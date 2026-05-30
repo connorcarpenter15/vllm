@@ -247,5 +247,10 @@ vllm/grpc/vllm_engine_pb2.py
 vllm/grpc/vllm_engine_pb2_grpc.py
 vllm/grpc/vllm_engine_pb2.pyi
 
+# OpenEngine sidecar gRPC stubs — build artifacts from openengine/gen.sh
+vllm/entrypoints/openengine/_openengine/*_pb2.py
+vllm/entrypoints/openengine/_openengine/*_pb2_grpc.py
+vllm/entrypoints/openengine/_openengine/*_pb2.pyi
+
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
