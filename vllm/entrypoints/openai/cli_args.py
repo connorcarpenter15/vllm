@@ -304,12 +304,6 @@ class FrontendArgs(BaseFrontendArgs):
     enable_flash_late_interaction: bool = True
     """If set, run pooling score MaxSim on GPU in the API server process.
     Can significantly improve late-interaction scoring performance."""
-    openengine_port: int | None = None
-    """If set, start an OpenEngine v1 gRPC server on this port alongside the
-    HTTP server, sharing the same engine. Used by the Dynamo vLLM sidecar.
-    Default None disables it."""
-    openengine_host: str = "0.0.0.0"
-    """Host/interface for the OpenEngine gRPC server (see --openengine-port)."""
 
     @classmethod
     def _customize_cli_kwargs(

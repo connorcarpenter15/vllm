@@ -126,6 +126,17 @@ pub struct SharedRuntimeArgs {
     #[arg(long)]
     #[serde(default)]
     pub grpc_port: Option<u16>,
+    /// TCP port for the OpenEngine v1 gRPC service consumed by out-of-process
+    /// frontends (e.g. the Dynamo vLLM sidecar). When not set, no OpenEngine
+    /// server is started.
+    #[arg(long)]
+    #[serde(default)]
+    pub openengine_port: Option<u16>,
+    /// Bind host for the OpenEngine gRPC service. When not set, follows the
+    /// HTTP listener's host.
+    #[arg(long)]
+    #[serde(default)]
+    pub openengine_host: Option<String>,
     /// Maximum time to wait for active requests to drain during shutdown.
     #[arg(long, default_value_t = 0)]
     #[serde(default)]
@@ -240,6 +251,8 @@ impl SharedRuntimeArgs {
             enable_log_requests: self.enable_log_requests,
             disable_log_stats: self.disable_log_stats,
             grpc_port: self.grpc_port,
+            openengine_port: self.openengine_port,
+            openengine_host: self.openengine_host,
             shutdown_timeout,
         }
     }
@@ -280,6 +293,8 @@ impl SharedRuntimeArgs {
             enable_log_requests: self.enable_log_requests,
             disable_log_stats: self.disable_log_stats,
             grpc_port: self.grpc_port,
+            openengine_port: self.openengine_port,
+            openengine_host: self.openengine_host,
             shutdown_timeout,
         }
     }

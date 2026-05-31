@@ -70,6 +70,8 @@ async fn main() -> Result<()> {
         enable_log_requests: false,
         disable_log_stats: false,
         grpc_port: None,
+        openengine_port: None,
+        openengine_host: None,
         shutdown_timeout: Duration::ZERO,
     };
 

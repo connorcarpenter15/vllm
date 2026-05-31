@@ -662,29 +662,6 @@ async def build_and_serve_renderer(
     )
 
 
-async def maybe_start_openengine_server(engine_client, args):
-    """Start the OpenEngine gRPC server if ``--openengine-port`` is set.
-
-    Returns the running ``OpenEngineServer`` (caller stops it on shutdown) or
-    ``None`` when the flag is unset. This is the only OpenEngine hook in the
-    OpenAI api_server; all server logic lives in
-    ``vllm.entrypoints.openengine``.
-    """
-    port = getattr(args, "openengine_port", None)
-    if not port:
-        return None
-    from vllm.entrypoints.openengine import OpenEngineServer
-
-    server = OpenEngineServer(
-        engine_client,
-        engine_client.vllm_config,
-        host=getattr(args, "openengine_host", "0.0.0.0"),
-        port=port,
-    )
-    await server.start()
-    return server
-
-
 async def run_server(args, **uvicorn_kwargs) -> None:
     """Run a single-worker API server."""
 
@@ -716,10 +693,6 @@ async def run_server_worker(
         args,
         client_config=client_config,
     ) as engine_client:
-        # Optionally serve the OpenEngine v1 gRPC contract alongside HTTP,
-        # sharing this engine_client. Started here so it is live before the
-        # HTTP server begins accepting traffic; stopped after HTTP shuts down.
-        openengine_server = await maybe_start_openengine_server(engine_client, args)
         shutdown_task = await build_and_serve(
             engine_client, listen_address, sock, args, **uvicorn_kwargs
         )
@@ -727,8 +700,6 @@ async def run_server_worker(
     try:
         await shutdown_task
     finally:
-        if openengine_server is not None:
-            await openengine_server.shutdown(grace=5.0)
         sock.close()
 
 

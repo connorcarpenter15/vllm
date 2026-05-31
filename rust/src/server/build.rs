@@ -6,7 +6,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .protoc_arg("--experimental_allow_proto3_optional") // be compatible with old compilers
-        .compile_protos(&[format!("{proto_dir}/vllm_grpc.proto")], &[proto_dir])?;
+        .compile_protos(
+            &[
+                format!("{proto_dir}/vllm_grpc.proto"),
+                format!("{proto_dir}/openengine.proto"),
+            ],
+            &[proto_dir],
+        )?;
 
     Ok(())
 }
