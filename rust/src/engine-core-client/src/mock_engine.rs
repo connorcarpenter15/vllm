@@ -49,6 +49,21 @@ pub fn default_ready_response() -> EngineCoreReadyResponse {
         dp_stats_address: None,
         dtype: ModelDtype::Float32,
         vllm_version: "test-vllm-version".to_string(),
+        // Single-GPU aggregated engine defaults for the discovery fields the
+        // out-of-process OpenEngine frontend reads from the handshake.
+        tensor_parallel_size: 1,
+        pipeline_parallel_size: 1,
+        data_parallel_size: 1,
+        data_parallel_rank: 0,
+        block_size: 16,
+        max_num_seqs: 256,
+        max_num_batched_tokens: 8192,
+        kv_connector: None,
+        kv_role: None,
+        kv_engine_id: None,
+        kv_events_publisher: None,
+        kv_events_endpoint: None,
+        kv_events_topic: None,
     }
 }
 

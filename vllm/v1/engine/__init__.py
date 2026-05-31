@@ -77,6 +77,24 @@ class EngineCoreReadyResponse:
     dp_stats_address: str | None
     dtype: str
     vllm_version: str
+    # Engine configuration advertised to out-of-process frontends (e.g. the
+    # OpenEngine sidecar) so they can discover topology, role, and limits over
+    # the wire instead of being passed flags. All values are read from the
+    # authoritative VllmConfig at startup. Defaults keep the message
+    # backward-compatible for frontends that predate these fields.
+    tensor_parallel_size: int = 1
+    pipeline_parallel_size: int = 1
+    data_parallel_size: int = 1
+    data_parallel_rank: int = 0
+    block_size: int = 0
+    max_num_seqs: int = 0
+    max_num_batched_tokens: int = 0
+    kv_connector: str | None = None
+    kv_role: str | None = None
+    kv_engine_id: str | None = None
+    kv_events_publisher: str | None = None
+    kv_events_endpoint: str | None = None
+    kv_events_topic: str | None = None
 
 
 class EngineCoreRequest(

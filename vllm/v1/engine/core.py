@@ -1459,12 +1459,40 @@ class EngineCoreProc(EngineCore):
 
             # Register sockets with poller.
             poller = zmq.Poller()
+            parallel_config = self.vllm_config.parallel_config
+            cache_config = self.vllm_config.cache_config
+            scheduler_config = self.vllm_config.scheduler_config
+            kv_transfer_config = self.vllm_config.kv_transfer_config
+            kv_events_config = self.vllm_config.kv_events_config
             ready_response = EngineCoreReadyResponse(
                 max_model_len=self.vllm_config.model_config.max_model_len,
                 num_gpu_blocks=self.vllm_config.cache_config.num_gpu_blocks or 0,
                 dp_stats_address=self.frontend_stats_publish_address,
                 dtype=str(self.vllm_config.model_config.dtype).removeprefix("torch."),
                 vllm_version=VLLM_VERSION,
+                tensor_parallel_size=parallel_config.tensor_parallel_size,
+                pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+                data_parallel_size=parallel_config.data_parallel_size,
+                data_parallel_rank=parallel_config.data_parallel_rank,
+                block_size=cache_config.block_size or 0,
+                max_num_seqs=scheduler_config.max_num_seqs,
+                max_num_batched_tokens=scheduler_config.max_num_batched_tokens,
+                kv_connector=(
+                    kv_transfer_config.kv_connector if kv_transfer_config else None
+                ),
+                kv_role=(kv_transfer_config.kv_role if kv_transfer_config else None),
+                kv_engine_id=(
+                    kv_transfer_config.engine_id if kv_transfer_config else None
+                ),
+                kv_events_publisher=(
+                    kv_events_config.publisher if kv_events_config else None
+                ),
+                kv_events_endpoint=(
+                    kv_events_config.endpoint if kv_events_config else None
+                ),
+                kv_events_topic=(
+                    kv_events_config.topic if kv_events_config else None
+                ),
             )
             ready_payload = msgspec.msgpack.encode(ready_response)
             for input_socket in input_sockets:
