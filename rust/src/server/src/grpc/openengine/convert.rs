@@ -64,16 +64,23 @@ pub fn to_text_request(
         sampling_params.stop_token_ids = Some(stop_token_ids);
     }
 
-    // Decode-role disaggregation: lift the KV session attributes into
-    // `kv_transfer_params` so the engine-core request carries them through to
-    // the connector. Phase 3 refines the exact session contents; the encoding
-    // here round-trips with [`kv_transfer_params_to_kv_session`].
-    if let Some(kv_session) = req.kv_session.as_ref()
-        && !kv_session.attributes.is_empty()
-    {
-        let kv_json = kv_session_attributes_to_json(&kv_session.attributes);
-        let map = sampling_params.vllm_xargs.get_or_insert_with(Default::default);
-        map.insert("kv_transfer_params".to_string(), kv_json);
+    // Decode-role disaggregation: lift the KV session handoff into
+    // `kv_transfer_params` so the engine-core request carries it through to the
+    // connector. Prefer the typed `attributes_struct` (no string re-parse);
+    // fall back to the legacy string-map `attributes`. Round-trips with
+    // [`kv_transfer_params_to_kv_session`].
+    if let Some(kv_session) = req.kv_session.as_ref() {
+        let kv_json = match kv_session.attributes_struct.as_ref() {
+            Some(s) if !s.fields.is_empty() => Some(prost_struct_to_json(s)),
+            _ if !kv_session.attributes.is_empty() => {
+                Some(kv_session_attributes_to_json(&kv_session.attributes))
+            }
+            _ => None,
+        };
+        if let Some(kv_json) = kv_json {
+            let map = sampling_params.vllm_xargs.get_or_insert_with(Default::default);
+            map.insert("kv_transfer_params".to_string(), kv_json);
+        }
     }
 
     let decode_options = TextDecodeOptions {
@@ -307,34 +314,85 @@ fn kv_session_attributes_to_json(attrs: &HashMap<String, String>) -> serde_json:
 
 /// Encode `kv_transfer_params` (a JSON object) into a KV session reference.
 ///
-/// Object fields become string-valued attributes (scalar JSON values are
-/// stringified plainly; compound values are JSON-encoded) so they round-trip
-/// through [`kv_session_attributes_to_json`] on the decode side.
+/// The params are carried in `attributes_struct` (a `google.protobuf.Struct`)
+/// so numbers, booleans, and arrays survive the wire with their JSON type
+/// intact — no string re-parsing on the decode side (the connector reads
+/// `remote_port` / `tp_size` etc. as their native types). Round-trips through
+/// the `attributes_struct` branch of [`to_text_request`].
 fn kv_transfer_params_to_kv_session(
     params: &serde_json::Value,
     request_id: &str,
     kv_connector: Option<&str>,
 ) -> pb::KvSessionRef {
-    let attributes = match params {
-        serde_json::Value::Object(map) => map
-            .iter()
-            .map(|(k, v)| {
-                let s = match v {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                (k.clone(), s)
-            })
-            .collect(),
-        _ => HashMap::new(),
-    };
-
     pb::KvSessionRef {
         session_id: request_id.to_string(),
         transfer_backend: kv_connector.unwrap_or_default().to_string(),
         endpoints: Vec::new(),
         dp_rank: 0,
-        attributes,
+        attributes: HashMap::new(),
+        attributes_struct: json_to_prost_struct(params),
+    }
+}
+
+/// Convert a JSON object into a `google.protobuf.Struct`. Non-object inputs
+/// (the connector always hands back an object) yield `None`.
+pub(crate) fn json_to_prost_struct(value: &serde_json::Value) -> Option<prost_types::Struct> {
+    match value {
+        serde_json::Value::Object(map) => Some(prost_types::Struct {
+            fields: map.iter().map(|(k, v)| (k.clone(), json_to_prost_value(v))).collect(),
+        }),
+        _ => None,
+    }
+}
+
+fn json_to_prost_value(value: &serde_json::Value) -> prost_types::Value {
+    use prost_types::value::Kind;
+    let kind = match value {
+        serde_json::Value::Null => Kind::NullValue(prost_types::NullValue::NullValue as i32),
+        serde_json::Value::Bool(b) => Kind::BoolValue(*b),
+        serde_json::Value::Number(n) => Kind::NumberValue(n.as_f64().unwrap_or(0.0)),
+        serde_json::Value::String(s) => Kind::StringValue(s.clone()),
+        serde_json::Value::Array(arr) => Kind::ListValue(prost_types::ListValue {
+            values: arr.iter().map(json_to_prost_value).collect(),
+        }),
+        serde_json::Value::Object(map) => Kind::StructValue(prost_types::Struct {
+            fields: map.iter().map(|(k, v)| (k.clone(), json_to_prost_value(v))).collect(),
+        }),
+    };
+    prost_types::Value { kind: Some(kind) }
+}
+
+/// Convert a `google.protobuf.Struct` back into a JSON object.
+pub(crate) fn prost_struct_to_json(s: &prost_types::Struct) -> serde_json::Value {
+    serde_json::Value::Object(
+        s.fields.iter().map(|(k, v)| (k.clone(), prost_value_to_json(v))).collect(),
+    )
+}
+
+fn prost_value_to_json(value: &prost_types::Value) -> serde_json::Value {
+    use prost_types::value::Kind;
+    match &value.kind {
+        None | Some(Kind::NullValue(_)) => serde_json::Value::Null,
+        Some(Kind::BoolValue(b)) => serde_json::Value::Bool(*b),
+        Some(Kind::NumberValue(n)) => number_to_json(*n),
+        Some(Kind::StringValue(s)) => serde_json::Value::String(s.clone()),
+        Some(Kind::ListValue(l)) => {
+            serde_json::Value::Array(l.values.iter().map(prost_value_to_json).collect())
+        }
+        Some(Kind::StructValue(s)) => prost_struct_to_json(s),
+    }
+}
+
+/// `google.protobuf.Struct` numbers are IEEE-754 doubles. Recover integral
+/// values as JSON integers (the connector encodes ints like `remote_port` /
+/// `tp_size`, which downstream code reads as ints, not floats).
+fn number_to_json(n: f64) -> serde_json::Value {
+    if n.is_finite() && n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
+        serde_json::Value::Number((n as i64).into())
+    } else {
+        serde_json::Number::from_f64(n)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null)
     }
 }
 
@@ -503,15 +561,42 @@ mod tests {
         let session = prefill.kv_session.as_ref().expect("kv_session present");
         assert_eq!(session.session_id, "req");
         assert_eq!(session.transfer_backend, "NixlConnector");
-        assert_eq!(
-            session.attributes.get("remote_engine_id"),
-            Some(&"engine-7".to_string())
+        // Typed attributes preserve their JSON types (no stringification).
+        let attrs = prost_struct_to_json(
+            session
+                .attributes_struct
+                .as_ref()
+                .expect("attributes_struct present"),
         );
-        // Compound values round-trip as JSON strings.
-        assert_eq!(
-            session.attributes.get("remote_block_ids"),
-            Some(&"[1,2,3]".to_string())
-        );
+        assert_eq!(attrs["remote_engine_id"], serde_json::json!("engine-7"));
+        assert_eq!(attrs["remote_block_ids"], serde_json::json!([1, 2, 3]));
+        assert!(session.attributes.is_empty(), "legacy attributes map is unset");
+    }
+
+    #[test]
+    fn kv_session_attributes_struct_round_trips_into_kv_transfer_params() {
+        // Mirrors the wire path: prefill builds a Struct, decode reads it back.
+        let params = serde_json::json!({
+            "remote_engine_id": "engine-7",
+            "remote_port": 20097,
+            "tp_size": 1,
+            "do_remote_prefill": true,
+            "remote_block_ids": [4, 5, 6],
+        });
+        let session = kv_transfer_params_to_kv_session(&params, "sess", Some("NixlConnector"));
+        let req = pb::GenerateRequest {
+            kv_session: Some(session),
+            ..base_request()
+        };
+        let text = to_text_request(req, &["test-model".to_string()]).expect("convert");
+        let xargs = text.sampling_params.vllm_xargs.expect("xargs present");
+        let kv = xargs.get("kv_transfer_params").expect("kv_transfer_params present");
+        // Numbers stay numbers (ints recovered), bools stay bools, arrays stay arrays.
+        assert_eq!(kv["remote_engine_id"], serde_json::json!("engine-7"));
+        assert_eq!(kv["remote_port"], serde_json::json!(20097));
+        assert_eq!(kv["tp_size"], serde_json::json!(1));
+        assert_eq!(kv["do_remote_prefill"], serde_json::json!(true));
+        assert_eq!(kv["remote_block_ids"], serde_json::json!([4, 5, 6]));
     }
 
     #[test]

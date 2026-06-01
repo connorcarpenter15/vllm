@@ -53,21 +53,27 @@ The **only** new vLLM CLI flags are `--openengine-port` / `--openengine-host`
 | `Abort` | `EngineCoreClient::abort([id])`, idempotent (unknown id → `ABORTED`). `abort_all` → `UNSUPPORTED` (frontend does not retain the in-flight id set). |
 | `Drain` (server-stream) | polls `server_load` to 0 or deadline; `STARTED` → `IN_PROGRESS`* → `COMPLETE`/`FAILED`. |
 | `GetKvConnectorInfo` | from the handshake `kv_connector`. |
-| `GetKvEventSources` | surfaces the ZMQ publisher (`kv_events_*`) verbatim for KV-aware routing; empty when no publisher. |
+| `GetKvEventSources` | surfaces the ZMQ publisher (`kv_events_*`) for KV-aware routing; populates the routable `endpoint_addr` (`KvEndpoint{host,port,protocol}`) — a bind wildcard (`*`/`0.0.0.0`/`::`) is rewritten to this node's advertised IP so a remote router can connect. Empty when no publisher. |
 | `SubscribeKvEvents` / `SubscribeRuntimeEvents` | `UNIMPLEMENTED` in v1 (consumers subscribe to the ZMQ source directly via `GetKvEventSources`). |
 
 ## Disaggregation (KV session) — Phase 3
 
 - **Prefill role**: the terminal `Finished.kv_transfer_params` (the connector's
-  handoff metadata) is packed into `PrefillReady.kv_session`
-  (`convert::kv_transfer_params_to_kv_session`).
-- **Decode role**: the request's `kv_session.attributes` are lifted back into
-  the engine-core request's `kv_transfer_params` via `vllm_xargs`
-  (`convert::kv_session_attributes_to_json`).
+  handoff metadata) is packed into `PrefillReady.kv_session.attributes_struct`
+  as a typed `google.protobuf.Struct` (`convert::kv_transfer_params_to_kv_session`
+  → `json_to_prost_struct`). The legacy string-map `attributes` field is left
+  empty.
+- **Decode role**: the request's `kv_session.attributes_struct` is converted
+  back to JSON (`convert::prost_struct_to_json`) and lifted into the
+  engine-core request's `kv_transfer_params` via `vllm_xargs`. If only the
+  legacy `attributes` (string map) is present, it falls back to
+  `kv_session_attributes_to_json`.
 
-The encoding round-trips (object fields ↔ string-valued attributes). The exact
-session contents are refined in Phase 3 against the NixlConnector path; the
-shape here is the stable envelope.
+The typed Struct preserves value types end-to-end (ints, bools, arrays) with no
+stringify/reparse — `number_to_json` recovers integral `f64`s back to JSON
+integers so connector params like `remote_port`/`tp_size` keep their int type.
+The exact session contents track the NixlConnector path; the shape here is the
+stable envelope.
 
 ## Testing
 

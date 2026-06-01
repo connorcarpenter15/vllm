@@ -348,6 +348,7 @@ impl pb::open_engine_server::OpenEngine for OpenEngineServiceImpl {
                 buffer_steps: 0,
                 hwm: 0,
                 max_queue_size: 0,
+                endpoint_addr: kv_endpoint_from_zmq(endpoint),
             });
         }
 
@@ -452,4 +453,38 @@ fn now_unix_nanos() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+/// Parse a ZMQ publisher endpoint (`tcp://host:port`) into a connectable
+/// [`pb::KvEndpoint`], substituting a routable host for bind wildcards
+/// (`*` / `0.0.0.0` / `::`). The engine binds its KV-event publisher on a
+/// wildcard, which a remote KV router on another node cannot dial; this
+/// advertises the node's routable address instead. Returns `None` if the
+/// endpoint cannot be parsed (the legacy `endpoint` string is still set).
+fn kv_endpoint_from_zmq(endpoint: &str) -> Option<pb::KvEndpoint> {
+    let rest = endpoint.strip_prefix("tcp://").unwrap_or(endpoint);
+    let (host, port) = rest.rsplit_once(':')?;
+    let port: u32 = port.parse().ok()?;
+    let host = match host.trim_matches(|c| c == '[' || c == ']') {
+        "*" | "0.0.0.0" | "::" | "" => advertise_host(),
+        concrete => concrete.to_string(),
+    };
+    Some(pb::KvEndpoint {
+        host,
+        port,
+        protocol: "tcp".to_string(),
+    })
+}
+
+/// Best-effort routable host for advertising a locally-bound socket. Discovers
+/// the node's primary outbound IP via a connected UDP socket (no packets are
+/// sent — `connect` only consults the routing table); falls back to loopback
+/// when no route exists (single-host deployments).
+fn advertise_host() -> String {
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|sock| {
+            sock.connect("10.255.255.255:1")?;
+            Ok(sock.local_addr()?.ip().to_string())
+        })
+        .unwrap_or_else(|_| "127.0.0.1".to_string())
 }
