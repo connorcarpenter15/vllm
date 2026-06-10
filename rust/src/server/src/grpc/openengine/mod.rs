@@ -108,11 +108,37 @@ impl pb::open_engine_server::OpenEngine for OpenEngineServiceImpl {
         request: Request<pb::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
         let proto_req = request.into_inner();
+        // Extract media before moving the request into text conversion; wire
+        // order aligns with the placeholder markers carried in the prompt.
+        let media_parts = convert::media_parts_from_request(&proto_req.media)?;
         let mut text_request =
             convert::to_text_request(proto_req, self.state.served_model_names())?;
 
         let request_id = text_request.request_id.clone();
         info!(%request_id, "openengine generate");
+
+        // Multimodal: the orchestrator forwards media plus token IDs that still
+        // carry un-expanded placeholder markers (one per item). Fetch and
+        // preprocess the media, expand the markers in place, and attach the
+        // engine-facing features. This runs before `mark_prefill_request` so the
+        // prefill engine encodes the media and produces the KV the decode peer
+        // pulls.
+        if !media_parts.is_empty() {
+            let Prompt::TokenIds(mut token_ids) = text_request.prompt else {
+                return Err(Status::invalid_argument(
+                    "multimodal OpenEngine requests must provide token_ids input; \
+                     placeholder markers are expanded engine-side",
+                ));
+            };
+            let mm_features = self
+                .state
+                .chat
+                .prepare_media(media_parts, &mut token_ids)
+                .await
+                .map_err(|e| Status::internal(e.to_report_string()))?;
+            text_request.prompt = Prompt::TokenIds(token_ids);
+            text_request.mm_features = mm_features;
+        }
 
         // Role and connector are uniform across engines; snapshot owned copies
         // so the response mapping can run inside the spawned task.
@@ -206,7 +232,7 @@ impl pb::open_engine_server::OpenEngine for OpenEngineServiceImpl {
             supports_logprobs: true,
             supports_guided_decoding: true,
             supports_lora: false,
-            supports_multimodal: false,
+            supports_multimodal: self.state.chat.supports_multimodal(),
         }))
     }
 

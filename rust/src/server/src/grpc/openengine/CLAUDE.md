@@ -45,9 +45,9 @@ The **only** new vLLM CLI flags are `--openengine-port` / `--openengine-host`
 
 | RPC | Maps to |
 |---|---|
-| `Generate` (server-stream) | `TextLlm::generate`. Per `TextDelta` → `Token{token_ids,text}`; terminal → `Finished{reason,usage}`, or `PrefillReady{kv_session}` for the prefill role. Mid-stream failure → `EngineError`. `stream=false` collapses to the terminal output only (`intermediate` flag). |
+| `Generate` (server-stream) | `TextLlm::generate`. Per `TextDelta` → `Token{token_ids,text}`; terminal → `Finished{reason,usage}`, or `PrefillReady{kv_session}` for the prefill role. Mid-stream failure → `EngineError`. `stream=false` collapses to the terminal output only (`intermediate` flag). `media` (if present) → `MediaContentPart`s via `media_parts_from_request`, then `ChatLlm::prepare_media` fetches/preprocesses and expands the placeholder markers in `token_ids` (so multimodal requests must use token-ids input); runs before `mark_prefill_request` so prefill encodes the media. |
 | `GetEngineInfo` | `engine_name="vllm"`, version + role + parallelism + kv_connector from the handshake. |
-| `GetModelInfo` | model id / served names + caps from the handshake; capability bools are static (text/token-ids/logprobs/guided = true; lora/multimodal = false). |
+| `GetModelInfo` | model id / served names + caps from the handshake; most capability bools are static (text/token-ids/logprobs/guided = true; lora = false). `supports_multimodal` reflects the loaded backend (`ChatLlm::supports_multimodal()`: true when a `MultimodalModelInfo` resolved, e.g. a VLM). |
 | `GetLoad` | `running_requests` from `AppState::server_load`; deeper scheduler stats (queue depth, KV usage) are **not yet a queryable snapshot** → reported as 0 (follow-up). |
 | `Health` | liveness from `EngineCoreClient::is_healthy`; `include_inference_probe` runs a bounded 1-token greedy generate. |
 | `Abort` | `EngineCoreClient::abort([id])`, idempotent (unknown id → `ABORTED`). `abort_all` → `UNSUPPORTED` (frontend does not retain the in-flight id set). |

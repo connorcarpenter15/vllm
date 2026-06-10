@@ -115,6 +115,12 @@ message GenerateRequest {
   repeated StopCondition stop = 6;
   bool stream = 7;
 
+  // Multimodal inputs. Order is significant: the i-th item aligns with the
+  // i-th (un-expanded) placeholder marker carried in the prompt/token_ids.
+  // The engine fetches/decodes and preprocesses each item, then expands the
+  // marker into the model's replacement run. Empty for text-only requests.
+  repeated MediaItem media = 8;
+
   // Required for decode requests in disaggregated serving.
   KvSessionRef kv_session = 20;
 
@@ -128,6 +134,30 @@ message GenerateRequest {
 
   // Optional request metadata for tracing/admission/routing.
   map<string, string> metadata = 30;
+}
+
+// Multimodal modality discriminator. 0 is treated as image for forward
+// compatibility with senders that omit the field.
+enum Modality {
+  MODALITY_UNSPECIFIED = 0;
+  MODALITY_IMAGE = 1;
+  MODALITY_VIDEO = 2;
+  MODALITY_AUDIO = 3;
+}
+
+// A single multimodal input. Exactly one `source` should be set. The engine
+// owns fetch/decode/preprocess -- the orchestrator never derefs media (it has
+// no GPU/NIXL agent in the sidecar deployment), so a pre-decoded/RDMA media
+// descriptor is NOT representable here by design.
+message MediaItem {
+  Modality modality = 1;
+  oneof source {
+    string url       = 2;   // http(s):// -- engine fetches
+    string data_uri  = 3;   // data:<mime>;base64,<...> -- engine decodes
+    bytes  raw_bytes = 4;   // pre-fetched bytes -- engine still preprocesses
+  }
+  string mime_type = 5;     // optional, hints raw_bytes decode
+  string uuid      = 6;     // optional caller id / mm_hash
 }
 
 message TokenIds {
