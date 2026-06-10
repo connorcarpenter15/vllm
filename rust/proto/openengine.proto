@@ -118,6 +118,14 @@ message GenerateRequest {
   // Required for decode requests in disaggregated serving.
   KvSessionRef kv_session = 20;
 
+  // Router-forced internal data-parallel rank. When set, the engine must place
+  // this request on exactly this DP rank instead of load-balancing across
+  // ranks. This is what keeps prefix->rank affinity for KV-aware routing: the
+  // KV router decides a rank from the prefix it indexed, and the engine honors
+  // it so a child block's parent stays in the same rank's radix subtree.
+  // Unset = let the engine pick (no affinity). Rank 0 is valid, hence optional.
+  optional uint32 data_parallel_rank = 21;
+
   // Optional request metadata for tracing/admission/routing.
   map<string, string> metadata = 30;
 }
@@ -134,6 +142,10 @@ message SamplingParams {
   double presence_penalty = 5;
   uint32 max_tokens = 6;
   uint64 seed = 7;
+  // When true the engine ignores the EOS token and generates until another
+  // stop condition (e.g. max_tokens) fires. Without it the engine stops at
+  // natural EOS, which truncates fixed-length benchmark workloads.
+  bool ignore_eos = 8;
 }
 
 message StopCondition {

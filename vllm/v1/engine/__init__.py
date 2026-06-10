@@ -86,6 +86,10 @@ class EngineCoreReadyResponse:
     pipeline_parallel_size: int = 1
     data_parallel_size: int = 1
     data_parallel_rank: int = 0
+    # KV-event (main-attention) block size, NOT cache_config.block_size: under
+    # the hybrid KV-cache manager the latter is reset to the minimum group
+    # block size, which need not match the granularity at which prefix-cache
+    # events are published. See EngineCore._kv_event_block_size.
     block_size: int = 0
     max_num_seqs: int = 0
     max_num_batched_tokens: int = 0

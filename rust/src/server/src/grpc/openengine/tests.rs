@@ -688,3 +688,39 @@ async fn subscribe_runtime_events_is_unimplemented() {
 
     server_task.abort();
 }
+
+// ========================================================================================
+// DP helpers (data-parallel orchestration: per-rank KV blocks + per-rank KV
+// event endpoints)
+// ========================================================================================
+
+#[test]
+fn per_rank_kv_blocks_divides_aggregate_by_dp_size() {
+    // DP=1 (or 0, treated as 1): aggregate is already per-rank.
+    assert_eq!(super::per_rank_kv_blocks(1000, 1), 1000);
+    assert_eq!(super::per_rank_kv_blocks(1000, 0), 1000);
+    // DP>1: floor-divide the aggregate across ranks (matches per_rank_kv_blocks
+    // in dynamo/components/src/dynamo/vllm/capacity.py).
+    assert_eq!(super::per_rank_kv_blocks(1000, 4), 250);
+    assert_eq!(super::per_rank_kv_blocks(1001, 4), 250); // floor
+    // Zero aggregate (e.g. Ray DP backend sentinel) stays zero.
+    assert_eq!(super::per_rank_kv_blocks(0, 8), 0);
+    // Fewer blocks than ranks clamps to 1 rather than 0.
+    assert_eq!(super::per_rank_kv_blocks(3, 8), 1);
+}
+
+#[test]
+fn offset_endpoint_port_matches_vllm_convention() {
+    // Rank 0 is never offset.
+    assert_eq!(super::offset_endpoint_port("tcp://*:5557", 0), "tcp://*:5557");
+    // tcp: port += data_parallel_rank.
+    assert_eq!(super::offset_endpoint_port("tcp://*:5557", 1), "tcp://*:5558");
+    assert_eq!(
+        super::offset_endpoint_port("tcp://127.0.0.1:5557", 7),
+        "tcp://127.0.0.1:5564"
+    );
+    // inproc: `_dp{rank}` suffix.
+    assert_eq!(super::offset_endpoint_port("inproc://cache", 3), "inproc://cache_dp3");
+    // Empty endpoint is returned unchanged.
+    assert_eq!(super::offset_endpoint_port("", 5), "");
+}

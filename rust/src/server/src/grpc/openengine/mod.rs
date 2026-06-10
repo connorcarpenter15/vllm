@@ -63,6 +63,35 @@ impl OpenEngineServiceImpl {
     fn ready(&self) -> &EngineCoreReadyResponse {
         self.state.engine_core_client().ready_response()
     }
+
+    /// Per-rank KV-cache block capacity advertised to the frontend.
+    ///
+    /// `EngineCoreClient::total_num_gpu_blocks()` sums blocks across every
+    /// connected DP engine (the aggregate the frontend manages), but Dynamo's
+    /// KV router treats `ModelInfo.total_kv_blocks` as a **per-rank** value and
+    /// replicates it across each DP rank it enumerates. Reporting the aggregate
+    /// would over-state every rank's capacity by `data_parallel_size`. Divide
+    /// it down, mirroring the in-process path's `per_rank_kv_blocks`
+    /// (`dynamo/components/src/dynamo/vllm/capacity.py`).
+    fn per_rank_kv_blocks(&self) -> u64 {
+        let total = self.state.engine_core_client().total_num_gpu_blocks();
+        per_rank_kv_blocks(total, self.ready().data_parallel_size)
+    }
+}
+
+/// Divide an aggregate KV-block count into a per-rank value, mirroring the
+/// in-process path's `per_rank_kv_blocks`
+/// (`dynamo/components/src/dynamo/vllm/capacity.py`). `total` is the sum across
+/// all connected DP engines; the Dynamo KV router replicates the reported value
+/// across each enumerated DP rank, so it must be per-rank, not the aggregate.
+fn per_rank_kv_blocks(total: u64, data_parallel_size: u32) -> u64 {
+    let dp_size = u64::from(data_parallel_size.max(1));
+    if dp_size <= 1 || total == 0 {
+        return total;
+    }
+    // Floor division matches the in-process path; clamp to 1 so a tiny cache
+    // (fewer blocks than ranks) still advertises non-zero per-rank capacity.
+    (total / dp_size).max(1)
 }
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
@@ -168,7 +197,7 @@ impl pb::open_engine_server::OpenEngine for OpenEngineServiceImpl {
             max_context_length: client.max_model_len(),
             max_output_tokens: 0,
             kv_block_size: rr.block_size,
-            total_kv_blocks: client.total_num_gpu_blocks(),
+            total_kv_blocks: self.per_rank_kv_blocks(),
             max_running_requests: rr.max_num_seqs,
             max_batched_tokens: rr.max_num_batched_tokens,
             tokenizer_modes: Vec::new(),
@@ -196,7 +225,7 @@ impl pb::open_engine_server::OpenEngine for OpenEngineServiceImpl {
             queued_requests: 0,
             active_kv_sessions: 0,
             used_kv_blocks: 0,
-            total_kv_blocks: self.state.engine_core_client().total_num_gpu_blocks(),
+            total_kv_blocks: self.per_rank_kv_blocks(),
             running_tokens: 0,
             waiting_tokens: 0,
             prefill_batch_size: 0,
@@ -329,28 +358,38 @@ impl pb::open_engine_server::OpenEngine for OpenEngineServiceImpl {
         &self,
         _request: Request<pb::GetKvEventSourcesRequest>,
     ) -> Result<Response<pb::GetKvEventSourcesResponse>, Status> {
-        let rr = self.ready();
-        let mut sources = Vec::new();
-
-        // The engine advertises a ZMQ KV-event publisher only when one is
-        // configured; surface it verbatim for KV-aware routing.
-        if rr.kv_events_publisher.as_deref() == Some("zmq")
-            && let Some(endpoint) = rr.kv_events_endpoint.as_ref()
-        {
-            sources.push(pb::KvEventSource {
-                transport: "zmq".to_string(),
-                endpoint: endpoint.clone(),
-                topic: rr.kv_events_topic.clone().unwrap_or_default(),
-                replay_endpoint: String::new(),
-                data_parallel_rank: rr.data_parallel_rank,
-                encoding: "msgpack".to_string(),
-                schema_version: 1,
-                buffer_steps: 0,
-                hwm: 0,
-                max_queue_size: 0,
-                endpoint_addr: kv_endpoint_from_zmq(endpoint),
-            });
-        }
+        // Each connected DP engine runs its own KV-event publisher, so emit one
+        // source per engine rather than only the first. The engine reports the
+        // *base* `kv_events_endpoint` in its handshake; vLLM's `ZmqEventPublisher`
+        // offsets the port by `data_parallel_rank` at bind time
+        // (`vllm/distributed/kv_events.py::offset_endpoint_port`), so we replicate
+        // that offset here. This mirrors the in-process Dynamo path, which builds
+        // one publisher per dp_rank with the same per-rank port offset
+        // (`dynamo/components/src/dynamo/vllm/main.py::setup_kv_event_publisher`).
+        let sources = self
+            .state
+            .engine_core_client()
+            .ready_responses()
+            .into_iter()
+            .filter(|rr| rr.kv_events_publisher.as_deref() == Some("zmq"))
+            .filter_map(|rr| {
+                let base = rr.kv_events_endpoint.as_ref()?;
+                let endpoint = offset_endpoint_port(base, rr.data_parallel_rank);
+                Some(pb::KvEventSource {
+                    transport: "zmq".to_string(),
+                    endpoint_addr: kv_endpoint_from_zmq(&endpoint),
+                    endpoint,
+                    topic: rr.kv_events_topic.clone().unwrap_or_default(),
+                    replay_endpoint: String::new(),
+                    data_parallel_rank: rr.data_parallel_rank,
+                    encoding: "msgpack".to_string(),
+                    schema_version: 1,
+                    buffer_steps: 0,
+                    hwm: 0,
+                    max_queue_size: 0,
+                })
+            })
+            .collect();
 
         Ok(Response::new(pb::GetKvEventSourcesResponse { sources }))
     }
@@ -453,6 +492,32 @@ fn now_unix_nanos() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+/// Offset a KV-event publisher endpoint's port by the data-parallel rank,
+/// mirroring vLLM's `ZmqEventPublisher.offset_endpoint_port`
+/// (`vllm/distributed/kv_events.py`). The engine reports the base endpoint in
+/// its handshake but binds the publisher on `base_port + data_parallel_rank`,
+/// so a subscriber must apply the same offset to connect to the right rank.
+///
+/// - rank 0: returned unchanged (no offset).
+/// - `inproc://...`: `_dp{rank}` suffix.
+/// - `tcp://host:port`: port becomes `port + rank`.
+/// - anything else: returned unchanged.
+fn offset_endpoint_port(endpoint: &str, data_parallel_rank: u32) -> String {
+    if data_parallel_rank == 0 || endpoint.is_empty() {
+        return endpoint.to_string();
+    }
+    if endpoint.contains("inproc") {
+        return format!("{endpoint}_dp{data_parallel_rank}");
+    }
+    if endpoint.contains("tcp")
+        && let Some((base_addr, port)) = endpoint.rsplit_once(':')
+        && let Ok(base_port) = port.parse::<u32>()
+    {
+        return format!("{base_addr}:{}", base_port + data_parallel_rank);
+    }
+    endpoint.to_string()
 }
 
 /// Parse a ZMQ publisher endpoint (`tcp://host:port`) into a connectable

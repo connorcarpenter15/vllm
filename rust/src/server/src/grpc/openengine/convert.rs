@@ -103,7 +103,10 @@ pub fn to_text_request(
         priority: 0,
         cache_salt: None,
         add_special_tokens: true,
-        data_parallel_rank: None,
+        // Honour the KV router's forced internal DP rank when set, pinning this
+        // request to the engine rank that holds its prefix (KV-aware routing).
+        // Unset → the engine load-balances across its DP ranks as before.
+        data_parallel_rank: req.data_parallel_rank,
     })
 }
 
@@ -129,6 +132,7 @@ fn build_sampling_params(sampling: Option<&pb::SamplingParams>) -> SamplingParam
         max_tokens: (s.max_tokens != 0).then_some(s.max_tokens),
         frequency_penalty: (s.frequency_penalty != 0.0).then_some(s.frequency_penalty as f32),
         presence_penalty: (s.presence_penalty != 0.0).then_some(s.presence_penalty as f32),
+        ignore_eos: s.ignore_eos,
         ..SamplingParams::default()
     }
 }
@@ -427,6 +431,7 @@ mod tests {
                 top_k: 50,
                 max_tokens: 16,
                 seed: 42,
+                ignore_eos: true,
                 ..Default::default()
             }),
             ..base_request()
@@ -437,6 +442,7 @@ mod tests {
         assert_eq!(text.sampling_params.top_k, Some(50));
         assert_eq!(text.sampling_params.max_tokens, Some(16));
         assert_eq!(text.sampling_params.seed, Some(42));
+        assert!(text.sampling_params.ignore_eos);
     }
 
     #[test]
@@ -491,6 +497,22 @@ mod tests {
         };
         let status = to_text_request(req, &["test-model".to_string()]).expect_err("should reject");
         assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+
+    #[test]
+    fn forwards_router_forced_dp_rank() {
+        let req = pb::GenerateRequest {
+            data_parallel_rank: Some(3),
+            ..base_request()
+        };
+        let text = to_text_request(req, &["test-model".to_string()]).expect("convert");
+        assert_eq!(text.data_parallel_rank, Some(3));
+    }
+
+    #[test]
+    fn unset_dp_rank_defaults_to_none() {
+        let text = to_text_request(base_request(), &["test-model".to_string()]).expect("convert");
+        assert_eq!(text.data_parallel_rank, None);
     }
 
     fn finished(reason: FinishReason) -> Finished {
