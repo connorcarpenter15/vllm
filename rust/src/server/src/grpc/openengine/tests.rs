@@ -22,6 +22,8 @@ use vllm_chat::{
 use vllm_engine_core_client::protocol::{
     EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
 };
+use vllm_engine_core_client::mock_engine::default_ready_response;
+use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
 use vllm_engine_core_client::test_utils::{IpcNamespace, spawn_mock_engine_task};
 use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig, EngineId};
 use vllm_llm::Llm;
@@ -538,6 +540,77 @@ async fn get_kv_event_sources_empty_without_publisher() {
     assert!(resp.sources.is_empty());
 
     server_task.abort();
+}
+
+// ----------------------------------------------------------------------------------------
+// KV event source selection (pure, no server harness) — consolidator vs per-rank
+// ----------------------------------------------------------------------------------------
+
+fn ready_with_kv_events(
+    dp_rank: u32,
+    publisher: Option<&str>,
+    endpoint: Option<&str>,
+    consolidated: Option<&str>,
+) -> EngineCoreReadyResponse {
+    EngineCoreReadyResponse {
+        data_parallel_rank: dp_rank,
+        kv_events_publisher: publisher.map(str::to_string),
+        kv_events_endpoint: endpoint.map(str::to_string),
+        kv_events_topic: Some("kv".to_string()),
+        kv_events_consolidated_endpoint: consolidated.map(str::to_string),
+        ..default_ready_response()
+    }
+}
+
+#[test]
+fn build_kv_event_sources_prefers_consolidator_single_rank0_source() {
+    // Two DP engines each expose a raw ZMQ publisher, but the engine also
+    // advertises the KVBM consolidator endpoint. The consolidator merges both
+    // ranks into one deduped stream, so exactly one rank-0 source is emitted
+    // (the consolidator endpoint), not the per-rank raw publishers.
+    let r0 = ready_with_kv_events(
+        0,
+        Some("zmq"),
+        Some("tcp://*:5557"),
+        Some("tcp://0.0.0.0:57001"),
+    );
+    let r1 = ready_with_kv_events(1, Some("zmq"), Some("tcp://*:5557"), None);
+    let sources = super::build_kv_event_sources(&[&r0, &r1]);
+
+    assert_eq!(sources.len(), 1, "consolidator collapses to one source");
+    let src = &sources[0];
+    assert_eq!(src.transport, "zmq");
+    assert_eq!(src.data_parallel_rank, 0);
+    assert_eq!(src.endpoint, "tcp://0.0.0.0:57001");
+    // Consolidator republishes on an empty topic; advertising the raw vLLM topic
+    // here would make the router's SUB filter reject every consolidated message.
+    assert_eq!(src.topic, "", "consolidator source must advertise an empty topic");
+    let addr = src.endpoint_addr.as_ref().expect("routable endpoint_addr");
+    assert_eq!(addr.port, 57001);
+    assert_ne!(addr.host, "0.0.0.0", "bind wildcard rewritten to a routable host");
+}
+
+#[test]
+fn build_kv_event_sources_falls_back_to_per_rank_publishers() {
+    // No consolidator: one source per DP engine, with vLLM's per-rank port
+    // offset (rank 0 unchanged, rank 1 = base + 1).
+    let r0 = ready_with_kv_events(0, Some("zmq"), Some("tcp://*:5557"), None);
+    let r1 = ready_with_kv_events(1, Some("zmq"), Some("tcp://*:5557"), None);
+    let sources = super::build_kv_event_sources(&[&r0, &r1]);
+
+    assert_eq!(sources.len(), 2);
+    let ports: Vec<u32> = sources
+        .iter()
+        .map(|s| s.endpoint_addr.as_ref().expect("endpoint_addr").port)
+        .collect();
+    assert_eq!(ports, vec![5557, 5558]);
+}
+
+#[test]
+fn build_kv_event_sources_empty_without_publisher_or_consolidator() {
+    let r0 = ready_with_kv_events(0, None, None, None);
+    let sources = super::build_kv_event_sources(&[&r0]);
+    assert!(sources.is_empty());
 }
 
 // ========================================================================================

@@ -1510,6 +1510,18 @@ class EngineCoreProc(EngineCore):
             scheduler_config = self.vllm_config.scheduler_config
             kv_transfer_config = self.vllm_config.kv_transfer_config
             kv_events_config = self.vllm_config.kv_events_config
+            # KVBM consolidator output endpoint (set in run_headless / the
+            # in-process Dynamo worker via additional_config). Element [1] is the
+            # bind endpoint (tcp://0.0.0.0:PORT); the OpenEngine frontend rewrites
+            # the wildcard host to a routable address. None when KVBM
+            # consolidation is not active. additional_config may be a non-dict
+            # SupportsHash, so guard before subscripting.
+            _additional_config = self.vllm_config.additional_config
+            consolidator_endpoints = (
+                _additional_config.get("consolidator_endpoints")
+                if isinstance(_additional_config, dict)
+                else None
+            )
             ready_response = EngineCoreReadyResponse(
                 max_model_len=self.vllm_config.model_config.max_model_len,
                 num_gpu_blocks=self.vllm_config.cache_config.num_gpu_blocks or 0,
@@ -1537,6 +1549,9 @@ class EngineCoreProc(EngineCore):
                     kv_events_config.endpoint if kv_events_config else None
                 ),
                 kv_events_topic=(kv_events_config.topic if kv_events_config else None),
+                kv_events_consolidated_endpoint=(
+                    consolidator_endpoints[1] if consolidator_endpoints else None
+                ),
             )
             ready_payload = msgspec.msgpack.encode(ready_response)
             for input_socket in input_sockets:

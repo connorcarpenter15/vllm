@@ -384,39 +384,8 @@ impl pb::open_engine_server::OpenEngine for OpenEngineServiceImpl {
         &self,
         _request: Request<pb::GetKvEventSourcesRequest>,
     ) -> Result<Response<pb::GetKvEventSourcesResponse>, Status> {
-        // Each connected DP engine runs its own KV-event publisher, so emit one
-        // source per engine rather than only the first. The engine reports the
-        // *base* `kv_events_endpoint` in its handshake; vLLM's `ZmqEventPublisher`
-        // offsets the port by `data_parallel_rank` at bind time
-        // (`vllm/distributed/kv_events.py::offset_endpoint_port`), so we replicate
-        // that offset here. This mirrors the in-process Dynamo path, which builds
-        // one publisher per dp_rank with the same per-rank port offset
-        // (`dynamo/components/src/dynamo/vllm/main.py::setup_kv_event_publisher`).
-        let sources = self
-            .state
-            .engine_core_client()
-            .ready_responses()
-            .into_iter()
-            .filter(|rr| rr.kv_events_publisher.as_deref() == Some("zmq"))
-            .filter_map(|rr| {
-                let base = rr.kv_events_endpoint.as_ref()?;
-                let endpoint = offset_endpoint_port(base, rr.data_parallel_rank);
-                Some(pb::KvEventSource {
-                    transport: "zmq".to_string(),
-                    endpoint_addr: kv_endpoint_from_zmq(&endpoint),
-                    endpoint,
-                    topic: rr.kv_events_topic.clone().unwrap_or_default(),
-                    replay_endpoint: String::new(),
-                    data_parallel_rank: rr.data_parallel_rank,
-                    encoding: "msgpack".to_string(),
-                    schema_version: 1,
-                    buffer_steps: 0,
-                    hwm: 0,
-                    max_queue_size: 0,
-                })
-            })
-            .collect();
-
+        let sources =
+            build_kv_event_sources(&self.state.engine_core_client().ready_responses());
         Ok(Response::new(pb::GetKvEventSourcesResponse { sources }))
     }
 
@@ -544,6 +513,78 @@ fn offset_endpoint_port(endpoint: &str, data_parallel_rank: u32) -> String {
         return format!("{base_addr}:{}", base_port + data_parallel_rank);
     }
     endpoint.to_string()
+}
+
+/// Build the KV-event sources advertised for KV-aware routing from the engines'
+/// startup handshakes.
+///
+/// KVBM: when an engine advertises a KV-event consolidator endpoint, the
+/// per-rank vLLM publishers' events are already merged into one deduped,
+/// multi-tier (GPU/CPU/disk) stream. The router must subscribe to that
+/// consolidated stream instead of the raw per-rank publishers — subscribing to
+/// both would double-index. The consolidator is dp_rank=0-only
+/// (`kvbm .../consolidator_config.py`), so a single rank-0 source is emitted.
+///
+/// Otherwise each connected DP engine runs its own KV-event publisher, so emit
+/// one source per engine. The engine reports the *base* `kv_events_endpoint`;
+/// vLLM's `ZmqEventPublisher` offsets the port by `data_parallel_rank` at bind
+/// time (`vllm/distributed/kv_events.py::offset_endpoint_port`), replicated
+/// here. This mirrors the in-process Dynamo path, which builds one publisher per
+/// dp_rank with the same offset
+/// (`dynamo/components/src/dynamo/vllm/main.py::setup_kv_event_publisher`).
+///
+/// Both branches advertise the bind form (`tcp://0.0.0.0:PORT`) and let
+/// [`kv_endpoint_from_zmq`] rewrite the wildcard host to a routable address.
+fn build_kv_event_sources(
+    ready_responses: &[&EngineCoreReadyResponse],
+) -> Vec<pb::KvEventSource> {
+    if let Some(consolidated) = ready_responses
+        .iter()
+        .find_map(|rr| rr.kv_events_consolidated_endpoint.as_deref())
+    {
+        // The consolidator republishes on an EMPTY ZMQ topic, unlike the raw
+        // vLLM publisher's `kv-events` topic. Advertise an empty topic so the
+        // router's SUB filter matches: ZMQ SUB does topic-PREFIX matching, so a
+        // `kv-events` filter would reject every empty-topic consolidated message
+        // and the router index would stay empty (KV-aware routing silently
+        // non-operational). Verified on cluster: consolidator frames carry topic
+        // `b''` while raw vLLM frames carry `b'kv-events'`.
+        return vec![pb::KvEventSource {
+            transport: "zmq".to_string(),
+            endpoint_addr: kv_endpoint_from_zmq(consolidated),
+            endpoint: consolidated.to_string(),
+            topic: String::new(),
+            replay_endpoint: String::new(),
+            data_parallel_rank: 0,
+            encoding: "msgpack".to_string(),
+            schema_version: 1,
+            buffer_steps: 0,
+            hwm: 0,
+            max_queue_size: 0,
+        }];
+    }
+
+    ready_responses
+        .iter()
+        .filter(|rr| rr.kv_events_publisher.as_deref() == Some("zmq"))
+        .filter_map(|rr| {
+            let base = rr.kv_events_endpoint.as_ref()?;
+            let endpoint = offset_endpoint_port(base, rr.data_parallel_rank);
+            Some(pb::KvEventSource {
+                transport: "zmq".to_string(),
+                endpoint_addr: kv_endpoint_from_zmq(&endpoint),
+                endpoint,
+                topic: rr.kv_events_topic.clone().unwrap_or_default(),
+                replay_endpoint: String::new(),
+                data_parallel_rank: rr.data_parallel_rank,
+                encoding: "msgpack".to_string(),
+                schema_version: 1,
+                buffer_steps: 0,
+                hwm: 0,
+                max_queue_size: 0,
+            })
+        })
+        .collect()
 }
 
 /// Parse a ZMQ publisher endpoint (`tcp://host:port`) into a connectable

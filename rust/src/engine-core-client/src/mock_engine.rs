@@ -64,6 +64,7 @@ pub fn default_ready_response() -> EngineCoreReadyResponse {
         kv_events_publisher: None,
         kv_events_endpoint: None,
         kv_events_topic: None,
+        kv_events_consolidated_endpoint: None,
     }
 }
 

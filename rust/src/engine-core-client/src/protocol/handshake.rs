@@ -86,6 +86,13 @@ pub struct EngineCoreReadyResponse {
     /// Topic the KV-event publisher tags events with, if configured.
     #[serde(default)]
     pub kv_events_topic: Option<String>,
+    /// KVBM KV-event consolidator output endpoint (`tcp://0.0.0.0:PORT` bind
+    /// form), if KVBM consolidation is active. The KV router subscribes here for
+    /// the deduped, multi-tier event stream instead of the per-rank raw vLLM
+    /// publishers. The OpenEngine frontend rewrites the wildcard host to a
+    /// routable address before advertising it.
+    #[serde(default)]
+    pub kv_events_consolidated_endpoint: Option<String>,
 }
 
 /// Frontend-owned ZMQ addresses that are sent to the engine during startup

@@ -99,6 +99,11 @@ class EngineCoreReadyResponse:
     kv_events_publisher: str | None = None
     kv_events_endpoint: str | None = None
     kv_events_topic: str | None = None
+    # KVBM KV-event consolidator output endpoint (bind form tcp://0.0.0.0:PORT),
+    # set via additional_config when KVBM consolidation is active. The router
+    # subscribes here for the deduped, multi-tier event stream instead of the
+    # per-rank raw vLLM publishers. None when KVBM consolidation is off.
+    kv_events_consolidated_endpoint: str | None = None
 
 
 class EngineCoreRequest(
