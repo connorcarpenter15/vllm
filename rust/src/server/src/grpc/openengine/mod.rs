@@ -233,6 +233,10 @@ impl pb::open_engine_server::OpenEngine for OpenEngineServiceImpl {
             supports_guided_decoding: true,
             supports_lora: false,
             supports_multimodal: self.state.chat.supports_multimodal(),
+            // openengine.v1 additive fields. The vLLM server does not advertise
+            // response parsers over OpenEngine yet.
+            reasoning_parser: String::new(),
+            tool_call_parser: String::new(),
         }))
     }
 

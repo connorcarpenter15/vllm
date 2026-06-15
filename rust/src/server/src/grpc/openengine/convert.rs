@@ -227,6 +227,7 @@ pub fn event_to_responses(
                         token_ids,
                         text: delta,
                         logprobs: Vec::new(),
+                        top_logprobs: Vec::new(),
                     })),
                     usage: None,
                 });
