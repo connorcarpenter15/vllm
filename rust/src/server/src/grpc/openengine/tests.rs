@@ -581,7 +581,6 @@ fn build_kv_event_sources_prefers_consolidator_single_rank0_source() {
     let src = &sources[0];
     assert_eq!(src.transport, "zmq");
     assert_eq!(src.data_parallel_rank, 0);
-    assert_eq!(src.endpoint, "tcp://0.0.0.0:57001");
     // Consolidator republishes on an empty topic; advertising the raw vLLM topic
     // here would make the router's SUB filter reject every consolidated message.
     assert_eq!(src.topic, "", "consolidator source must advertise an empty topic");

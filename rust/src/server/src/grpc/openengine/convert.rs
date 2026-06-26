@@ -5,8 +5,6 @@
 //! targets the vendor-neutral OpenEngine contract consumed by the Dynamo
 //! sidecar.
 
-use std::collections::HashMap;
-
 use tonic::Status;
 use uuid::Uuid;
 use vllm_chat::MediaContentPart;
@@ -67,20 +65,11 @@ pub fn to_text_request(
 
     // Decode-role disaggregation: lift the KV session handoff into
     // `kv_transfer_params` so the engine-core request carries it through to the
-    // connector. Prefer the typed `attributes_struct` (no string re-parse);
-    // fall back to the legacy string-map `attributes`. Round-trips with
-    // [`kv_transfer_params_to_kv_session`].
+    // connector. Round-trips with [`kv_transfer_params_to_kv_session`].
     if let Some(kv_session) = req.kv_session.as_ref() {
-        let kv_json = match kv_session.attributes_struct.as_ref() {
-            Some(s) if !s.fields.is_empty() => Some(prost_struct_to_json(s)),
-            _ if !kv_session.attributes.is_empty() => {
-                Some(kv_session_attributes_to_json(&kv_session.attributes))
-            }
-            _ => None,
-        };
-        if let Some(kv_json) = kv_json {
+        if let Some(s) = kv_session.attributes_struct.as_ref().filter(|s| !s.fields.is_empty()) {
             let map = sampling_params.vllm_xargs.get_or_insert_with(Default::default);
-            map.insert("kv_transfer_params".to_string(), kv_json);
+            map.insert("kv_transfer_params".to_string(), prost_struct_to_json(s));
         }
     }
 
@@ -355,22 +344,6 @@ pub fn mark_prefill_request(request: &mut TextRequest) {
 // KV session <-> kv_transfer_params encoding
 // ========================================================================================
 
-/// Decode KV session attributes (string-valued map) into a JSON object suitable
-/// for `kv_transfer_params`.
-///
-/// Each value is parsed as JSON when possible (so the prefill side can encode
-/// arbitrary types as JSON strings) and falls back to a plain string otherwise.
-fn kv_session_attributes_to_json(attrs: &HashMap<String, String>) -> serde_json::Value {
-    let map = attrs
-        .iter()
-        .map(|(k, v)| {
-            let value = serde_json::from_str(v).unwrap_or_else(|_| serde_json::Value::String(v.clone()));
-            (k.clone(), value)
-        })
-        .collect();
-    serde_json::Value::Object(map)
-}
-
 /// Encode `kv_transfer_params` (a JSON object) into a KV session reference.
 ///
 /// The params are carried in `attributes_struct` (a `google.protobuf.Struct`)
@@ -388,7 +361,6 @@ fn kv_transfer_params_to_kv_session(
         transfer_backend: kv_connector.unwrap_or_default().to_string(),
         endpoints: Vec::new(),
         dp_rank: 0,
-        attributes: HashMap::new(),
         attributes_struct: json_to_prost_struct(params),
     }
 }
@@ -647,7 +619,6 @@ mod tests {
         );
         assert_eq!(attrs["remote_engine_id"], serde_json::json!("engine-7"));
         assert_eq!(attrs["remote_block_ids"], serde_json::json!([1, 2, 3]));
-        assert!(session.attributes.is_empty(), "legacy attributes map is unset");
     }
 
     #[test]
@@ -677,26 +648,6 @@ mod tests {
     }
 
     #[test]
-    fn kv_session_attributes_round_trip_into_kv_transfer_params() {
-        let mut attributes = HashMap::new();
-        attributes.insert("remote_engine_id".to_string(), "engine-7".to_string());
-        attributes.insert("remote_block_ids".to_string(), "[1,2,3]".to_string());
-        let req = pb::GenerateRequest {
-            kv_session: Some(pb::KvSessionRef {
-                session_id: "sess".to_string(),
-                attributes,
-                ..Default::default()
-            }),
-            ..base_request()
-        };
-        let text = to_text_request(req, &["test-model".to_string()]).expect("convert");
-        let xargs = text.sampling_params.vllm_xargs.expect("xargs present");
-        let params = xargs.get("kv_transfer_params").expect("kv_transfer_params present");
-        assert_eq!(params["remote_engine_id"], "engine-7");
-        assert_eq!(params["remote_block_ids"], serde_json::json!([1, 2, 3]));
-    }
-
-    #[test]
     fn mark_prefill_sets_do_remote_decode() {
         let mut text = to_text_request(base_request(), &["test-model".to_string()]).expect("convert");
         mark_prefill_request(&mut text);
@@ -707,11 +658,12 @@ mod tests {
 
     #[test]
     fn mark_prefill_preserves_existing_kv_transfer_params() {
-        let mut attributes = HashMap::new();
-        attributes.insert("remote_engine_id".to_string(), "engine-7".to_string());
+        let attributes_struct = json_to_prost_struct(&serde_json::json!({
+            "remote_engine_id": "engine-7",
+        }));
         let req = pb::GenerateRequest {
             kv_session: Some(pb::KvSessionRef {
-                attributes,
+                attributes_struct,
                 ..Default::default()
             }),
             ..base_request()

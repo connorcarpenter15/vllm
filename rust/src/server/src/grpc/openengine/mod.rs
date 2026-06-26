@@ -553,19 +553,20 @@ fn build_kv_event_sources(
         // and the router index would stay empty (KV-aware routing silently
         // non-operational). Verified on cluster: consolidator frames carry topic
         // `b''` while raw vLLM frames carry `b'kv-events'`.
-        return vec![pb::KvEventSource {
-            transport: "zmq".to_string(),
-            endpoint_addr: kv_endpoint_from_zmq(consolidated),
-            endpoint: consolidated.to_string(),
-            topic: String::new(),
-            replay_endpoint: String::new(),
-            data_parallel_rank: 0,
-            encoding: "msgpack".to_string(),
-            schema_version: 1,
-            buffer_steps: 0,
-            hwm: 0,
-            max_queue_size: 0,
-        }];
+        if let Some(endpoint_addr) = kv_endpoint_from_zmq(consolidated) {
+            return vec![pb::KvEventSource {
+                transport: "zmq".to_string(),
+                endpoint_addr: Some(endpoint_addr),
+                topic: String::new(),
+                replay_endpoint: String::new(),
+                data_parallel_rank: 0,
+                encoding: "msgpack".to_string(),
+                schema_version: 1,
+                buffer_steps: 0,
+                hwm: 0,
+                max_queue_size: 0,
+            }];
+        }
     }
 
     ready_responses
@@ -574,10 +575,10 @@ fn build_kv_event_sources(
         .filter_map(|rr| {
             let base = rr.kv_events_endpoint.as_ref()?;
             let endpoint = offset_endpoint_port(base, rr.data_parallel_rank);
+            let endpoint_addr = kv_endpoint_from_zmq(&endpoint)?;
             Some(pb::KvEventSource {
                 transport: "zmq".to_string(),
-                endpoint_addr: kv_endpoint_from_zmq(&endpoint),
-                endpoint,
+                endpoint_addr: Some(endpoint_addr),
                 topic: rr.kv_events_topic.clone().unwrap_or_default(),
                 replay_endpoint: String::new(),
                 data_parallel_rank: rr.data_parallel_rank,
@@ -596,7 +597,7 @@ fn build_kv_event_sources(
 /// (`*` / `0.0.0.0` / `::`). The engine binds its KV-event publisher on a
 /// wildcard, which a remote KV router on another node cannot dial; this
 /// advertises the node's routable address instead. Returns `None` if the
-/// endpoint cannot be parsed (the legacy `endpoint` string is still set).
+/// endpoint cannot be parsed.
 fn kv_endpoint_from_zmq(endpoint: &str) -> Option<pb::KvEndpoint> {
     let rest = endpoint.strip_prefix("tcp://").unwrap_or(endpoint);
     let (host, port) = rest.rsplit_once(':')?;

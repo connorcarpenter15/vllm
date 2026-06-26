@@ -61,13 +61,10 @@ The **only** new vLLM CLI flags are `--openengine-port` / `--openengine-host`
 - **Prefill role**: the terminal `Finished.kv_transfer_params` (the connector's
   handoff metadata) is packed into `PrefillReady.kv_session.attributes_struct`
   as a typed `google.protobuf.Struct` (`convert::kv_transfer_params_to_kv_session`
-  → `json_to_prost_struct`). The legacy string-map `attributes` field is left
-  empty.
+  → `json_to_prost_struct`).
 - **Decode role**: the request's `kv_session.attributes_struct` is converted
   back to JSON (`convert::prost_struct_to_json`) and lifted into the
-  engine-core request's `kv_transfer_params` via `vllm_xargs`. If only the
-  legacy `attributes` (string map) is present, it falls back to
-  `kv_session_attributes_to_json`.
+  engine-core request's `kv_transfer_params` via `vllm_xargs`.
 
 The typed Struct preserves value types end-to-end (ints, bools, arrays) with no
 stringify/reparse — `number_to_json` recovers integral `f64`s back to JSON
