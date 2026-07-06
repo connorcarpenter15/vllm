@@ -48,6 +48,7 @@ mod classified_outputs;
 pub mod dtype;
 pub mod handshake;
 pub mod logprobs;
+pub mod lora;
 pub mod multimodal;
 pub mod stats;
 pub mod tensor;
@@ -57,6 +58,7 @@ pub use classified_outputs::{
 };
 pub use dtype::ModelDtype;
 pub use logprobs::decode_engine_core_outputs;
+pub use lora::LoraRequest;
 
 /// Request types are encoded as single-byte protocol constants so they can be
 /// sent over the ZMQ socket without an extra encoding step.
@@ -299,7 +301,15 @@ pub struct EngineCoreSamplingParams {
     #[serde(default)]
     pub skip_reading_prefix_cache: Option<bool>,
     /// Additional request parameters for custom extensions (from `vllm_xargs`).
-    #[serde(default)]
+    ///
+    /// Serialized via [`serialize_extra_args`]: the workspace enables
+    /// serde_json's `arbitrary_precision`, under which a `serde_json::Value`
+    /// number serializes (through any non-serde_json serializer, here
+    /// rmp_serde) as a tagged `{"$serde_json::private::Number": "<lexical>"}`
+    /// map. Without the custom serializer the Python engine would receive those
+    /// maps instead of integers — breaking, e.g., the NixlConnector reading
+    /// `remote_port`/`tp_size` out of `kv_transfer_params`.
+    #[serde(default, serialize_with = "serialize_extra_args")]
     pub extra_args: Option<HashMap<String, serde_json::Value>>,
 }
 
@@ -333,6 +343,84 @@ impl EngineCoreSamplingParams {
     }
 }
 
+/// Serialize `vllm_xargs`/`extra_args` so JSON numbers reach the engine as
+/// native msgpack integers and floats.
+///
+/// The workspace enables `serde_json/arbitrary_precision`, under which a
+/// `serde_json::Value::Number` always serializes — through any serializer that
+/// is not serde_json itself — as a newtype tagged with the magic key
+/// `$serde_json::private::Number`. Encoded with rmp_serde and sent to the
+/// Python engine, that tag arrives as a `{"$serde_json::private::Number":
+/// "<lexical>"}` map, which consumers expecting a real number mis-read (the
+/// NixlConnector reads `remote_port`/`tp_size` out of `kv_transfer_params` and
+/// fails with a `TypeError` when they are dicts). [`PlainJson`] re-emits each
+/// value via the primitive serializer methods, avoiding the tag.
+fn serialize_extra_args<S>(
+    value: &Option<HashMap<String, serde_json::Value>>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+    match value {
+        None => serializer.serialize_none(),
+        Some(map) => {
+            let mut m = serializer.serialize_map(Some(map.len()))?;
+            for (k, v) in map {
+                m.serialize_entry(k, &PlainJson(v))?;
+            }
+            m.end()
+        }
+    }
+}
+
+/// Serialize a borrowed [`serde_json::Value`] using the target serializer's
+/// primitive methods, so numbers are emitted natively even when serde_json's
+/// `arbitrary_precision` feature is enabled. See [`serialize_extra_args`].
+struct PlainJson<'a>(&'a serde_json::Value);
+
+impl serde::Serialize for PlainJson<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        match self.0 {
+            serde_json::Value::Null => serializer.serialize_unit(),
+            serde_json::Value::Bool(b) => serializer.serialize_bool(*b),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    serializer.serialize_i64(i)
+                } else if let Some(u) = n.as_u64() {
+                    serializer.serialize_u64(u)
+                } else if let Some(f) = n.as_f64() {
+                    serializer.serialize_f64(f)
+                } else {
+                    // An arbitrary_precision number fitting none of i64/u64/f64;
+                    // emit its lexical form rather than leak the tagged map.
+                    serializer.serialize_str(&n.to_string())
+                }
+            }
+            serde_json::Value::String(s) => serializer.serialize_str(s),
+            serde_json::Value::Array(items) => {
+                let mut seq = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    seq.serialize_element(&PlainJson(item))?;
+                }
+                seq.end()
+            }
+            serde_json::Value::Object(obj) => {
+                let mut m = serializer.serialize_map(Some(obj.len()))?;
+                for (k, v) in obj {
+                    m.serialize_entry(k, &PlainJson(v))?;
+                }
+                m.end()
+            }
+        }
+    }
+}
+
 /// Engine-core add-request payload sent from frontend to engine.
 ///
 /// Original Python definition:
@@ -349,7 +437,7 @@ pub struct EngineCoreRequest {
     pub pooling_params: Option<OpaqueValue>,
     pub arrival_time: f64,
     #[serde(default)]
-    pub lora_request: Option<OpaqueValue>,
+    pub lora_request: Option<LoraRequest>,
     #[serde(default)]
     pub cache_salt: Option<String>,
     #[serde(default)]
@@ -598,5 +686,58 @@ mod tests {
         .unwrap_err();
 
         expect_test::expect![[r#"messagepack decode failed for u64: wrong msgpack marker FixMap(1); value fallback: {"status": "READY"}"#]].assert_eq(&error.to_report_string());
+    }
+
+    #[test]
+    fn extra_args_numbers_serialize_as_native_msgpack() {
+        // Regression: with serde_json `arbitrary_precision` enabled, a
+        // `serde_json::Value` number would otherwise serialize through
+        // rmp_serde as a `{"$serde_json::private::Number": "..."}` map and reach
+        // the Python engine as a dict — breaking the NixlConnector reading
+        // `remote_port`/`tp_size` out of `kv_transfer_params`.
+        let kv = serde_json::json!({
+            "do_remote_prefill": true,
+            "remote_port": 20097,
+            "tp_size": 1,
+            "remote_block_ids": [[4]],
+            "remote_host": "127.0.0.1",
+        });
+        let params = EngineCoreSamplingParams {
+            extra_args: Some(HashMap::from([(
+                "kv_transfer_params".to_string(),
+                kv,
+            )])),
+            ..EngineCoreSamplingParams::for_test()
+        };
+
+        let encoded = encode_msgpack(&params).unwrap();
+        let value = decode_value(&encoded).unwrap();
+
+        fn get<'a>(value: &'a Value, key: &str) -> &'a Value {
+            match value {
+                Value::Map(entries) => entries
+                    .iter()
+                    .find(|(k, _)| k.as_str() == Some(key))
+                    .map(|(_, v)| v)
+                    .unwrap_or_else(|| panic!("missing key {key:?} in {value:?}")),
+                other => panic!("expected map for key {key:?}, got {other:?}"),
+            }
+        }
+
+        let kv_params = get(get(&value, "extra_args"), "kv_transfer_params");
+        assert_eq!(get(kv_params, "remote_port").as_i64(), Some(20097));
+        assert_eq!(get(kv_params, "tp_size").as_i64(), Some(1));
+        assert_eq!(get(kv_params, "remote_host").as_str(), Some("127.0.0.1"));
+        assert_eq!(get(kv_params, "do_remote_prefill").as_bool(), Some(true));
+        assert!(matches!(
+            get(kv_params, "remote_block_ids"),
+            Value::Array(_)
+        ));
+
+        // The arbitrary_precision tagged representation must not leak anywhere.
+        assert!(
+            !format!("{value:?}").contains("serde_json::private::Number"),
+            "arbitrary_precision tag leaked into msgpack: {value:?}"
+        );
     }
 }

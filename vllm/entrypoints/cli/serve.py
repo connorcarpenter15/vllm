@@ -181,6 +181,33 @@ def run_headless(args: argparse.Namespace):
         usage_context=usage_context, headless=True
     )
 
+    # KVBM: the in-process Dynamo worker injects the KV-event consolidator
+    # endpoints into additional_config before building the engine
+    # (dynamo/components/src/dynamo/vllm/main.py). A standalone headless engine
+    # has no such worker, so do it here. The connector leader reads these to
+    # start the consolidator that merges KVBM's multi-tier (GPU/CPU/disk) KV
+    # events into one stream for KV-aware routing. Only the KVBM connector
+    # (DynamoConnector / PdConnector) needs it; a no-op for everything else.
+    _kvtc = vllm_config.kv_transfer_config
+    if _kvtc is not None and getattr(_kvtc, "kv_connector", None) in (
+        "DynamoConnector",
+        "PdConnector",
+    ):
+        try:
+            from kvbm.vllm_integration.consolidator_config import (
+                get_consolidator_endpoints,
+            )
+
+            vllm_config.additional_config["consolidator_endpoints"] = (
+                get_consolidator_endpoints(vllm_config)
+            )
+        except Exception as e:
+            logger.warning(
+                "KVBM connector is enabled but consolidator endpoint setup "
+                "failed: %s. Continuing without KV event consolidation.",
+                e,
+            )
+
     if engine_args.data_parallel_hybrid_lb:
         raise ValueError("data_parallel_hybrid_lb is not applicable in headless mode")
 

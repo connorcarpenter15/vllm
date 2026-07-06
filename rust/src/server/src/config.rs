@@ -67,6 +67,12 @@ pub struct Config {
     /// TCP port for the gRPC Generate service. When `None`, no gRPC server is
     /// started.
     pub grpc_port: Option<u16>,
+    /// TCP port for the OpenEngine v1 gRPC service. When `None`, no OpenEngine
+    /// server is started.
+    pub openengine_port: Option<u16>,
+    /// Bind host for the OpenEngine gRPC service. When `None`, follows the HTTP
+    /// listener's host (matching the `grpc_port` behavior).
+    pub openengine_host: Option<String>,
     /// Maximum time to wait for active HTTP/gRPC requests to drain on shutdown.
     pub shutdown_timeout: Duration,
 }

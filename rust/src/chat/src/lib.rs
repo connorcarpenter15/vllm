@@ -17,6 +17,11 @@ pub use event::{
     AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantMessageExt,
     AssistantToolCall, ChatEvent,
 };
+// Multimodal types re-exported for non-chat callers (e.g. the OpenEngine gRPC
+// service) that build media parts and consume engine-facing features without
+// reaching into the internal crates directly.
+pub use llm_multimodal::MediaContentPart;
+pub use vllm_engine_core_client::protocol::multimodal::MmFeatures;
 use futures::{StreamExt, TryStreamExt as _};
 pub use output::{
     ChatOutputProcessor, DefaultChatOutputProcessor, DynChatOutputProcessor,
@@ -157,6 +162,37 @@ impl ChatLlm {
         self.text.engine_core_client()
     }
 
+    /// Whether the loaded backend resolved multimodal support (a registered
+    /// model spec + image processor). Mirrors `ModelInfo.supports_multimodal`.
+    pub fn supports_multimodal(&self) -> bool {
+        self.backend.multimodal_model_info().is_some()
+    }
+
+    /// Prepare pre-rendered multimodal media for callers that already hold
+    /// tokenized input (e.g. the OpenEngine gRPC service, whose token IDs carry
+    /// un-expanded placeholder markers from the orchestrator).
+    ///
+    /// Fetches and preprocesses each part, expands the placeholder markers in
+    /// `token_ids` in place, and builds the engine-facing features. Returns
+    /// `Ok(None)` when `media` is empty. Errors when media is present but the
+    /// backend has no multimodal support, so a multimodal request never
+    /// silently degrades to text on a text-only model.
+    pub async fn prepare_media(
+        &self,
+        media: Vec<MediaContentPart>,
+        token_ids: &mut Vec<u32>,
+    ) -> Result<Option<MmFeatures>> {
+        if media.is_empty() {
+            return Ok(None);
+        }
+        let info = self
+            .backend
+            .multimodal_model_info()
+            .ok_or(Error::UnsupportedMultimodalRenderer)?;
+        let features = info.prepare_multimodal(media, token_ids, self.model_dtype).await?;
+        Ok(Some(features))
+    }
+
     /// Render, tokenize, and submit one chat request.
     pub async fn chat(&self, mut request: ChatRequest) -> Result<ChatEventStream> {
         request.validate()?;
@@ -189,6 +225,7 @@ impl ChatLlm {
             cache_salt: request.cache_salt,
             add_special_tokens: request.add_special_tokens,
             data_parallel_rank: request.data_parallel_rank,
+            lora_request: None,
         };
         let decoded_stream = self.text.generate(text_request).await?.map_err(Error::from).boxed();
 

@@ -75,7 +75,11 @@ from vllm.v1.engine.utils import (
     get_device_indices,
 )
 from vllm.v1.executor import Executor
-from vllm.v1.kv_cache_interface import KVCacheConfig, get_kv_cache_spec_kind
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheSpecKind,
+    get_kv_cache_spec_kind,
+)
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -89,6 +93,32 @@ logger = init_logger(__name__)
 HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
+
+# KV-cache group kinds whose block size defines the prefix-cache event
+# granularity (the "main attention" group). Advertised to out-of-process
+# frontends as the KV-event block size; see EngineCore._kv_event_block_size.
+_MAIN_ATTENTION_KV_CACHE_KINDS = frozenset(
+    (
+        KVCacheSpecKind.FULL_ATTENTION.value,
+        KVCacheSpecKind.MLA_ATTENTION.value,
+        KVCacheSpecKind.SINK_FULL_ATTENTION.value,
+    )
+)
+
+
+def select_kv_event_block_size(
+    group_metadata: list[dict[str, int | str | None]],
+    fallback_block_size: int,
+) -> int:
+    """Pick the main-attention group's block size from KV-cache group metadata.
+
+    Returns ``fallback_block_size`` when no main-attention group is present.
+    """
+    for group in group_metadata:
+        if group.get("kind") in _MAIN_ATTENTION_KV_CACHE_KINDS:
+            block_size = group.get("block_size")
+            return int(block_size) if block_size else fallback_block_size
+    return fallback_block_size
 
 
 class EngineCore:
@@ -333,6 +363,23 @@ class EngineCore:
                 }
             )
         return metadata
+
+    def _kv_event_block_size(self) -> int:
+        """Block size at which prefix-cache (KV) events are published.
+
+        Out-of-process frontends (the OpenEngine sidecar's KV router) index
+        block-stored events at this granularity. Under the hybrid KV-cache
+        manager, ``_initialize_kv_caches`` resets ``cache_config.block_size``
+        to the *minimum* group block size, which need not match the
+        main-attention block size the events actually carry — so report the
+        main-attention group's block size, falling back to
+        ``cache_config.block_size``. Mirrors the in-process bridge's
+        ``select_main_attention_block_size``.
+        """
+        return select_kv_event_block_size(
+            self.get_kv_cache_group_metadata(),
+            self.vllm_config.cache_config.block_size or 0,
+        )
 
     def add_request(self, request: Request, request_wave: int = 0):
         """Add request to the scheduler.
@@ -1459,12 +1506,53 @@ class EngineCoreProc(EngineCore):
 
             # Register sockets with poller.
             poller = zmq.Poller()
+            parallel_config = self.vllm_config.parallel_config
+            scheduler_config = self.vllm_config.scheduler_config
+            kv_transfer_config = self.vllm_config.kv_transfer_config
+            kv_events_config = self.vllm_config.kv_events_config
+            # KVBM consolidator output endpoint (set in run_headless / the
+            # in-process Dynamo worker via additional_config). Element [1] is the
+            # bind endpoint (tcp://0.0.0.0:PORT); the OpenEngine frontend rewrites
+            # the wildcard host to a routable address. None when KVBM
+            # consolidation is not active. additional_config may be a non-dict
+            # SupportsHash, so guard before subscripting.
+            _additional_config = self.vllm_config.additional_config
+            consolidator_endpoints = (
+                _additional_config.get("consolidator_endpoints")
+                if isinstance(_additional_config, dict)
+                else None
+            )
             ready_response = EngineCoreReadyResponse(
                 max_model_len=self.vllm_config.model_config.max_model_len,
                 num_gpu_blocks=self.vllm_config.cache_config.num_gpu_blocks or 0,
                 dp_stats_address=self.frontend_stats_publish_address,
                 dtype=str(self.vllm_config.model_config.dtype).removeprefix("torch."),
                 vllm_version=VLLM_VERSION,
+                tensor_parallel_size=parallel_config.tensor_parallel_size,
+                pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+                data_parallel_size=parallel_config.data_parallel_size,
+                data_parallel_rank=parallel_config.data_parallel_rank,
+                block_size=self._kv_event_block_size(),
+                max_num_seqs=scheduler_config.max_num_seqs,
+                max_num_batched_tokens=scheduler_config.max_num_batched_tokens,
+                kv_connector=(
+                    kv_transfer_config.kv_connector if kv_transfer_config else None
+                ),
+                kv_role=(kv_transfer_config.kv_role if kv_transfer_config else None),
+                kv_engine_id=(
+                    kv_transfer_config.engine_id if kv_transfer_config else None
+                ),
+                kv_events_publisher=(
+                    kv_events_config.publisher if kv_events_config else None
+                ),
+                kv_events_endpoint=(
+                    kv_events_config.endpoint if kv_events_config else None
+                ),
+                kv_events_topic=(kv_events_config.topic if kv_events_config else None),
+                kv_events_consolidated_endpoint=(
+                    consolidator_endpoints[1] if consolidator_endpoints else None
+                ),
+                supports_lora=self.vllm_config.lora_config is not None,
             )
             ready_payload = msgspec.msgpack.encode(ready_response)
             for input_socket in input_sockets:

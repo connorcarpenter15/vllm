@@ -131,6 +131,33 @@ pub async fn serve(config: Config, shutdown: CancellationToken) -> Result<()> {
         None
     };
 
+    // Optionally bind the OpenEngine v1 gRPC service on its own port. Like the
+    // gRPC Generate service, bind synchronously here so bind errors surface
+    // before serving. The host follows --openengine-host, then the HTTP
+    // listener's host.
+    let openengine_setup = if let Some(openengine_port) = config.openengine_port {
+        let openengine_host = config.openengine_host.as_deref().unwrap_or(match &config.listener_mode {
+            HttpListenerMode::BindTcp { host, .. } => host.as_str(),
+            HttpListenerMode::BindUnix { .. } | HttpListenerMode::InheritedFd { .. } => "0.0.0.0",
+        });
+        let openengine_listener = TcpListener::bind((openengine_host, openengine_port))
+            .await
+            .with_context(|| {
+                format!("failed to bind OpenEngine listener on {openengine_host}:{openengine_port}")
+            })?;
+        let addr = openengine_listener.local_addr()?;
+        let openengine_svc = grpc::openengine::OpenEngineServer::new(
+            grpc::openengine::OpenEngineServiceImpl::new(state.clone()),
+        );
+        let lora_svc = grpc::openengine::LoraManagerServer::new(
+            grpc::openengine::LoraManagerServiceImpl::new(state.clone()),
+        );
+        info!(%addr, "starting OpenEngine server");
+        Some((openengine_listener, openengine_svc, lora_svc))
+    } else {
+        None
+    };
+
     info!(%bind_address, %model, "starting OpenAI server");
 
     // Set TCP_NODELAY on accepted connections to reduce latency.
@@ -226,8 +253,44 @@ pub async fn serve(config: Config, shutdown: CancellationToken) -> Result<()> {
         }
     };
 
-    let (http_res, grpc_res) = tokio::join!(http_fut, grpc_fut);
-    http_res.and(grpc_res)?;
+    let openengine_fut = {
+        let shutdown = server_shutdown.child_token();
+        let server_shutdown = server_shutdown.clone();
+        let force_shutdown = force_shutdown.clone();
+        async move {
+            let Some((openengine_listener, openengine_svc, lora_svc)) = openengine_setup else {
+                // No OpenEngine configured: wait for shutdown so we do not race
+                // the join! by resolving early and tripping the cancellation
+                // token.
+                shutdown.cancelled().await;
+                return Ok(());
+            };
+            let server = TonicServer::builder()
+                .add_service(openengine_svc)
+                .add_service(lora_svc)
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(openengine_listener),
+                    shutdown.cancelled_owned(),
+                );
+
+            let result = tokio::select! {
+                result = server => {
+                    result.context("OpenEngine server failed")
+                }
+                _ = force_shutdown.cancelled() => {
+                    warn!("OpenEngine graceful shutdown deadline elapsed; aborting server");
+                    Ok(())
+                }
+            };
+
+            server_shutdown.cancel();
+            result
+        }
+    };
+
+    let (http_res, grpc_res, openengine_res) =
+        tokio::join!(http_fut, grpc_fut, openengine_fut);
+    http_res.and(grpc_res).and(openengine_res)?;
 
     let shutdown_deadline = shutdown_deadline
         .get()

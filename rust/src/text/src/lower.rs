@@ -40,11 +40,11 @@ pub fn lower_text_request(
         cache_salt: request.cache_salt.clone(),
         priority: request.priority,
         data_parallel_rank: request.data_parallel_rank,
+        lora_request: request.lora_request.clone(),
         // Fields below are currently placeholders.
         arrival_time: None,
         trace_headers: None,
         reasoning_ended: None,
-        lora_request: None,
     };
 
     Ok(PreparedTextRequest {
@@ -385,6 +385,31 @@ mod tests {
             }
         "#]]
         .assert_debug_eq(&params);
+    }
+
+    #[test]
+    fn lower_text_request_forwards_lora_request() {
+        let mut request = sample_request();
+        let lora = vllm_engine_core_client::protocol::LoraRequest {
+            lora_name: "adapter-a".to_string(),
+            lora_int_id: 17,
+            lora_path: "/models/adapter-a".to_string(),
+            base_model_name: None,
+            tensorizer_config_dict: None,
+            load_inplace: false,
+            is_3d_lora_weight: false,
+        };
+        request.lora_request = Some(lora.clone());
+
+        let prepared = lower_text_request(
+            request,
+            vec![1, 2, 3],
+            sample_sampling_hints(),
+            &stub_tokenizer(),
+        )
+        .unwrap();
+
+        assert_eq!(prepared.generate_request.lora_request, Some(lora));
     }
 
     #[tokio::test]

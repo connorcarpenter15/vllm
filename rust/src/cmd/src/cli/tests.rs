@@ -38,6 +38,8 @@ fn serve_args_forward_python_flags_with_separator() {
                             512,
                         ),
                         grpc_port: None,
+                        openengine_port: None,
+                        openengine_host: None,
                         shutdown_timeout: 0,
                         chat_template: None,
                         default_chat_template_kwargs: None,
@@ -84,6 +86,43 @@ fn serve_args_auto_forward_python_flags_without_separator() {
         args.managed_engine.python_args,
         vec!["--quantization", "awq"]
     );
+}
+
+#[test]
+fn serve_args_forward_lora_engine_flags() {
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "Qwen/Qwen3-0.6B",
+        "--enable-lora",
+        "--max-loras",
+        "4",
+        "--max-lora-rank",
+        "64",
+    ])
+    .unwrap();
+
+    let Command::Serve(args) = cli.command else {
+        panic!("expected serve args");
+    };
+    assert_eq!(
+        args.managed_engine.python_args,
+        vec!["--enable-lora", "--max-loras", "4", "--max-lora-rank", "64"]
+    );
+}
+
+#[test]
+fn serve_args_reject_frontend_owned_lora_modules() {
+    let error = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "Qwen/Qwen3-0.6B",
+        "--lora-modules",
+        "adapter=/models/adapter",
+    ])
+    .unwrap_err();
+
+    assert!(error.to_string().contains("argument is not implemented"));
 }
 
 #[test]
@@ -213,6 +252,8 @@ fn frontend_args_accept_json() {
                         renderer: Auto,
                         max_model_len: None,
                         grpc_port: None,
+                        openengine_port: None,
+                        openengine_host: None,
                         shutdown_timeout: 0,
                         chat_template: None,
                         default_chat_template_kwargs: None,
@@ -611,6 +652,8 @@ fn serve_args_accept_handshake_aliases() {
                         renderer: Auto,
                         max_model_len: None,
                         grpc_port: None,
+                        openengine_port: None,
+                        openengine_host: None,
                         shutdown_timeout: 0,
                         chat_template: None,
                         default_chat_template_kwargs: None,
@@ -735,6 +778,8 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
             enable_log_requests: false,
             disable_log_stats: false,
             grpc_port: None,
+            openengine_port: None,
+            openengine_host: None,
             shutdown_timeout: 0ns,
         }
     "#]]
@@ -797,6 +842,8 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
             enable_log_requests: false,
             disable_log_stats: false,
             grpc_port: None,
+            openengine_port: None,
+            openengine_host: None,
             shutdown_timeout: 0ns,
         }
     "#]]
@@ -874,6 +921,8 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
             enable_log_requests: false,
             disable_log_stats: false,
             grpc_port: None,
+            openengine_port: None,
+            openengine_host: None,
             shutdown_timeout: 0ns,
         }
     "#]]

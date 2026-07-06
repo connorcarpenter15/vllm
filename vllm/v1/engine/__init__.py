@@ -77,6 +77,34 @@ class EngineCoreReadyResponse:
     dp_stats_address: str | None
     dtype: str
     vllm_version: str
+    # Engine configuration advertised to out-of-process frontends (e.g. the
+    # OpenEngine sidecar) so they can discover topology, role, and limits over
+    # the wire instead of being passed flags. All values are read from the
+    # authoritative VllmConfig at startup. Defaults keep the message
+    # backward-compatible for frontends that predate these fields.
+    tensor_parallel_size: int = 1
+    pipeline_parallel_size: int = 1
+    data_parallel_size: int = 1
+    data_parallel_rank: int = 0
+    # KV-event (main-attention) block size, NOT cache_config.block_size: under
+    # the hybrid KV-cache manager the latter is reset to the minimum group
+    # block size, which need not match the granularity at which prefix-cache
+    # events are published. See EngineCore._kv_event_block_size.
+    block_size: int = 0
+    max_num_seqs: int = 0
+    max_num_batched_tokens: int = 0
+    kv_connector: str | None = None
+    kv_role: str | None = None
+    kv_engine_id: str | None = None
+    kv_events_publisher: str | None = None
+    kv_events_endpoint: str | None = None
+    kv_events_topic: str | None = None
+    # KVBM KV-event consolidator output endpoint (bind form tcp://0.0.0.0:PORT),
+    # set via additional_config when KVBM consolidation is active. The router
+    # subscribes here for the deduped, multi-tier event stream instead of the
+    # per-rank raw vLLM publishers. None when KVBM consolidation is off.
+    kv_events_consolidated_endpoint: str | None = None
+    supports_lora: bool = False
 
 
 class EngineCoreRequest(
