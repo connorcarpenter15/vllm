@@ -5813,6 +5813,7 @@ dependencies = [
  "serde_with",
  "serial_test",
  "socket2",
+ "tempfile",
  "thiserror-ext",
  "tokio",
  "tokio-stream",

@@ -47,6 +47,20 @@ class EngineCoreSamplingParams(msgspec.Struct, dict=True):
     output_kind: RequestOutputKind = RequestOutputKind.DELTA
 
 
+class LoRARequest(
+    msgspec.Struct,
+    array_like=True,
+    omit_defaults=True,
+):
+    lora_name: str
+    lora_int_id: int
+    lora_path: str = ""
+    base_model_name: str | None = None
+    tensorizer_config_dict: dict | None = None
+    load_inplace: bool = False
+    is_3d_lora_weight: bool = False
+
+
 class EngineCoreRequest(
     msgspec.Struct,
     array_like=True,
@@ -58,7 +72,7 @@ class EngineCoreRequest(
     sampling_params: EngineCoreSamplingParams | None
     pooling_params: object | None
     arrival_time: float
-    lora_request: object | None = None
+    lora_request: LoRARequest | None = None
     cache_salt: str | None = None
     data_parallel_rank: int | None = None
     prompt_embeds: object | None = None
@@ -131,6 +145,15 @@ request = EngineCoreRequest(
     ),
     pooling_params=None,
     arrival_time=42.5,
+    lora_request=LoRARequest(
+        lora_name="adapter-a",
+        lora_int_id=17,
+        lora_path="/models/adapter-a",
+        base_model_name="Qwen/Qwen3-0.6B",
+        tensorizer_config_dict={"format": "safetensors"},
+        load_inplace=True,
+        is_3d_lora_weight=True,
+    ),
     client_index=0,
 )
 

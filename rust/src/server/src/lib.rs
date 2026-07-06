@@ -146,11 +146,14 @@ pub async fn serve(config: Config, shutdown: CancellationToken) -> Result<()> {
                 format!("failed to bind OpenEngine listener on {openengine_host}:{openengine_port}")
             })?;
         let addr = openengine_listener.local_addr()?;
-        let svc = grpc::openengine::OpenEngineServer::new(
+        let openengine_svc = grpc::openengine::OpenEngineServer::new(
             grpc::openengine::OpenEngineServiceImpl::new(state.clone()),
         );
+        let lora_svc = grpc::openengine::LoraManagerServer::new(
+            grpc::openengine::LoraManagerServiceImpl::new(state.clone()),
+        );
         info!(%addr, "starting OpenEngine server");
-        Some((openengine_listener, svc))
+        Some((openengine_listener, openengine_svc, lora_svc))
     } else {
         None
     };
@@ -255,17 +258,20 @@ pub async fn serve(config: Config, shutdown: CancellationToken) -> Result<()> {
         let server_shutdown = server_shutdown.clone();
         let force_shutdown = force_shutdown.clone();
         async move {
-            let Some((openengine_listener, svc)) = openengine_setup else {
+            let Some((openengine_listener, openengine_svc, lora_svc)) = openengine_setup else {
                 // No OpenEngine configured: wait for shutdown so we do not race
                 // the join! by resolving early and tripping the cancellation
                 // token.
                 shutdown.cancelled().await;
                 return Ok(());
             };
-            let server = TonicServer::builder().add_service(svc).serve_with_incoming_shutdown(
-                TcpListenerStream::new(openengine_listener),
-                shutdown.cancelled_owned(),
-            );
+            let server = TonicServer::builder()
+                .add_service(openengine_svc)
+                .add_service(lora_svc)
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(openengine_listener),
+                    shutdown.cancelled_owned(),
+                );
 
             let result = tokio::select! {
                 result = server => {

@@ -93,6 +93,9 @@ pub struct EngineCoreReadyResponse {
     /// routable address before advertising it.
     #[serde(default)]
     pub kv_events_consolidated_endpoint: Option<String>,
+    /// Whether the engine was started with LoRA support enabled.
+    #[serde(default)]
+    pub supports_lora: bool,
 }
 
 /// Frontend-owned ZMQ addresses that are sent to the engine during startup

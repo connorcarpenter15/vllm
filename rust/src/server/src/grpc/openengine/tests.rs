@@ -19,12 +19,15 @@ use vllm_chat::{
     DynChatOutputProcessor, DynChatRenderer, MediaContentPart, NewChatOutputProcessorOptions,
     RenderedPrompt,
 };
+use vllm_engine_core_client::mock_engine::{MockEngineConfig, default_ready_response};
+use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
+use vllm_engine_core_client::protocol::utility::{UtilityOutput, UtilityResultEnvelope};
 use vllm_engine_core_client::protocol::{
     EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
 };
-use vllm_engine_core_client::mock_engine::default_ready_response;
-use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
-use vllm_engine_core_client::test_utils::{IpcNamespace, spawn_mock_engine_task};
+use vllm_engine_core_client::test_utils::{
+    IpcNamespace, spawn_mock_engine_task, spawn_mock_engine_task_with_config,
+};
 use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig, EngineId};
 use vllm_llm::Llm;
 use vllm_text::tokenizer::{DynTokenizer, Tokenizer};
@@ -32,8 +35,11 @@ use vllm_text::{Prompt, TextBackend};
 use zeromq::prelude::{SocketRecv, SocketSend};
 use zeromq::{DealerSocket, PushSocket, ZmqMessage};
 
+use super::pb::lora_manager_client::LoraManagerClient;
 use super::pb::open_engine_client::OpenEngineClient;
-use super::{OpenEngineServer, OpenEngineServiceImpl, pb};
+use super::{
+    LoraManagerServer, LoraManagerServiceImpl, OpenEngineServer, OpenEngineServiceImpl, pb,
+};
 use crate::state::AppState;
 
 // ========================================================================================
@@ -304,9 +310,253 @@ fn base_request() -> pb::GenerateRequest {
     }
 }
 
+async fn lora_test_server(
+    supports_lora: bool,
+) -> (
+    OpenEngineClient<tonic::transport::Channel>,
+    LoraManagerClient<tonic::transport::Channel>,
+    tokio::task::JoinHandle<()>,
+    MockEngineTask,
+) {
+    let ipc = IpcNamespace::new().expect("create ipc namespace");
+    let handshake_address = ipc.handshake_endpoint();
+    let mut ready = default_ready_response();
+    ready.supports_lora = supports_lora;
+    let config = MockEngineConfig {
+        local: true,
+        headless: true,
+        ready_response: ready,
+        ..Default::default()
+    };
+
+    let engine_task = MockEngineTask::new(spawn_mock_engine_task_with_config(
+        handshake_address.clone(),
+        b"oe-lora".to_vec(),
+        config,
+        |dealer, push| {
+            boxed_test_future(async move {
+                let load = recv_engine_message(dealer).await;
+                assert_eq!(load[0].as_ref(), &[0x03]);
+                let load: rmpv::Value = rmp_serde::from_slice(&load[1]).unwrap();
+                let load = load.as_array().expect("load utility tuple");
+                assert_eq!(load[2], rmpv::Value::from("add_lora"));
+                send_utility_bool(push, load[1].as_u64().unwrap(), true).await;
+
+                let add = recv_engine_message(dealer).await;
+                assert_eq!(add[0].as_ref(), &[0x00]);
+                let request: EngineCoreRequest = rmp_serde::from_slice(&add[1]).unwrap();
+                let lora = request.lora_request.expect("LoRA request");
+                assert_eq!(lora.lora_name, "adapter-a");
+                assert_eq!(lora.lora_int_id, 17);
+                send_outputs(
+                    push,
+                    engine_outputs_for_request(&request.request_id, default_stream_output_specs()),
+                )
+                .await;
+
+                let unload = recv_engine_message(dealer).await;
+                assert_eq!(unload[0].as_ref(), &[0x03]);
+                let unload: rmpv::Value = rmp_serde::from_slice(&unload[1]).unwrap();
+                let unload = unload.as_array().expect("unload utility tuple");
+                assert_eq!(unload[2], rmpv::Value::from("remove_lora"));
+                send_utility_bool(push, unload[1].as_u64().unwrap(), true).await;
+            })
+        },
+    ));
+
+    let client = EngineCoreClient::connect(
+        EngineCoreClientConfig::new_single(handshake_address)
+            .with_model_name("test-model")
+            .with_local_input_output_addresses(
+                Some(ipc.input_endpoint()),
+                Some(ipc.output_endpoint()),
+            ),
+    )
+    .await
+    .expect("connect client");
+    let chat = ChatLlm::from_shared_backend(
+        test_llm(client),
+        Arc::new(FakeTextBackend) as Arc<dyn ChatTextBackend>,
+    );
+    let state = Arc::new(AppState::new(vec!["test-model".to_string()], chat));
+    let openengine = OpenEngineServer::new(OpenEngineServiceImpl::new(state.clone()));
+    let lora = LoraManagerServer::new(LoraManagerServiceImpl::new(state));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_task = tokio::spawn(async move {
+        TonicServer::builder()
+            .add_service(openengine)
+            .add_service(lora)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    (
+        OpenEngineClient::new(channel.clone()),
+        LoraManagerClient::new(channel),
+        server_task,
+        engine_task,
+    )
+}
+
+async fn send_utility_bool(push: &mut PushSocket, call_id: u64, result: bool) {
+    send_outputs(
+        push,
+        EngineCoreOutputs {
+            utility_output: Some(UtilityOutput {
+                call_id: call_id.into(),
+                failure_message: None,
+                result: Some(UtilityResultEnvelope::without_type_info(rmpv::Value::from(
+                    result,
+                ))),
+            }),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
 // ========================================================================================
 // Generate
 // ========================================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn lora_lifecycle_selects_adapter_for_generation() {
+    let (mut openengine, mut lora, server_task, engine_task) = lora_test_server(true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let adapter = pb::LoraAdapter {
+        lora_id: 17,
+        lora_name: "adapter-a".to_string(),
+        source_path: dir.path().to_string_lossy().into_owned(),
+    };
+
+    let loaded = lora
+        .load_lora(pb::LoadLoraRequest {
+            adapter: Some(adapter.clone()),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!loaded.already_loaded);
+    let loaded_again = lora
+        .load_lora(pb::LoadLoraRequest {
+            adapter: Some(adapter.clone()),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(loaded_again.already_loaded);
+
+    let error = lora
+        .load_lora(pb::LoadLoraRequest {
+            adapter: Some(pb::LoraAdapter {
+                lora_id: 18,
+                ..adapter.clone()
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::AlreadyExists);
+    let error = lora
+        .load_lora(pb::LoadLoraRequest {
+            adapter: Some(pb::LoraAdapter {
+                lora_name: "adapter-b".to_string(),
+                ..adapter.clone()
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::AlreadyExists);
+    let error = lora
+        .load_lora(pb::LoadLoraRequest {
+            adapter: Some(pb::LoraAdapter {
+                lora_id: 19,
+                lora_name: "adapter-c".to_string(),
+                source_path: adapter.source_path.clone(),
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::AlreadyExists);
+    let error = lora
+        .load_lora(pb::LoadLoraRequest {
+            adapter: Some(pb::LoraAdapter {
+                lora_id: 20,
+                lora_name: "relative".to_string(),
+                source_path: "relative/path".to_string(),
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    let error = lora
+        .unload_lora(pb::UnloadLoraRequest {
+            lora_name: "missing".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::NotFound);
+    assert_eq!(
+        lora.list_loras(pb::ListLorasRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .adapters
+            .len(),
+        1
+    );
+
+    let mut missing_request = base_request();
+    missing_request.lora_name = "missing".to_string();
+    let error = openengine.generate(missing_request).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::NotFound);
+
+    let mut request = base_request();
+    request.lora_name = "adapter-a".to_string();
+    let responses = openengine
+        .generate(request)
+        .await
+        .unwrap()
+        .into_inner()
+        .collect::<Vec<_>>()
+        .await;
+    assert!(responses.iter().all(Result::is_ok));
+
+    lora.unload_lora(pb::UnloadLoraRequest {
+        lora_name: "adapter-a".to_string(),
+    })
+    .await
+    .unwrap();
+    assert!(
+        lora.list_loras(pb::ListLorasRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .adapters
+            .is_empty()
+    );
+
+    server_task.abort();
+    engine_task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn lora_lifecycle_rejects_disabled_engine() {
+    let (_openengine, mut lora, server_task, engine_task) = lora_test_server(false).await;
+
+    let error = lora.list_loras(pb::ListLorasRequest {}).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
+    server_task.abort();
+    drop(engine_task);
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
@@ -487,6 +737,7 @@ async fn get_model_info_reports_caps_from_handshake() {
     assert!(info.supports_text_input);
     assert!(info.supports_token_ids_input);
     assert!(!info.supports_multimodal);
+    assert!(!info.supports_lora);
 
     server_task.abort();
 }

@@ -1,10 +1,13 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use std::collections::{BTreeMap, HashMap};
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Duration, Instant, sleep_until};
 use tracing::warn;
 use vllm_chat::ChatLlm;
 use vllm_engine_core_client::EngineCoreClient;
+use vllm_engine_core_client::protocol::LoraRequest;
 
 const SHUTDOWN_REFCOUNT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -19,6 +22,66 @@ pub struct AppState {
     pub enable_log_requests: bool,
     /// Number of in-flight inference requests currently owned by this frontend.
     server_load: AtomicU64,
+    /// Logical LoRA registry shared by generation and lifecycle RPCs.
+    loras: LoraRegistry,
+}
+
+#[derive(Default)]
+pub(crate) struct LoraRegistry {
+    /// Serialize lifecycle mutations while allowing request lookups to proceed.
+    pub(crate) lifecycle: Mutex<()>,
+    state: RwLock<LoraRegistryState>,
+}
+
+#[derive(Default)]
+struct LoraRegistryState {
+    by_name: BTreeMap<String, LoraRequest>,
+    by_id: HashMap<i64, String>,
+    by_path: HashMap<String, String>,
+}
+
+impl LoraRegistry {
+    pub(crate) async fn get(&self, name: &str) -> Option<LoraRequest> {
+        self.state.read().await.by_name.get(name).cloned()
+    }
+
+    pub(crate) async fn list(&self) -> Vec<LoraRequest> {
+        self.state.read().await.by_name.values().cloned().collect()
+    }
+
+    pub(crate) async fn conflicting_adapter(&self, adapter: &LoraRequest) -> Option<LoraRequest> {
+        let state = self.state.read().await;
+        if let Some(existing) = state.by_name.get(&adapter.lora_name) {
+            return (existing != adapter).then(|| existing.clone());
+        }
+        state
+            .by_id
+            .get(&adapter.lora_int_id)
+            .and_then(|name| state.by_name.get(name))
+            .cloned()
+            .or_else(|| {
+                state
+                    .by_path
+                    .get(&adapter.lora_path)
+                    .and_then(|name| state.by_name.get(name))
+                    .cloned()
+            })
+    }
+
+    pub(crate) async fn insert(&self, adapter: LoraRequest) {
+        let mut state = self.state.write().await;
+        state.by_id.insert(adapter.lora_int_id, adapter.lora_name.clone());
+        state.by_path.insert(adapter.lora_path.clone(), adapter.lora_name.clone());
+        state.by_name.insert(adapter.lora_name.clone(), adapter);
+    }
+
+    pub(crate) async fn remove(&self, name: &str) -> Option<LoraRequest> {
+        let mut state = self.state.write().await;
+        let adapter = state.by_name.remove(name)?;
+        state.by_id.remove(&adapter.lora_int_id);
+        state.by_path.remove(&adapter.lora_path);
+        Some(adapter)
+    }
 }
 
 impl AppState {
@@ -40,6 +103,7 @@ impl AppState {
             chat,
             enable_log_requests: false,
             server_load: AtomicU64::new(0),
+            loras: LoraRegistry::default(),
         }
     }
 
@@ -64,6 +128,10 @@ impl AppState {
     /// calls.
     pub(crate) fn engine_core_client(&self) -> &EngineCoreClient {
         self.chat.engine_core_client()
+    }
+
+    pub(crate) fn loras(&self) -> &LoraRegistry {
+        &self.loras
     }
 
     /// Return the current in-flight inference request count for the `/load`

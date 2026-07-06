@@ -89,6 +89,43 @@ fn serve_args_auto_forward_python_flags_without_separator() {
 }
 
 #[test]
+fn serve_args_forward_lora_engine_flags() {
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "Qwen/Qwen3-0.6B",
+        "--enable-lora",
+        "--max-loras",
+        "4",
+        "--max-lora-rank",
+        "64",
+    ])
+    .unwrap();
+
+    let Command::Serve(args) = cli.command else {
+        panic!("expected serve args");
+    };
+    assert_eq!(
+        args.managed_engine.python_args,
+        vec!["--enable-lora", "--max-loras", "4", "--max-lora-rank", "64"]
+    );
+}
+
+#[test]
+fn serve_args_reject_frontend_owned_lora_modules() {
+    let error = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "Qwen/Qwen3-0.6B",
+        "--lora-modules",
+        "adapter=/models/adapter",
+    ])
+    .unwrap_err();
+
+    assert!(error.to_string().contains("argument is not implemented"));
+}
+
+#[test]
 fn serve_args_auto_forward_python_multi_char_alias_without_separator() {
     let cli = Cli::try_parse_from(["vllm-rs", "serve", "Qwen/Qwen3-0.6B", "-tp", "2"]).unwrap();
 

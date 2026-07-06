@@ -9,6 +9,7 @@
 //! from CLI flags, so the sidecar discovers everything over the wire.
 
 mod convert;
+mod lora;
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -34,6 +35,8 @@ pub mod pb {
     tonic::include_proto!("openengine.v1");
 }
 
+pub use lora::LoraManagerServiceImpl;
+pub use pb::lora_manager_server::LoraManagerServer;
 pub use pb::open_engine_server::OpenEngineServer;
 
 #[cfg(test)]
@@ -108,11 +111,24 @@ impl pb::open_engine_server::OpenEngine for OpenEngineServiceImpl {
         request: Request<pb::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
         let proto_req = request.into_inner();
+        let lora_name = proto_req.lora_name.clone();
         // Extract media before moving the request into text conversion; wire
         // order aligns with the placeholder markers carried in the prompt.
         let media_parts = convert::media_parts_from_request(&proto_req.media)?;
         let mut text_request =
             convert::to_text_request(proto_req, self.state.served_model_names())?;
+
+        if !lora_name.is_empty() {
+            if !self.ready().supports_lora {
+                return Err(Status::failed_precondition(
+                    "engine was not started with LoRA enabled",
+                ));
+            }
+            text_request.lora_request =
+                Some(self.state.loras().get(&lora_name).await.ok_or_else(|| {
+                    Status::not_found(format!("LoRA adapter `{lora_name}` is not loaded"))
+                })?);
+        }
 
         let request_id = text_request.request_id.clone();
         info!(%request_id, "openengine generate");
@@ -231,7 +247,7 @@ impl pb::open_engine_server::OpenEngine for OpenEngineServiceImpl {
             supports_token_ids_input: true,
             supports_logprobs: true,
             supports_guided_decoding: true,
-            supports_lora: false,
+            supports_lora: rr.supports_lora,
             supports_multimodal: self.state.chat.supports_multimodal(),
             // openengine.v1 additive fields. The vLLM server does not advertise
             // response parsers over OpenEngine yet.
@@ -462,6 +478,7 @@ impl OpenEngineServiceImpl {
             cache_salt: None,
             add_special_tokens: true,
             data_parallel_rank: None,
+            lora_request: None,
         };
 
         match self.state.chat.text().generate(probe).await {

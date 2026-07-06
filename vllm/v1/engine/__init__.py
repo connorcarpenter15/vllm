@@ -104,6 +104,7 @@ class EngineCoreReadyResponse:
     # subscribes here for the deduped, multi-tier event stream instead of the
     # per-rank raw vLLM publishers. None when KVBM consolidation is off.
     kv_events_consolidated_endpoint: str | None = None
+    supports_lora: bool = False
 
 
 class EngineCoreRequest(

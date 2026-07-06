@@ -1552,6 +1552,7 @@ class EngineCoreProc(EngineCore):
                 kv_events_consolidated_endpoint=(
                     consolidator_endpoints[1] if consolidator_endpoints else None
                 ),
+                supports_lora=self.vllm_config.lora_config is not None,
             )
             ready_payload = msgspec.msgpack.encode(ready_response)
             for input_socket in input_sockets:

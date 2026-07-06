@@ -97,6 +97,7 @@ pub fn to_text_request(
         // request to the engine rank that holds its prefix (KV-aware routing).
         // Unset → the engine load-balances across its DP ranks as before.
         data_parallel_rank: req.data_parallel_rank,
+        lora_request: None,
     })
 }
 
