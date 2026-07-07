@@ -57,6 +57,19 @@ pub fn default_ready_response() -> EngineCoreReadyResponse {
         data_parallel_size: 1,
         kv_cache_size_tokens: None,
         kv_cache_max_concurrency: None,
+        tensor_parallel_size: 1,
+        pipeline_parallel_size: 1,
+        data_parallel_rank: 0,
+        max_num_seqs: 256,
+        max_num_batched_tokens: 8192,
+        kv_connector: None,
+        kv_role: None,
+        kv_engine_id: None,
+        kv_events_publisher: None,
+        kv_events_endpoint: None,
+        kv_events_topic: None,
+        kv_events_consolidated_endpoint: None,
+        supports_lora: false,
     }
 }
 

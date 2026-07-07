@@ -391,6 +391,21 @@ impl EngineCoreClient {
         self.engines.iter().map(|engine| &engine.ready_response).collect()
     }
 
+    /// Return the first engine's ready response.
+    ///
+    /// Engine topology, role, and limits (TP/PP size, KV block size, KV
+    /// connector role, scheduler caps) are uniform across the connected
+    /// engines, so the first engine's response is representative for discovery.
+    /// Per-engine values that differ (e.g. `data_parallel_rank`) should be read
+    /// via [`ready_responses`](Self::ready_responses) instead.
+    pub fn ready_response(&self) -> &EngineCoreReadyResponse {
+        &self
+            .engines
+            .first()
+            .expect("engine core client requires at least one engine")
+            .ready_response
+    }
+
     /// Return the engine-reported effective model dtype.
     pub fn model_dtype(&self) -> ModelDtype {
         self.engines

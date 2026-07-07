@@ -75,6 +75,8 @@ async fn main() -> Result<()> {
         api_keys: Vec::new(),
         disable_log_stats: false,
         grpc_port: None,
+        engine_rpc_port: None,
+        engine_rpc_host: None,
         shutdown_timeout: Duration::ZERO,
         keep_alive_timeout: Duration::from_secs(5),
         profiler: None,

@@ -147,10 +147,35 @@ where
         + Send
         + 'static,
 {
+    spawn_mock_engine_task_with_config(engine_handshake, engine_id, test_mock_engine_config(), run)
+}
+
+/// Variant of [`spawn_mock_engine_task`] with an explicit startup response.
+pub fn spawn_mock_engine_task_with_config<F>(
+    engine_handshake: String,
+    engine_id: impl Into<EngineId>,
+    config: MockEngineConfig,
+    run: F,
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>)
+where
+    F: for<'a> FnOnce(
+            &'a mut DealerSocket,
+            &'a mut PushSocket,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
+        + Send
+        + 'static,
+{
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let engine_id = engine_id.into();
     let engine_task = tokio::spawn(async move {
-        let (mut dealer, mut push) = setup_mock_engine(engine_handshake, engine_id).await;
+        let MockEngineSockets { data_sockets, .. } =
+            connect_to_frontend(engine_handshake, engine_id, config)
+                .await
+                .expect("connect mock engine");
+        let MockEngineDataSockets {
+            mut dealer,
+            mut push,
+        } = data_sockets.into_iter().next().expect("mock engine data socket");
         run(&mut dealer, &mut push).await;
         let _ = shutdown_rx.await;
     });

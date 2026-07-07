@@ -53,6 +53,49 @@ pub struct EngineCoreReadyResponse {
     pub kv_cache_size_tokens: Option<u64>,
     /// Maximum achievable request concurrency given the KV cache, if reported.
     pub kv_cache_max_concurrency: Option<f64>,
+    /// Tensor-parallel size of this engine.
+    #[serde(default)]
+    pub tensor_parallel_size: u32,
+    /// Pipeline-parallel size of this engine.
+    #[serde(default)]
+    pub pipeline_parallel_size: u32,
+    /// This engine's data-parallel rank.
+    #[serde(default)]
+    pub data_parallel_rank: u32,
+    /// Scheduler cap on concurrently running sequences.
+    #[serde(default)]
+    pub max_num_seqs: u64,
+    /// Scheduler cap on batched tokens per step.
+    #[serde(default)]
+    pub max_num_batched_tokens: u64,
+    /// Configured KV connector name (e.g. `NixlConnector`), if any.
+    #[serde(default)]
+    pub kv_connector: Option<String>,
+    /// KV transfer role (`kv_producer` / `kv_consumer` / `kv_both`), if any.
+    #[serde(default)]
+    pub kv_role: Option<String>,
+    /// KV connector engine identifier, if a connector is configured.
+    #[serde(default)]
+    pub kv_engine_id: Option<String>,
+    /// KV-event publisher backend (`null` / `zmq`), if configured.
+    #[serde(default)]
+    pub kv_events_publisher: Option<String>,
+    /// ZMQ endpoint the engine publishes KV events on, if configured.
+    #[serde(default)]
+    pub kv_events_endpoint: Option<String>,
+    /// Topic the KV-event publisher tags events with, if configured.
+    #[serde(default)]
+    pub kv_events_topic: Option<String>,
+    /// KVBM KV-event consolidator output endpoint (`tcp://0.0.0.0:PORT` bind
+    /// form), if KVBM consolidation is active. The KV router subscribes here for
+    /// the deduped, multi-tier event stream instead of the per-rank raw vLLM
+    /// publishers. The engine RPC frontend rewrites the wildcard host to a
+    /// routable address before advertising it.
+    #[serde(default)]
+    pub kv_events_consolidated_endpoint: Option<String>,
+    /// Whether the engine was started with LoRA support enabled.
+    #[serde(default)]
+    pub supports_lora: bool,
 }
 
 /// Frontend-owned ZMQ addresses that are sent to the engine during startup

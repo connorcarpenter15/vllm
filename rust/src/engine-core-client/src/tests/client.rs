@@ -159,6 +159,18 @@ fn sample_request_with_id(request_id: &str) -> EngineCoreRequest {
             ..EngineCoreSamplingParams::for_test()
         }),
         arrival_time: 42.5,
+        lora_request: Some(crate::protocol::LoraRequest {
+            lora_name: "adapter-a".to_string(),
+            lora_int_id: 17,
+            lora_path: "/models/adapter-a".to_string(),
+            base_model_name: Some("Qwen/Qwen3-0.6B".to_string()),
+            tensorizer_config_dict: Some(rmpv::Value::Map(vec![(
+                rmpv::Value::from("format"),
+                rmpv::Value::from("safetensors"),
+            )])),
+            load_inplace: true,
+            is_3d_lora_weight: true,
+        }),
         ..EngineCoreRequest::default()
     }
 }

@@ -48,6 +48,14 @@ pub(crate) enum UnloadLoraError {
     },
 }
 
+#[derive(Debug)]
+pub(crate) enum LoadExactLoraError {
+    BaseModelName { lora_name: String },
+    Conflict { existing: LoraRequest },
+    Engine(vllm_engine_core_client::Error),
+    NotLoaded { lora_name: String },
+}
+
 impl LoraManager {
     pub fn new() -> Self {
         Self {
@@ -124,6 +132,62 @@ impl LoraManager {
         Ok(lora_request)
     }
 
+    /// Load an adapter with a caller-supplied ID.
+    pub async fn load_lora_exact(
+        &self,
+        engine_core_client: &EngineCoreClient,
+        base_model_names: &[String],
+        lora_request: LoraRequest,
+    ) -> Result<(LoraRequest, bool), LoadExactLoraError> {
+        let _guard = self.update_lock.lock().await;
+        if base_model_names.iter().any(|name| name == &lora_request.lora_name) {
+            return Err(LoadExactLoraError::BaseModelName {
+                lora_name: lora_request.lora_name,
+            });
+        }
+
+        let requests = self.requests.read().await;
+        if let Some(existing) = requests.values().find(|existing| {
+            existing.lora_name == lora_request.lora_name
+                || existing.lora_int_id == lora_request.lora_int_id
+                || existing.lora_path == lora_request.lora_path
+        }) {
+            if existing == &lora_request {
+                return Ok((existing.clone(), true));
+            }
+            return Err(LoadExactLoraError::Conflict {
+                existing: existing.clone(),
+            });
+        }
+        drop(requests);
+
+        let results =
+            match engine_core_client.call_utility::<bool, _>("add_lora", (&lora_request,)).await {
+                Ok(results) => results,
+                Err(error) => {
+                    let _ = engine_core_client
+                        .call_utility::<bool, _>("remove_lora", (lora_request.lora_int_id,))
+                        .await;
+                    return Err(LoadExactLoraError::Engine(error));
+                }
+            };
+        if !results.iter().all(|loaded| *loaded) {
+            let _ = engine_core_client
+                .call_utility::<bool, _>("remove_lora", (lora_request.lora_int_id,))
+                .await;
+            return Err(LoadExactLoraError::NotLoaded {
+                lora_name: lora_request.lora_name,
+            });
+        }
+
+        self.id_counter.fetch_max(lora_request.lora_int_id, Ordering::Relaxed);
+        self.requests
+            .write()
+            .await
+            .insert(lora_request.lora_name.clone(), lora_request.clone());
+        Ok((lora_request, false))
+    }
+
     /// Remove one dynamic LoRA adapter from the engine and public model
     /// registry.
     pub async fn unload_lora(
@@ -149,11 +213,19 @@ impl LoraManager {
             });
         }
 
-        let removed = engine_core_client
-            .remove_lora(lora_request.lora_int_id)
+        let removed = match engine_core_client
+            .call_utility::<bool, _>("remove_lora", (lora_request.lora_int_id,))
             .await
-            .map_err(UnloadLoraError::Engine)?;
+        {
+            Ok(results) => results.iter().all(|removed| *removed),
+            Err(error) => {
+                let _ =
+                    engine_core_client.call_utility::<bool, _>("add_lora", (&lora_request,)).await;
+                return Err(UnloadLoraError::Engine(error));
+            }
+        };
         if !removed {
+            let _ = engine_core_client.call_utility::<bool, _>("add_lora", (&lora_request,)).await;
             return Err(UnloadLoraError::NotRemoved {
                 lora_name: lora_request.lora_name,
                 lora_int_id: lora_request.lora_int_id,

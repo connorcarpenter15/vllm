@@ -1,6 +1,7 @@
 //! gRPC Generate service backed by the shared [`vllm_text::TextLlm`] facade.
 
 mod convert;
+pub mod engine_rpc;
 
 use std::pin::Pin;
 use std::sync::Arc;
