@@ -151,13 +151,13 @@ pub struct SharedRuntimeArgs {
     #[serde(default)]
     pub grpc_port: Option<u16>,
     /// TCP port for the engine RPC service consumed by out-of-process
-    /// frontends such as the Dynamo vLLM sidecar. When not set, no engine RPC
-    /// server is started.
+    /// frontends. When not set, no engine RPC server is started.
     #[arg(long)]
     #[serde(default)]
     pub engine_rpc_port: Option<u16>,
-    /// Bind host for the engine RPC service. When not set, follows the
-    /// HTTP listener's host.
+    /// Bind host for the unauthenticated engine control service. Defaults to
+    /// loopback. Setting a non-loopback host deliberately exposes privileged
+    /// lifecycle RPCs and should only be done on an access-controlled network.
     #[arg(long)]
     #[serde(default)]
     pub engine_rpc_host: Option<String>,

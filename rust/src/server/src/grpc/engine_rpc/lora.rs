@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::sync::Arc;
 
 use thiserror_ext::AsReport as _;
 use tonic::{Request, Response, Status};
@@ -9,105 +8,109 @@ use super::pb;
 use crate::lora::{LoadExactLoraError, UnloadLoraError};
 use crate::state::AppState;
 
-pub struct LoraManagerServiceImpl {
-    state: Arc<AppState>,
+fn ensure_enabled(state: &AppState) -> Result<(), Status> {
+    state
+        .engine_core_client()
+        .ready_response()
+        .supports_lora
+        .then_some(())
+        .ok_or_else(|| Status::failed_precondition("engine was not started with LoRA enabled"))
 }
 
-impl LoraManagerServiceImpl {
-    pub fn new(state: Arc<AppState>) -> Self {
-        Self { state }
-    }
-
-    fn ensure_enabled(&self) -> Result<(), Status> {
-        self.state
-            .engine_core_client()
-            .ready_response()
-            .supports_lora
-            .then_some(())
-            .ok_or_else(|| Status::failed_precondition("engine was not started with LoRA enabled"))
-    }
+fn ensure_consistent(state: &AppState) -> Result<(), Status> {
+    state.lora_state_is_consistent().then_some(()).ok_or_else(|| {
+        Status::failed_precondition("LoRA state differs across engine ranks; restart the engine")
+    })
 }
 
-#[tonic::async_trait]
-impl pb::lora_manager_server::LoraManager for LoraManagerServiceImpl {
-    async fn load_lora(
-        &self,
-        request: Request<pb::LoadLoraRequest>,
-    ) -> Result<Response<pb::LoadLoraResponse>, Status> {
-        self.ensure_enabled()?;
-        let adapter = normalize_adapter(
-            request
-                .into_inner()
-                .adapter
-                .ok_or_else(|| Status::invalid_argument("adapter is required"))?,
-        )
-        .await?;
+pub(super) async fn load_lora(
+    state: &std::sync::Arc<AppState>,
+    request: Request<pb::LoadLoraRequest>,
+) -> Result<Response<pb::LoadLoraResponse>, Status> {
+    ensure_enabled(state)?;
+    ensure_consistent(state)?;
+    let adapter = normalize_adapter(
+        request
+            .into_inner()
+            .adapter
+            .ok_or_else(|| Status::invalid_argument("adapter is required"))?,
+    )
+    .await?;
+    let _guard = state
+        .try_admit_engine_work()
+        .ok_or_else(|| Status::unavailable("engine is draining"))?;
 
-        let (adapter, already_loaded) =
-            self.state.load_lora_exact(adapter).await.map_err(|error| match error {
-                LoadExactLoraError::BaseModelName { lora_name } => Status::already_exists(format!(
-                    "LoRA adapter `{lora_name}` conflicts with a served base model"
-                )),
-                LoadExactLoraError::Conflict { existing } => conflict(&existing),
-                LoadExactLoraError::Engine(error) => Status::internal(error.to_report_string()),
-                LoadExactLoraError::NotLoaded { lora_name } => Status::internal(format!(
-                    "one or more engine ranks rejected LoRA adapter `{lora_name}`"
-                )),
-            })?;
-        Ok(Response::new(pb::LoadLoraResponse {
-            adapter: Some(to_proto(&adapter)),
-            already_loaded,
-        }))
+    let (adapter, already_loaded) =
+        state.load_lora_exact(adapter).await.map_err(|error| match error {
+            LoadExactLoraError::Inconsistent => Status::failed_precondition(
+                "LoRA state differs across engine ranks; restart the engine",
+            ),
+            LoadExactLoraError::BaseModelName { lora_name } => Status::already_exists(format!(
+                "LoRA adapter `{lora_name}` conflicts with a served base model"
+            )),
+            LoadExactLoraError::Conflict { existing } => conflict(&existing),
+            LoadExactLoraError::Engine(error) => Status::internal(error.to_report_string()),
+            LoadExactLoraError::NotLoaded { lora_name } => Status::internal(format!(
+                "one or more engine ranks rejected LoRA adapter `{lora_name}`"
+            )),
+        })?;
+    Ok(Response::new(pb::LoadLoraResponse {
+        adapter: Some(to_proto(&adapter)),
+        already_loaded,
+    }))
+}
+
+pub(super) async fn unload_lora(
+    state: &std::sync::Arc<AppState>,
+    request: Request<pb::UnloadLoraRequest>,
+) -> Result<Response<pb::UnloadLoraResponse>, Status> {
+    ensure_enabled(state)?;
+    ensure_consistent(state)?;
+    let name = request.into_inner().lora_name;
+    if name.trim().is_empty() {
+        return Err(Status::invalid_argument("lora_name is required"));
     }
 
-    async fn unload_lora(
-        &self,
-        request: Request<pb::UnloadLoraRequest>,
-    ) -> Result<Response<pb::UnloadLoraResponse>, Status> {
-        self.ensure_enabled()?;
-        let name = request.into_inner().lora_name;
-        if name.trim().is_empty() {
-            return Err(Status::invalid_argument("lora_name is required"));
-        }
-
-        let adapter = self
-            .state
-            .served_lora_requests()
+    let adapter = state
+        .served_lora_requests()
+        .await
+        .into_iter()
+        .find(|adapter| adapter.lora_name == name)
+        .ok_or_else(|| Status::not_found(format!("LoRA adapter `{name}` is not loaded")))?;
+    let _guard = state
+        .try_admit_engine_work()
+        .ok_or_else(|| Status::unavailable("engine is draining"))?;
+    let adapter =
+        state
+            .unload_lora(&name, Some(adapter.lora_int_id))
             .await
-            .into_iter()
-            .find(|adapter| adapter.lora_name == name)
-            .ok_or_else(|| Status::not_found(format!("LoRA adapter `{name}` is not loaded")))?;
-        let adapter =
-            self.state
-                .unload_lora(&name, Some(adapter.lora_int_id))
-                .await
-                .map_err(|error| match error {
-                    UnloadLoraError::NotFound { lora_name } => {
-                        Status::not_found(format!("LoRA adapter `{lora_name}` is not loaded"))
-                    }
-                    UnloadLoraError::IntIdMismatch { .. } => {
-                        Status::internal("LoRA registry changed during unload")
-                    }
-                    UnloadLoraError::Engine(error) => Status::internal(error.to_report_string()),
-                    UnloadLoraError::NotRemoved { lora_name, .. } => Status::internal(format!(
-                        "one or more engine ranks rejected unloading LoRA adapter `{lora_name}`"
-                    )),
-                })?;
-        Ok(Response::new(pb::UnloadLoraResponse {
-            adapter: Some(to_proto(&adapter)),
-        }))
-    }
+            .map_err(|error| match error {
+                UnloadLoraError::Inconsistent => Status::failed_precondition(
+                    "LoRA state differs across engine ranks; restart the engine",
+                ),
+                UnloadLoraError::NotFound { lora_name } => {
+                    Status::not_found(format!("LoRA adapter `{lora_name}` is not loaded"))
+                }
+                UnloadLoraError::IntIdMismatch { .. } => {
+                    Status::internal("LoRA registry changed during unload")
+                }
+                UnloadLoraError::Engine(error) => Status::internal(error.to_report_string()),
+            })?;
+    Ok(Response::new(pb::UnloadLoraResponse {
+        adapter: Some(to_proto(&adapter)),
+    }))
+}
 
-    async fn list_loras(
-        &self,
-        _request: Request<pb::ListLorasRequest>,
-    ) -> Result<Response<pb::ListLorasResponse>, Status> {
-        self.ensure_enabled()?;
-        let mut adapters = self.state.served_lora_requests().await;
-        adapters.sort_by(|left, right| left.lora_name.cmp(&right.lora_name));
-        let adapters = adapters.iter().map(to_proto).collect();
-        Ok(Response::new(pb::ListLorasResponse { adapters }))
-    }
+pub(super) async fn list_loras(
+    state: &std::sync::Arc<AppState>,
+    _request: Request<pb::ListLorasRequest>,
+) -> Result<Response<pb::ListLorasResponse>, Status> {
+    ensure_enabled(state)?;
+    ensure_consistent(state)?;
+    let mut adapters = state.served_lora_requests().await;
+    adapters.sort_by(|left, right| left.lora_name.cmp(&right.lora_name));
+    let adapters = adapters.iter().map(to_proto).collect();
+    Ok(Response::new(pb::ListLorasResponse { adapters }))
 }
 
 async fn normalize_adapter(adapter: pb::LoraAdapter) -> Result<LoraRequest, Status> {

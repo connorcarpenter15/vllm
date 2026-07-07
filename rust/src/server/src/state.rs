@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use serde_json::Value;
@@ -43,6 +43,8 @@ pub struct AppState {
     api_key_hashes: Vec<ApiKeyHash>,
     /// Number of in-flight inference requests currently owned by this frontend.
     server_load: AtomicU64,
+    /// Whether engine-mutating frontend work has stopped accepting requests.
+    engine_draining: AtomicBool,
     /// Dynamic LoRA adapter registry.
     lora_manager: LoraManager,
     /// Backend model path reported as `root` for base-model cards.
@@ -76,6 +78,7 @@ impl AppState {
             server_info: None,
             api_key_hashes: Vec::new(),
             server_load: AtomicU64::new(0),
+            engine_draining: AtomicBool::new(false),
             lora_manager: LoraManager::new(),
             model_path: None,
             request_runtime: OnceLock::new(),
@@ -160,6 +163,11 @@ impl AppState {
         self.lora_manager.served_lora_requests().await
     }
 
+    /// Whether the dynamic LoRA registry is known to match every engine rank.
+    pub(crate) fn lora_state_is_consistent(&self) -> bool {
+        self.lora_manager.is_consistent()
+    }
+
     /// Resolve the requested model against one dynamic LoRA registry snapshot.
     pub async fn resolve_model_with_loras(&self, model_name: Option<&str>) -> LoraModelResolution {
         self.lora_manager.resolve_model(&self.served_model_names, model_name).await
@@ -226,19 +234,44 @@ impl AppState {
     /// Return the current in-flight inference request count for the `/load`
     /// endpoint.
     pub fn server_load(&self) -> u64 {
-        self.server_load.load(Ordering::Relaxed)
+        self.server_load.load(Ordering::SeqCst)
+    }
+
+    /// Stop all frontend admission to engine-mutating work. This transition is
+    /// irreversible for the lifetime of the server process.
+    pub(crate) fn begin_engine_drain(&self) {
+        self.engine_draining.store(true, Ordering::SeqCst);
+    }
+
+    /// Return whether engine-mutating frontend admission has stopped.
+    pub(crate) fn engine_is_draining(&self) -> bool {
+        self.engine_draining.load(Ordering::SeqCst)
+    }
+
+    /// Atomically admit one unit of engine work or reject it after drain has
+    /// begun. The returned guard owns the in-flight count until dropped.
+    pub(crate) fn try_admit_engine_work(self: &Arc<Self>) -> Option<EngineWorkGuard> {
+        if self.engine_is_draining() {
+            return None;
+        }
+        self.increment_server_load();
+        if self.engine_is_draining() {
+            self.decrement_server_load();
+            return None;
+        }
+        Some(EngineWorkGuard(self.clone()))
     }
 
     /// Increment the in-flight inference request count, called by the load
     /// tracking middleware.
     pub(crate) fn increment_server_load(&self) {
-        self.server_load.fetch_add(1, Ordering::Relaxed);
+        self.server_load.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Decrement the in-flight inference request count, called by the load
     /// tracking middleware.
     pub(crate) fn decrement_server_load(&self) {
-        self.server_load.fetch_sub(1, Ordering::Relaxed);
+        self.server_load.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Wait until all request-owned references are dropped, then shut down the
@@ -274,5 +307,14 @@ impl AppState {
             ))
             .await;
         }
+    }
+}
+
+/// Owns one admitted unit of engine work.
+pub(crate) struct EngineWorkGuard(Arc<AppState>);
+
+impl Drop for EngineWorkGuard {
+    fn drop(&mut self) {
+        self.0.decrement_server_load();
     }
 }

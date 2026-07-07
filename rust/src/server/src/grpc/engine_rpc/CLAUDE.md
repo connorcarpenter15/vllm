@@ -1,8 +1,7 @@
 # Private engine RPC service
 
 This module implements vLLM's private RPC API for out-of-process frontends.
-The schema lives at `rust/proto/engine.proto`. Dynamo's Rust vLLM sidecar is
-the current client.
+The schema lives at `rust/proto/engine.proto`.
 
 It is a **sibling** of the `vllm`-native Generate service in `../mod.rs` and is
 backed by the same [`crate::state::AppState`] / [`vllm_text::TextLlm`] facade.
@@ -15,7 +14,7 @@ for this module — keep them structurally parallel.
 |---|---|
 | `mod.rs` | `EngineServiceImpl` — implements the generated `engine_server::Engine` trait. `pb` = `tonic::include_proto!("vllm.engine.v1")`. |
 | `convert.rs` | engine RPC `GenerateRequest` ↔ `vllm_text::TextRequest`, and `DecodedTextEvent` → `GenerateResponse` oneof. |
-| `tests.rs` | Wire-shape tests against the `mock-engine` double (mirror of `../tests.rs`). |
+| `tests.rs`, `tests/` | Shared mock harness plus focused discovery, generation, lifecycle, LoRA, media, and topology tests. |
 | `CLAUDE.md` | This file. |
 
 ## Discovery comes from the engine handshake, not from flags
@@ -32,8 +31,8 @@ populates from its `vllm_config`:
   flag. See `convert::role_from_kv_role`.
 - **Parallelism** — `tensor_parallel_size`, `pipeline_parallel_size`,
   `data_parallel_size`, `data_parallel_rank`.
-- **Caps** — `block_size`, `max_num_seqs`, `max_num_batched_tokens`,
-  `max_model_len` (+ `num_gpu_blocks` summed across engines).
+- **Caps** — `block_size`, per-engine `num_gpu_blocks`, `max_num_seqs`,
+  `max_num_batched_tokens`, `max_model_len`, and `max_loras`.
 - **KV connector / events** — `kv_connector`, `kv_engine_id`,
   `kv_events_publisher`/`endpoint`/`topic`.
 
@@ -46,14 +45,13 @@ The **only** new vLLM CLI flags are `--engine-rpc-port` / `--engine-rpc-host`
 |---|---|
 | `Generate` (server-stream) | `TextLlm::generate`. Per `TextDelta` → `Token{token_ids,text}`; terminal → `Finished{reason,usage}`, or `PrefillReady{kv_session}` for the prefill role. Mid-stream failure → `EngineError`. `stream=false` collapses to the terminal output only (`intermediate` flag). `media` (if present) → `MediaContentPart`s via `media_parts_from_request`, then `ChatLlm::prepare_media` fetches/preprocesses and expands the placeholder markers in `token_ids` (so multimodal requests must use token-ids input); runs before `mark_prefill_request` so prefill encodes the media. |
 | `GetEngineInfo` | `engine_name="vllm"`, version + role + parallelism + kv_connector from the handshake. |
-| `GetModelInfo` | model id / served names + caps from the handshake; most capability bools are static (text/token-ids/logprobs/guided = true). `supports_lora` comes from the engine handshake. `supports_multimodal` reflects the loaded backend (`ChatLlm::supports_multimodal()`: true when a `MultimodalModelInfo` resolved, e.g. a VLM). |
-| `GetLoad` | `running_requests` from `AppState::server_load`; deeper scheduler stats (queue depth, KV usage) are **not yet a queryable snapshot** → reported as 0 (follow-up). |
-| `Health` | liveness from `EngineCoreClient::is_healthy`; `include_inference_probe` runs a bounded 1-token greedy generate. |
+| `GetModelInfo` | Model names, per-engine capacity, effective parser names, and LoRA/multimodal capability. |
+| `Health` | liveness from `EngineCoreClient::is_healthy`; reports `DRAINING` after admission closes. `include_inference_probe` runs a bounded 1-token greedy generate. |
 | `Abort` | `EngineCoreClient::abort([id])`, idempotent (unknown id → `ABORTED`). `abort_all` → `UNSUPPORTED` (frontend does not retain the in-flight id set). |
-| `Drain` (server-stream) | polls `server_load` to 0 or deadline; `STARTED` → `IN_PROGRESS`* → `COMPLETE`/`FAILED`. |
+| `Drain` | irreversibly closes engine-RPC admission, then reports `IN_PROGRESS` or `COMPLETE` from `server_load`. Callers poll it; the RPC does not wait. |
+| `LoadLora` / `UnloadLora` / `ListLoras` | Manage the engine-local adapter registry. Disabled engines return `FAILED_PRECONDITION`; `Generate.lora_name` selects a loaded adapter. |
 | `GetKvConnectorInfo` | from the handshake `kv_connector`. |
 | `GetKvEventSources` | surfaces the ZMQ publisher (`kv_events_*`) for KV-aware routing; populates the routable `endpoint_addr` (`KvEndpoint{host,port,protocol}`) — a bind wildcard (`*`/`0.0.0.0`/`::`) is rewritten to this node's advertised IP so a remote router can connect. Empty when no publisher. |
-| `SubscribeKvEvents` / `SubscribeRuntimeEvents` | `UNIMPLEMENTED` in v1 (consumers subscribe to the ZMQ source directly via `GetKvEventSources`). |
 
 ## Disaggregation (KV session) — Phase 3
 
@@ -73,8 +71,6 @@ stable envelope.
 
 ## Testing
 
-`tests.rs` stands up the tonic service over the `mock-engine` double (the
-`../tests.rs` scaffold: `IpcNamespace` + `spawn_mock_engine_task` +
-`FakeTextBackend`) and asserts the wire shape for the happy-path stream, the
-discovery RPCs, abort, drain, and the unimplemented subscriptions. Real-engine
-coverage is the cluster smoke matrix (plan Phase 5) — there is no local GPU.
+`tests.rs` provides the shared tonic/mock-engine harness. Focused modules under
+`tests/` cover discovery, generation, lifecycle, LoRA, media, and topology.
+Real-engine coverage runs on the cluster; there is no local GPU.

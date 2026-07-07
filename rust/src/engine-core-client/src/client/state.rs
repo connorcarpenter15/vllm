@@ -102,6 +102,7 @@ pub struct RequestRegistry {
     requests: HashMap<String, TrackedRequest>,
     active_lora_requests: usize,
     routing_per_engine: BTreeMap<EngineId, EngineRoutingState>,
+    engine_by_data_parallel_rank: BTreeMap<u32, EngineId>,
 }
 
 impl RequestRegistry {
@@ -113,6 +114,15 @@ impl RequestRegistry {
             routing_per_engine: engines
                 .iter()
                 .map(|engine| (engine.engine_id.clone(), EngineRoutingState::default()))
+                .collect(),
+            engine_by_data_parallel_rank: engines
+                .iter()
+                .map(|engine| {
+                    (
+                        engine.ready_response.data_parallel_rank,
+                        engine.engine_id.clone(),
+                    )
+                })
                 .collect(),
         }
     }
@@ -162,16 +172,12 @@ impl RequestRegistry {
 
     fn choose_engine_for_request(&mut self, data_parallel_rank: Option<u32>) -> Result<EngineId> {
         if let Some(rank) = data_parallel_rank {
-            // Route to the engine at the specified rank index.
-            let engine_id = EngineId::from_engine_index(rank);
-            return self
-                .routing_per_engine
-                .contains_key(&engine_id)
-                .then_some(engine_id)
-                .ok_or_else(|| Error::InvalidDataParallelRank {
+            return self.engine_by_data_parallel_rank.get(&rank).cloned().ok_or_else(|| {
+                Error::InvalidDataParallelRank {
                     rank,
-                    num_engines: self.routing_per_engine.len() as u32,
-                });
+                    num_engines: self.engine_by_data_parallel_rank.len() as u32,
+                }
+            });
         }
 
         Ok(self
@@ -438,6 +444,11 @@ impl UtilityRegistry {
         self.utility_calls.contains_key(&call_id)
     }
 
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.utility_calls.len()
+    }
+
     pub fn is_closed(&self) -> bool {
         self.closed
     }
@@ -461,6 +472,16 @@ mod tests {
         ConnectedEngine {
             engine_id,
             ready_response: default_ready_response(),
+        }
+    }
+
+    fn connected_engine_at_rank(engine_id: EngineId, rank: u32) -> ConnectedEngine {
+        let mut ready_response = default_ready_response();
+        ready_response.data_parallel_size = u64::from(rank) + 1;
+        ready_response.data_parallel_rank = rank;
+        ConnectedEngine {
+            engine_id,
+            ready_response,
         }
     }
 
@@ -793,9 +814,9 @@ mod tests {
         let engine_1 = EngineId::from_engine_index(1);
         let engine_2 = EngineId::from_engine_index(2);
         let mut registry = RequestRegistry::new(&[
-            connected_engine(engine_0.clone()),
-            connected_engine(engine_1.clone()),
-            connected_engine(engine_2.clone()),
+            connected_engine_at_rank(engine_0.clone(), 0),
+            connected_engine_at_rank(engine_1.clone(), 1),
+            connected_engine_at_rank(engine_2.clone(), 2),
         ]);
 
         // Explicitly target rank 2 (third engine).
@@ -816,8 +837,8 @@ mod tests {
         let engine_0 = EngineId::from_engine_index(0);
         let engine_1 = EngineId::from_engine_index(1);
         let mut registry = RequestRegistry::new(&[
-            connected_engine(engine_0.clone()),
-            connected_engine(engine_1.clone()),
+            connected_engine_at_rank(engine_0.clone(), 0),
+            connected_engine_at_rank(engine_1.clone(), 1),
         ]);
 
         // Load-balance: first two go to engine_0 and engine_1.
@@ -832,8 +853,8 @@ mod tests {
     #[test]
     fn register_with_out_of_range_rank_returns_error() {
         let mut registry = RequestRegistry::new(&[
-            connected_engine(EngineId::from_engine_index(0)),
-            connected_engine(EngineId::from_engine_index(1)),
+            connected_engine_at_rank(EngineId::from_engine_index(0), 0),
+            connected_engine_at_rank(EngineId::from_engine_index(1), 1),
         ]);
 
         let error = registry.register("req-1".to_string(), None, Some(2)).unwrap_err();
@@ -859,6 +880,21 @@ mod tests {
             error,
             crate::error::Error::InvalidDataParallelRank {
                 rank: 1,
+                num_engines: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn register_rejects_rank_that_aliases_connected_identity() {
+        let engine_0 = EngineId::from_engine_index(0);
+        let mut registry = RequestRegistry::new(&[connected_engine_at_rank(engine_0, 0)]);
+
+        let error = registry.register("req-alias".to_string(), None, Some(65_536)).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::Error::InvalidDataParallelRank {
+                rank: 65_536,
                 num_engines: 1,
             }
         ));

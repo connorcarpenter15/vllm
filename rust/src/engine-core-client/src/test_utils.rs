@@ -82,6 +82,21 @@ pub async fn setup_mock_engine_sockets(
         .expect("connect mock engine")
 }
 
+/// Complete the handshake with an explicit engine-ready response.
+pub async fn setup_mock_engine_sockets_with_ready(
+    engine_handshake: String,
+    engine_id: impl Into<EngineId>,
+    ready_response: EngineCoreReadyResponse,
+) -> MockEngineSockets {
+    connect_to_frontend(
+        engine_handshake,
+        engine_id,
+        test_mock_engine_config_with_ready(ready_response),
+    )
+    .await
+    .expect("connect mock engine")
+}
+
 /// Connect one mock engine directly to already-bootstrapped frontend
 /// input/output sockets.
 pub async fn setup_bootstrapped_mock_engine(
@@ -89,11 +104,27 @@ pub async fn setup_bootstrapped_mock_engine(
     output_address: String,
     engine_id: impl Into<EngineId>,
 ) -> (DealerSocket, PushSocket) {
+    setup_bootstrapped_mock_engine_with_ready(
+        input_address,
+        output_address,
+        engine_id,
+        default_ready_response(),
+    )
+    .await
+}
+
+/// Connect a bootstrapped mock engine with an explicit ready response.
+pub async fn setup_bootstrapped_mock_engine_with_ready(
+    input_address: String,
+    output_address: String,
+    engine_id: impl Into<EngineId>,
+    ready_response: EngineCoreReadyResponse,
+) -> (DealerSocket, PushSocket) {
     connect_to_bootstrapped_frontend(
         input_address,
         output_address,
         engine_id,
-        test_mock_engine_config(),
+        test_mock_engine_config_with_ready(ready_response),
     )
     .await
     .expect("connect bootstrapped mock engine")

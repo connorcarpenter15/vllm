@@ -16,7 +16,7 @@ use serial_test::serial;
 use tonic::transport::Server as TonicServer;
 use vllm_chat::{
     ChatBackend, ChatLlm, ChatRenderer, ChatRequest, ChatTextBackend, DefaultChatOutputProcessor,
-    DynChatOutputProcessor, DynChatRenderer, MediaContentPart, NewChatOutputProcessorOptions,
+    DynChatOutputProcessor, DynChatRenderer, NewChatOutputProcessorOptions, ParserSelection,
     RenderedPrompt,
 };
 use vllm_engine_core_client::mock_engine::{MockEngineConfig, default_ready_response};
@@ -38,9 +38,15 @@ use zeromq::prelude::{SocketRecv, SocketSend};
 use zeromq::{DealerSocket, PushSocket, ZmqMessage};
 
 use super::pb::engine_client::EngineClient;
-use super::pb::lora_manager_client::LoraManagerClient;
-use super::{EngineServer, EngineServiceImpl, LoraManagerServer, LoraManagerServiceImpl, pb};
+use super::{EngineServer, EngineServiceImpl, pb};
 use crate::state::AppState;
+
+mod discovery;
+mod generate;
+mod lifecycle;
+mod lora;
+mod media;
+mod topology;
 
 // ========================================================================================
 // Helpers (mirrors crate::grpc::tests)
@@ -242,6 +248,25 @@ async fn engine_rpc_test_server(
     tokio::task::JoinHandle<()>,
     MockEngineTask,
 ) {
+    engine_rpc_test_server_with_parsers(
+        engine_id,
+        output_specs,
+        ParserSelection::Auto,
+        ParserSelection::Auto,
+    )
+    .await
+}
+
+async fn engine_rpc_test_server_with_parsers(
+    engine_id: impl Into<EngineId>,
+    output_specs: Vec<(Vec<u32>, Option<EngineCoreFinishReason>)>,
+    tool_call_parser: ParserSelection,
+    reasoning_parser: ParserSelection,
+) -> (
+    EngineClient<tonic::transport::Channel>,
+    tokio::task::JoinHandle<()>,
+    MockEngineTask,
+) {
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
     let engine_id = engine_id.into();
@@ -277,7 +302,9 @@ async fn engine_rpc_test_server(
     let chat = ChatLlm::from_shared_backend(
         test_llm(client),
         Arc::new(FakeTextBackend) as Arc<dyn ChatTextBackend>,
-    );
+    )
+    .with_tool_call_parser(tool_call_parser)
+    .with_reasoning_parser(reasoning_parser);
     let state = Arc::new(AppState::new(vec!["test-model".to_string()], chat));
     let svc = EngineServer::new(EngineServiceImpl::new(state));
 
@@ -310,18 +337,22 @@ fn base_request() -> pb::GenerateRequest {
     }
 }
 
-async fn lora_test_server(
+async fn lora_scripted_test_server<F>(
     supports_lora: bool,
+    run: F,
 ) -> (
     EngineClient<tonic::transport::Channel>,
-    LoraManagerClient<tonic::transport::Channel>,
     tokio::task::JoinHandle<()>,
     MockEngineTask,
-) {
+)
+where
+    F: for<'a> FnOnce(&'a mut DealerSocket, &'a mut PushSocket) -> TestFuture<'a> + Send + 'static,
+{
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
     let mut ready = default_ready_response();
     ready.supports_lora = supports_lora;
+    ready.max_loras = if supports_lora { 4 } else { 0 };
     let config = MockEngineConfig {
         local: true,
         headless: true,
@@ -331,37 +362,9 @@ async fn lora_test_server(
 
     let engine_task = MockEngineTask::new(spawn_mock_engine_task_with_config(
         handshake_address.clone(),
-        b"rpc-lora".to_vec(),
+        vec![0x00, 0x00],
         config,
-        |dealer, push| {
-            boxed_test_future(async move {
-                let load = recv_engine_message(dealer).await;
-                assert_eq!(load[0].as_ref(), &[0x03]);
-                let load: rmpv::Value = rmp_serde::from_slice(&load[1]).unwrap();
-                let load = load.as_array().expect("load utility tuple");
-                assert_eq!(load[2], rmpv::Value::from("add_lora"));
-                send_utility_bool(push, load[1].as_u64().unwrap(), true).await;
-
-                let add = recv_engine_message(dealer).await;
-                assert_eq!(add[0].as_ref(), &[0x00]);
-                let request: EngineCoreRequest = rmp_serde::from_slice(&add[1]).unwrap();
-                let lora = request.lora_request.expect("LoRA request");
-                assert_eq!(lora.lora_name, "adapter-a");
-                assert_eq!(lora.lora_int_id, 17);
-                send_outputs(
-                    push,
-                    engine_outputs_for_request(&request.request_id, default_stream_output_specs()),
-                )
-                .await;
-
-                let unload = recv_engine_message(dealer).await;
-                assert_eq!(unload[0].as_ref(), &[0x03]);
-                let unload: rmpv::Value = rmp_serde::from_slice(&unload[1]).unwrap();
-                let unload = unload.as_array().expect("unload utility tuple");
-                assert_eq!(unload[2], rmpv::Value::from("remove_lora"));
-                send_utility_bool(push, unload[1].as_u64().unwrap(), true).await;
-            })
-        },
+        run,
     ));
 
     let client = EngineCoreClient::connect(
@@ -379,14 +382,12 @@ async fn lora_test_server(
         Arc::new(FakeTextBackend) as Arc<dyn ChatTextBackend>,
     );
     let state = Arc::new(AppState::new(vec!["test-model".to_string()], chat));
-    let engine_rpc = EngineServer::new(EngineServiceImpl::new(state.clone()));
-    let lora = LoraManagerServer::new(LoraManagerServiceImpl::new(state));
+    let engine_rpc = EngineServer::new(EngineServiceImpl::new(state));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server_task = tokio::spawn(async move {
         TonicServer::builder()
             .add_service(engine_rpc)
-            .add_service(lora)
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await
             .unwrap();
@@ -396,12 +397,47 @@ async fn lora_test_server(
         .connect()
         .await
         .unwrap();
-    (
-        EngineClient::new(channel.clone()),
-        LoraManagerClient::new(channel),
-        server_task,
-        engine_task,
-    )
+    (EngineClient::new(channel), server_task, engine_task)
+}
+
+async fn lora_test_server(
+    supports_lora: bool,
+    unload_result: bool,
+) -> (
+    EngineClient<tonic::transport::Channel>,
+    tokio::task::JoinHandle<()>,
+    MockEngineTask,
+) {
+    lora_scripted_test_server(supports_lora, move |dealer, push| {
+        boxed_test_future(async move {
+            let load = recv_engine_message(dealer).await;
+            assert_eq!(load[0].as_ref(), &[0x03]);
+            let load: rmpv::Value = rmp_serde::from_slice(&load[1]).unwrap();
+            let load = load.as_array().expect("load utility tuple");
+            assert_eq!(load[2], rmpv::Value::from("add_lora"));
+            send_utility_bool(push, load[1].as_u64().unwrap(), true).await;
+
+            let add = recv_engine_message(dealer).await;
+            assert_eq!(add[0].as_ref(), &[0x00]);
+            let request: EngineCoreRequest = rmp_serde::from_slice(&add[1]).unwrap();
+            let lora = request.lora_request.expect("LoRA request");
+            assert_eq!(lora.lora_name, "adapter-a");
+            assert_eq!(lora.lora_int_id, 17);
+            send_outputs(
+                push,
+                engine_outputs_for_request(&request.request_id, default_stream_output_specs()),
+            )
+            .await;
+
+            let unload = recv_engine_message(dealer).await;
+            assert_eq!(unload[0].as_ref(), &[0x03]);
+            let unload: rmpv::Value = rmp_serde::from_slice(&unload[1]).unwrap();
+            let unload = unload.as_array().expect("unload utility tuple");
+            assert_eq!(unload[2], rmpv::Value::from("remove_lora"));
+            send_utility_bool(push, unload[1].as_u64().unwrap(), unload_result).await;
+        })
+    })
+    .await
 }
 
 async fn send_utility_bool(push: &mut PushSocket, call_id: u64, result: bool) {
@@ -421,792 +457,4 @@ async fn send_utility_bool(push: &mut PushSocket, call_id: u64, result: bool) {
         .into(),
     )
     .await;
-}
-
-// ========================================================================================
-// Generate
-// ========================================================================================
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn lora_lifecycle_selects_adapter_for_generation() {
-    let (mut engine_rpc, mut lora, server_task, engine_task) = lora_test_server(true).await;
-    let dir = tempfile::tempdir().unwrap();
-    let adapter = pb::LoraAdapter {
-        lora_id: 17,
-        lora_name: "adapter-a".to_string(),
-        source_path: dir.path().to_string_lossy().into_owned(),
-    };
-
-    let loaded = lora
-        .load_lora(pb::LoadLoraRequest {
-            adapter: Some(adapter.clone()),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(!loaded.already_loaded);
-    let loaded_again = lora
-        .load_lora(pb::LoadLoraRequest {
-            adapter: Some(adapter.clone()),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(loaded_again.already_loaded);
-
-    let error = lora
-        .load_lora(pb::LoadLoraRequest {
-            adapter: Some(pb::LoraAdapter {
-                lora_id: 18,
-                ..adapter.clone()
-            }),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::AlreadyExists);
-    let error = lora
-        .load_lora(pb::LoadLoraRequest {
-            adapter: Some(pb::LoraAdapter {
-                lora_name: "adapter-b".to_string(),
-                ..adapter.clone()
-            }),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::AlreadyExists);
-    let error = lora
-        .load_lora(pb::LoadLoraRequest {
-            adapter: Some(pb::LoraAdapter {
-                lora_id: 19,
-                lora_name: "adapter-c".to_string(),
-                source_path: adapter.source_path.clone(),
-            }),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::AlreadyExists);
-    let error = lora
-        .load_lora(pb::LoadLoraRequest {
-            adapter: Some(pb::LoraAdapter {
-                lora_id: 20,
-                lora_name: "relative".to_string(),
-                source_path: "relative/path".to_string(),
-            }),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::InvalidArgument);
-    let error = lora
-        .unload_lora(pb::UnloadLoraRequest {
-            lora_name: "missing".to_string(),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::NotFound);
-    assert_eq!(
-        lora.list_loras(pb::ListLorasRequest {})
-            .await
-            .unwrap()
-            .into_inner()
-            .adapters
-            .len(),
-        1
-    );
-
-    let mut missing_request = base_request();
-    missing_request.lora_name = "missing".to_string();
-    let error = engine_rpc.generate(missing_request).await.unwrap_err();
-    assert_eq!(error.code(), tonic::Code::NotFound);
-
-    let mut request = base_request();
-    request.lora_name = "adapter-a".to_string();
-    let responses = engine_rpc
-        .generate(request)
-        .await
-        .unwrap()
-        .into_inner()
-        .collect::<Vec<_>>()
-        .await;
-    assert!(responses.iter().all(Result::is_ok));
-
-    lora.unload_lora(pb::UnloadLoraRequest {
-        lora_name: "adapter-a".to_string(),
-    })
-    .await
-    .unwrap();
-    assert!(
-        lora.list_loras(pb::ListLorasRequest {})
-            .await
-            .unwrap()
-            .into_inner()
-            .adapters
-            .is_empty()
-    );
-
-    server_task.abort();
-    engine_task.await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn lora_lifecycle_rejects_disabled_engine() {
-    let (_engine_rpc, mut lora, server_task, engine_task) = lora_test_server(false).await;
-
-    let error = lora.list_loras(pb::ListLorasRequest {}).await.unwrap_err();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-
-    server_task.abort();
-    drop(engine_task);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn generate_streams_tokens_then_finishes() {
-    let (mut client, server_task, engine_task) =
-        engine_rpc_test_server(b"rpc-generate", default_stream_output_specs()).await;
-
-    let stream = client.generate(base_request()).await.expect("generate").into_inner();
-
-    let responses: Vec<pb::GenerateResponse> =
-        stream.map(|r| r.expect("stream item")).collect().await;
-
-    // Every response should carry the request id.
-    assert!(responses.iter().all(|r| r.request_id == "req-1"));
-
-    let text: String = responses
-        .iter()
-        .filter_map(|r| match &r.event {
-            Some(pb::generate_response::Event::Token(t)) => Some(t.text.as_str()),
-            _ => None,
-        })
-        .collect();
-    // The terminal stop token ('!') is suppressed from visible text.
-    assert_eq!(text, "hi");
-
-    let finished = responses
-        .iter()
-        .rev()
-        .find_map(|r| match &r.event {
-            Some(pb::generate_response::Event::Finished(f)) => Some((f, r.usage.as_ref())),
-            _ => None,
-        })
-        .expect("finished event present");
-    assert_eq!(finished.0.reason, pb::FinishReason::Stop as i32);
-
-    let usage = finished.1.expect("usage on terminal response");
-    assert_eq!(usage.prompt_tokens, 5); // "hello"
-    assert_eq!(usage.completion_tokens, 3);
-    assert_eq!(usage.total_tokens, 8);
-
-    engine_task.await.expect("mock engine task");
-    server_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn generate_with_token_ids_input() {
-    let (mut client, server_task, engine_task) =
-        engine_rpc_test_server(b"rpc-token-ids", default_stream_output_specs()).await;
-
-    let stream = client
-        .generate(pb::GenerateRequest {
-            request_id: "req-tok".to_string(),
-            model: "test-model".to_string(),
-            input: Some(pb::generate_request::Input::TokenIds(pb::TokenIds {
-                ids: vec![1, 2, 3],
-            })),
-            stream: true,
-            ..Default::default()
-        })
-        .await
-        .expect("generate")
-        .into_inner();
-
-    let responses: Vec<pb::GenerateResponse> =
-        stream.map(|r| r.expect("stream item")).collect().await;
-    let text: String = responses
-        .iter()
-        .filter_map(|r| match &r.event {
-            Some(pb::generate_response::Event::Token(t)) => Some(t.text.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(text, "hi");
-
-    engine_task.await.expect("mock engine task");
-    server_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn generate_missing_input_is_invalid_argument() {
-    let (mut client, server_task, _engine_task) =
-        engine_rpc_test_server(b"rpc-no-input", default_stream_output_specs()).await;
-
-    // Server-streaming RPCs surface a handler error on the initial call.
-    let status = client
-        .generate(pb::GenerateRequest {
-            request_id: "req-no-input".to_string(),
-            model: "test-model".to_string(),
-            input: None,
-            ..Default::default()
-        })
-        .await
-        .expect_err("should fail without input");
-
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
-
-    server_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn generate_rejects_wrong_model() {
-    let (mut client, server_task, _engine_task) =
-        engine_rpc_test_server(b"rpc-wrong-model", default_stream_output_specs()).await;
-
-    let status = client
-        .generate(pb::GenerateRequest {
-            request_id: "req-wrong".to_string(),
-            model: "other-model".to_string(),
-            input: Some(pb::generate_request::Input::Prompt("hi".to_string())),
-            ..Default::default()
-        })
-        .await
-        .expect_err("should fail with wrong model");
-
-    assert_eq!(status.code(), tonic::Code::NotFound);
-
-    server_task.abort();
-}
-
-// ========================================================================================
-// Discovery RPCs
-// ========================================================================================
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn get_engine_info_reports_aggregated_role_and_topology() {
-    let (mut client, server_task, _engine_task) =
-        engine_rpc_test_server(b"rpc-engine-info", default_stream_output_specs()).await;
-
-    let info = client
-        .get_engine_info(pb::GetEngineInfoRequest {})
-        .await
-        .expect("get_engine_info")
-        .into_inner();
-
-    assert_eq!(info.engine_name, "vllm");
-    assert_eq!(info.engine_version, "test-vllm-version");
-    assert_eq!(info.api_version, "vllm.engine.v1");
-    assert_eq!(info.role, pb::EngineRole::Aggregated as i32);
-    assert_eq!(info.supported_models, vec!["test-model".to_string()]);
-
-    let parallelism = info.parallelism.expect("parallelism present");
-    assert_eq!(parallelism.tensor_parallel_size, 1);
-    assert_eq!(parallelism.pipeline_parallel_size, 1);
-    assert_eq!(parallelism.data_parallel_size, 1);
-
-    let kv = info.kv_connector.expect("kv_connector present");
-    assert!(!kv.enabled);
-
-    server_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn get_model_info_reports_caps_from_handshake() {
-    let (mut client, server_task, _engine_task) =
-        engine_rpc_test_server(b"rpc-model-info", default_stream_output_specs()).await;
-
-    let info = client
-        .get_model_info(pb::GetModelInfoRequest {})
-        .await
-        .expect("get_model_info")
-        .into_inner();
-
-    assert_eq!(info.model_id, "test-model");
-    assert_eq!(info.served_model_name, "test-model");
-    assert!(info.served_model_aliases.is_empty());
-    assert_eq!(info.kv_block_size, 16);
-    assert_eq!(info.max_running_requests, 256);
-    assert_eq!(info.max_batched_tokens, 8192);
-    assert!(info.supports_text_input);
-    assert!(info.supports_token_ids_input);
-    assert!(!info.supports_multimodal);
-    assert!(!info.supports_lora);
-
-    server_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn get_load_reports_idle() {
-    let (mut client, server_task, _engine_task) =
-        engine_rpc_test_server(b"rpc-load", default_stream_output_specs()).await;
-
-    let load = client
-        .get_load(pb::GetLoadRequest::default())
-        .await
-        .expect("get_load")
-        .into_inner();
-
-    assert_eq!(load.running_requests, 0);
-
-    server_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn get_kv_connector_info_disabled_without_connector() {
-    let (mut client, server_task, _engine_task) =
-        engine_rpc_test_server(b"rpc-kv-conn", default_stream_output_specs()).await;
-
-    let info = client
-        .get_kv_connector_info(pb::GetKvConnectorInfoRequest {})
-        .await
-        .expect("get_kv_connector_info")
-        .into_inner();
-
-    assert!(!info.enabled);
-
-    server_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn get_kv_event_sources_empty_without_publisher() {
-    let (mut client, server_task, _engine_task) =
-        engine_rpc_test_server(b"rpc-kv-events", default_stream_output_specs()).await;
-
-    let resp = client
-        .get_kv_event_sources(pb::GetKvEventSourcesRequest::default())
-        .await
-        .expect("get_kv_event_sources")
-        .into_inner();
-
-    assert!(resp.sources.is_empty());
-
-    server_task.abort();
-}
-
-// ----------------------------------------------------------------------------------------
-// KV event source selection (pure, no server harness) — consolidator vs per-rank
-// ----------------------------------------------------------------------------------------
-
-fn ready_with_kv_events(
-    dp_rank: u32,
-    publisher: Option<&str>,
-    endpoint: Option<&str>,
-    consolidated: Option<&str>,
-) -> EngineCoreReadyResponse {
-    EngineCoreReadyResponse {
-        data_parallel_rank: dp_rank,
-        kv_events_publisher: publisher.map(str::to_string),
-        kv_events_endpoint: endpoint.map(str::to_string),
-        kv_events_topic: Some("kv".to_string()),
-        kv_events_consolidated_endpoint: consolidated.map(str::to_string),
-        ..default_ready_response()
-    }
-}
-
-#[test]
-fn build_kv_event_sources_prefers_consolidator_single_rank0_source() {
-    // Two DP engines each expose a raw ZMQ publisher, but the engine also
-    // advertises the KVBM consolidator endpoint. The consolidator merges both
-    // ranks into one deduped stream, so exactly one rank-0 source is emitted
-    // (the consolidator endpoint), not the per-rank raw publishers.
-    let r0 = ready_with_kv_events(
-        0,
-        Some("zmq"),
-        Some("tcp://*:5557"),
-        Some("tcp://0.0.0.0:57001"),
-    );
-    let r1 = ready_with_kv_events(1, Some("zmq"), Some("tcp://*:5557"), None);
-    let sources = super::build_kv_event_sources(&[&r0, &r1]);
-
-    assert_eq!(sources.len(), 1, "consolidator collapses to one source");
-    let src = &sources[0];
-    assert_eq!(src.transport, "zmq");
-    assert_eq!(src.data_parallel_rank, 0);
-    // Consolidator republishes on an empty topic; advertising the raw vLLM topic
-    // here would make the router's SUB filter reject every consolidated message.
-    assert_eq!(
-        src.topic, "",
-        "consolidator source must advertise an empty topic"
-    );
-    let addr = src.endpoint_addr.as_ref().expect("routable endpoint_addr");
-    assert_eq!(addr.port, 57001);
-    assert_ne!(
-        addr.host, "0.0.0.0",
-        "bind wildcard rewritten to a routable host"
-    );
-}
-
-#[test]
-fn build_kv_event_sources_falls_back_to_per_rank_publishers() {
-    // No consolidator: one source per DP engine, with vLLM's per-rank port
-    // offset (rank 0 unchanged, rank 1 = base + 1).
-    let r0 = ready_with_kv_events(0, Some("zmq"), Some("tcp://*:5557"), None);
-    let r1 = ready_with_kv_events(1, Some("zmq"), Some("tcp://*:5557"), None);
-    let sources = super::build_kv_event_sources(&[&r0, &r1]);
-
-    assert_eq!(sources.len(), 2);
-    let ports: Vec<u32> = sources
-        .iter()
-        .map(|s| s.endpoint_addr.as_ref().expect("endpoint_addr").port)
-        .collect();
-    assert_eq!(ports, vec![5557, 5558]);
-}
-
-#[test]
-fn build_kv_event_sources_empty_without_publisher_or_consolidator() {
-    let r0 = ready_with_kv_events(0, None, None, None);
-    let sources = super::build_kv_event_sources(&[&r0]);
-    assert!(sources.is_empty());
-}
-
-// ========================================================================================
-// Health
-// ========================================================================================
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn health_reports_ready_without_probe() {
-    let (mut client, server_task, _engine_task) =
-        engine_rpc_test_server(b"rpc-health", default_stream_output_specs()).await;
-
-    let resp = client
-        .health(pb::HealthRequest {
-            include_inference_probe: false,
-            ..Default::default()
-        })
-        .await
-        .expect("health")
-        .into_inner();
-
-    assert_eq!(resp.state, pb::HealthState::Ready as i32);
-    assert!(resp.checks.iter().any(|c| c.name == "engine"));
-
-    server_task.abort();
-}
-
-// ========================================================================================
-// Abort
-// ========================================================================================
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn abort_unknown_request_is_idempotent() {
-    let (mut client, server_task, _engine_task) =
-        engine_rpc_test_server(b"rpc-abort", default_stream_output_specs()).await;
-
-    let resp = client
-        .abort(pb::AbortRequest {
-            request_id: "not-in-flight".to_string(),
-            ..Default::default()
-        })
-        .await
-        .expect("abort")
-        .into_inner();
-
-    assert_eq!(resp.status, pb::AbortStatus::Aborted as i32);
-
-    server_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn abort_all_is_unsupported() {
-    let (mut client, server_task, _engine_task) =
-        engine_rpc_test_server(b"rpc-abort-all", default_stream_output_specs()).await;
-
-    let resp = client
-        .abort(pb::AbortRequest {
-            abort_all: true,
-            ..Default::default()
-        })
-        .await
-        .expect("abort")
-        .into_inner();
-
-    assert_eq!(resp.status, pb::AbortStatus::Unsupported as i32);
-
-    server_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn abort_empty_request_id_is_invalid_argument() {
-    let (mut client, server_task, _engine_task) =
-        engine_rpc_test_server(b"rpc-abort-empty", default_stream_output_specs()).await;
-
-    let status = client
-        .abort(pb::AbortRequest::default())
-        .await
-        .expect_err("empty request_id should be rejected");
-
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
-
-    server_task.abort();
-}
-
-// ========================================================================================
-// Drain
-// ========================================================================================
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn drain_completes_when_idle() {
-    let (mut client, server_task, _engine_task) =
-        engine_rpc_test_server(b"rpc-drain", default_stream_output_specs()).await;
-
-    let stream = client.drain(pb::DrainRequest::default()).await.expect("drain").into_inner();
-
-    let responses: Vec<pb::DrainResponse> = stream.map(|r| r.expect("drain item")).collect().await;
-
-    let first = responses.first().expect("at least one drain response");
-    assert_eq!(first.state, pb::DrainState::Started as i32);
-
-    let last = responses.last().expect("at least one drain response");
-    assert_eq!(last.state, pb::DrainState::Complete as i32);
-    assert_eq!(last.in_flight_requests, 0);
-
-    server_task.abort();
-}
-
-// ========================================================================================
-// Unimplemented subscriptions
-// ========================================================================================
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn subscribe_kv_events_is_unimplemented() {
-    let (mut client, server_task, _engine_task) =
-        engine_rpc_test_server(b"rpc-sub-kv", default_stream_output_specs()).await;
-
-    let status = client
-        .subscribe_kv_events(pb::SubscribeKvEventsRequest::default())
-        .await
-        .expect_err("subscribe_kv_events should be unimplemented");
-
-    assert_eq!(status.code(), tonic::Code::Unimplemented);
-
-    server_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn subscribe_runtime_events_is_unimplemented() {
-    let (mut client, server_task, _engine_task) =
-        engine_rpc_test_server(b"rpc-sub-rt", default_stream_output_specs()).await;
-
-    let status = client
-        .subscribe_runtime_events(pb::SubscribeRuntimeEventsRequest::default())
-        .await
-        .expect_err("subscribe_runtime_events should be unimplemented");
-
-    assert_eq!(status.code(), tonic::Code::Unimplemented);
-
-    server_task.abort();
-}
-
-// ========================================================================================
-// DP helpers (data-parallel orchestration: per-rank KV blocks + per-rank KV
-// event endpoints)
-// ========================================================================================
-
-#[test]
-fn per_rank_kv_blocks_divides_aggregate_by_dp_size() {
-    // DP=1 (or 0, treated as 1): aggregate is already per-rank.
-    assert_eq!(super::per_rank_kv_blocks(1000, 1), 1000);
-    assert_eq!(super::per_rank_kv_blocks(1000, 0), 1000);
-    // DP>1: floor-divide the aggregate across ranks (matches per_rank_kv_blocks
-    // in dynamo/components/src/dynamo/vllm/capacity.py).
-    assert_eq!(super::per_rank_kv_blocks(1000, 4), 250);
-    assert_eq!(super::per_rank_kv_blocks(1001, 4), 250); // floor
-    // Zero aggregate (e.g. Ray DP backend sentinel) stays zero.
-    assert_eq!(super::per_rank_kv_blocks(0, 8), 0);
-    // Fewer blocks than ranks clamps to 1 rather than 0.
-    assert_eq!(super::per_rank_kv_blocks(3, 8), 1);
-}
-
-#[test]
-fn offset_endpoint_port_matches_vllm_convention() {
-    // Rank 0 is never offset.
-    assert_eq!(
-        super::offset_endpoint_port("tcp://*:5557", 0),
-        "tcp://*:5557"
-    );
-    // tcp: port += data_parallel_rank.
-    assert_eq!(
-        super::offset_endpoint_port("tcp://*:5557", 1),
-        "tcp://*:5558"
-    );
-    assert_eq!(
-        super::offset_endpoint_port("tcp://127.0.0.1:5557", 7),
-        "tcp://127.0.0.1:5564"
-    );
-    // inproc: `_dp{rank}` suffix.
-    assert_eq!(
-        super::offset_endpoint_port("inproc://cache", 3),
-        "inproc://cache_dp3"
-    );
-    // Empty endpoint is returned unchanged.
-    assert_eq!(super::offset_endpoint_port("", 5), "");
-}
-
-// ========================================================================================
-// Multimodal wire shape
-// ========================================================================================
-
-fn image_item(source: pb::media_item::Source) -> pb::MediaItem {
-    pb::MediaItem {
-        modality: pb::Modality::Image as i32,
-        source: Some(source),
-        ..Default::default()
-    }
-}
-
-#[test]
-fn media_parts_maps_url_data_uri_and_raw_bytes() {
-    let media = vec![
-        pb::MediaItem {
-            modality: pb::Modality::Image as i32,
-            source: Some(pb::media_item::Source::Url("http://h/a.png".to_string())),
-            uuid: "uid-1".to_string(),
-            ..Default::default()
-        },
-        // MODALITY_UNSPECIFIED is forward-compat and treated as image.
-        pb::MediaItem {
-            modality: pb::Modality::Unspecified as i32,
-            source: Some(pb::media_item::Source::DataUri(
-                "data:image/png;base64,AAAA".to_string(),
-            )),
-            ..Default::default()
-        },
-        pb::MediaItem {
-            modality: pb::Modality::Image as i32,
-            source: Some(pb::media_item::Source::RawBytes(vec![1, 2, 3])),
-            mime_type: "image/png".to_string(),
-            ..Default::default()
-        },
-    ];
-
-    let parts = super::convert::media_parts_from_request(&media).expect("convert media");
-    assert_eq!(parts.len(), 3);
-
-    match &parts[0] {
-        MediaContentPart::ImageUrl { url, detail, uuid } => {
-            assert_eq!(url, "http://h/a.png");
-            assert!(detail.is_none());
-            assert_eq!(uuid.as_deref(), Some("uid-1"));
-        }
-        _ => panic!("part 0 should be an ImageUrl from a url source"),
-    }
-    match &parts[1] {
-        // A data: URI also lands on ImageUrl; the media connector decodes it.
-        MediaContentPart::ImageUrl { url, uuid, .. } => {
-            assert_eq!(url, "data:image/png;base64,AAAA");
-            assert!(uuid.is_none(), "absent proto uuid maps to None");
-        }
-        _ => panic!("part 1 should be an ImageUrl from a data_uri source"),
-    }
-    match &parts[2] {
-        MediaContentPart::ImageData {
-            data, mime_type, ..
-        } => {
-            assert_eq!(data, &[1, 2, 3]);
-            assert_eq!(mime_type.as_deref(), Some("image/png"));
-        }
-        _ => panic!("part 2 should be ImageData from a raw_bytes source"),
-    }
-}
-
-#[test]
-fn media_parts_empty_input_yields_no_parts() {
-    assert!(super::convert::media_parts_from_request(&[]).unwrap().is_empty());
-}
-
-#[test]
-fn media_parts_rejects_item_without_source() {
-    let media = vec![pb::MediaItem {
-        modality: pb::Modality::Image as i32,
-        source: None,
-        ..Default::default()
-    }];
-    let status = super::convert::media_parts_from_request(&media)
-        .expect_err("a media item with no source must be rejected");
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
-}
-
-#[test]
-fn media_parts_rejects_video_modality_in_v1() {
-    // v1 is image-only; video/audio preprocessing is a later phase.
-    let media = vec![pb::MediaItem {
-        modality: pb::Modality::Video as i32,
-        source: Some(pb::media_item::Source::Url("http://h/clip.mp4".to_string())),
-        ..Default::default()
-    }];
-    let status = super::convert::media_parts_from_request(&media)
-        .expect_err("video modality must be rejected in v1");
-    assert_eq!(status.code(), tonic::Code::Unimplemented);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn generate_with_media_requires_token_ids_input() {
-    // Placeholder markers are expanded engine-side, so a multimodal request must
-    // carry token_ids — a text prompt is rejected before the engine is touched.
-    let (mut client, server_task, _engine_task) =
-        engine_rpc_test_server(b"rpc-media-text", default_stream_output_specs()).await;
-
-    let status = client
-        .generate(pb::GenerateRequest {
-            request_id: "req-media-text".to_string(),
-            model: "test-model".to_string(),
-            input: Some(pb::generate_request::Input::Prompt("hi".to_string())),
-            media: vec![image_item(pb::media_item::Source::Url(
-                "http://h/a.png".to_string(),
-            ))],
-            stream: true,
-            ..Default::default()
-        })
-        .await
-        .expect_err("media with a text prompt should be rejected");
-
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
-
-    server_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn generate_with_media_on_text_only_backend_fails_closed() {
-    // The mock `FakeTextBackend` has no `MultimodalModelInfo`, so a media
-    // request must error rather than silently drop the image and degrade to a
-    // text completion.
-    let (mut client, server_task, _engine_task) =
-        engine_rpc_test_server(b"rpc-media-textonly", default_stream_output_specs()).await;
-
-    let status = client
-        .generate(pb::GenerateRequest {
-            request_id: "req-media-textonly".to_string(),
-            model: "test-model".to_string(),
-            input: Some(pb::generate_request::Input::TokenIds(pb::TokenIds {
-                ids: vec![1, 2, 3],
-            })),
-            media: vec![image_item(pb::media_item::Source::Url(
-                "http://h/a.png".to_string(),
-            ))],
-            stream: true,
-            ..Default::default()
-        })
-        .await
-        .expect_err("media on a text-only backend should fail closed");
-
-    assert_eq!(status.code(), tonic::Code::Internal);
-
-    server_task.abort();
 }

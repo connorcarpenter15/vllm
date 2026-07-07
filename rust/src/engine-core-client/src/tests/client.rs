@@ -16,7 +16,7 @@ use zeromq::prelude::{Socket, SocketRecv, SocketSend};
 use zeromq::util::PeerIdentity;
 use zeromq::{DealerSocket, PushSocket, SocketOptions, SubSocket, XPubSocket, ZmqMessage};
 
-use crate::protocol::handshake::{HandshakeInitMessage, ReadyMessage};
+use crate::protocol::handshake::{EngineCoreReadyResponse, HandshakeInitMessage, ReadyMessage};
 use crate::protocol::logprobs::MaybeWireLogprobs;
 use crate::protocol::multimodal::{
     MmFeatureSpec, MmField, MmFieldElem, MmFlatField, MmKwargValue, MmSlice, PlaceholderRange,
@@ -32,13 +32,16 @@ use crate::protocol::stats::SchedulerStats;
 use crate::protocol::tensor::WireTensor;
 use crate::protocol::utility::{UtilityOutput, UtilityResultEnvelope};
 use crate::test_utils::{
-    IpcNamespace, setup_bootstrapped_mock_engine, setup_mock_engine_sockets,
-    setup_mock_engine_with_init, spawn_mock_engine_task,
+    IpcNamespace, setup_bootstrapped_mock_engine, setup_bootstrapped_mock_engine_with_ready,
+    setup_mock_engine_sockets, setup_mock_engine_sockets_with_ready, spawn_mock_engine_task,
+    spawn_mock_engine_task_with_ready,
 };
 use crate::{
     CoordinatorMode, ENGINE_CORE_DEAD_SENTINEL, EngineCoreClient, EngineCoreClientConfig, EngineId,
     Error, TransportMode,
 };
+
+mod utility;
 
 static TRACING: Once = Once::new();
 
@@ -159,7 +162,7 @@ fn sample_request_with_id(request_id: &str) -> EngineCoreRequest {
             ..EngineCoreSamplingParams::for_test()
         }),
         arrival_time: 42.5,
-        lora_request: Some(crate::protocol::LoraRequest {
+        lora_request: Some(crate::protocol::lora::LoraRequest {
             lora_name: "adapter-a".to_string(),
             lora_int_id: 17,
             lora_path: "/models/adapter-a".to_string(),
@@ -328,6 +331,14 @@ fn bootstrapped_test_config(
     }
 }
 
+fn two_rank_ready(rank: u32) -> EngineCoreReadyResponse {
+    EngineCoreReadyResponse {
+        data_parallel_size: 2,
+        data_parallel_rank: rank,
+        ..crate::mock_engine::default_ready_response()
+    }
+}
+
 fn bootstrapped_test_config_with_start_index(
     input_address: String,
     output_address: String,
@@ -384,6 +395,7 @@ async fn send_external_coordinator_publish<T: serde::Serialize>(
 fn spawn_mock_engine_task_with_init<F>(
     engine_handshake: String,
     engine_id: impl Into<EngineId>,
+    ready_response: EngineCoreReadyResponse,
     run: F,
 ) -> (
     oneshot::Receiver<HandshakeInitMessage>,
@@ -403,8 +415,22 @@ where
     let (init_tx, init_rx) = oneshot::channel();
     let engine_id = engine_id.into();
     let engine_task = tokio::spawn(async move {
-        let (init, mut dealer, mut push) =
-            setup_mock_engine_with_init(engine_handshake, engine_id).await;
+        let crate::mock_engine::MockEngineSockets {
+            init, data_sockets, ..
+        } = crate::mock_engine::connect_to_frontend(
+            engine_handshake,
+            engine_id,
+            crate::mock_engine::MockEngineConfig {
+                ready_response,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("connect mock engine");
+        let crate::mock_engine::MockEngineDataSockets {
+            mut dealer,
+            mut push,
+        } = data_sockets.into_iter().next().expect("mock engine data socket");
         let _ = init_tx.send(init);
         run(&mut dealer, &mut push).await;
         let _ = shutdown_rx.await;
@@ -550,6 +576,43 @@ async fn coordinator_handshake_includes_engine_control_addresses() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handshake_rejects_non_python_engine_identity() {
+    init_tracing();
+    let ipc = IpcNamespace::new().unwrap();
+    let handshake_address = ipc.handshake_endpoint();
+    let (shutdown_tx, engine_task) = spawn_mock_engine_task(
+        handshake_address.clone(),
+        b"invalid-identity".to_vec(),
+        |_dealer, _push| Box::pin(async {}),
+    );
+    let config = handshake_test_config(
+        handshake_address,
+        1,
+        "test-model",
+        Duration::from_secs(2),
+        0,
+        None,
+    )
+    .with_local_input_output_addresses(Some(ipc.input_endpoint()), Some(ipc.output_endpoint()));
+
+    let error = match EngineCoreClient::connect(config).await {
+        Ok(_) => panic!("handshake should reject a non-Python engine identity"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            error,
+            Error::UnexpectedHandshakeMessage { ref message }
+                if message.contains("not a two-byte Python engine index")
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    let _ = shutdown_tx.send(());
+    engine_task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn coordinator_wave_control_tracks_pause_running_and_rebroadcasts() {
     init_tracing();
     let ipc = IpcNamespace::new().unwrap();
@@ -559,7 +622,12 @@ async fn coordinator_wave_control_tracks_pause_running_and_rebroadcasts() {
     let engine0_task = tokio::spawn({
         let handshake_address = handshake_address.clone();
         async move {
-            let mut engine = setup_mock_engine_sockets(handshake_address, &[0x00, 0x00]).await;
+            let mut engine = setup_mock_engine_sockets_with_ready(
+                handshake_address,
+                &[0x00, 0x00],
+                two_rank_ready(0),
+            )
+            .await;
             let mut coordinator =
                 engine.coordinator.take().expect("coordinator sockets should be present");
             let data_socket = engine.data_sockets.first_mut().expect("data socket");
@@ -640,7 +708,12 @@ async fn coordinator_wave_control_tracks_pause_running_and_rebroadcasts() {
     let engine1_task = tokio::spawn({
         let handshake_address = handshake_address.clone();
         async move {
-            let mut engine = setup_mock_engine_sockets(handshake_address, &[0x01, 0x00]).await;
+            let mut engine = setup_mock_engine_sockets_with_ready(
+                handshake_address,
+                &[0x01, 0x00],
+                two_rank_ready(1),
+            )
+            .await;
             let mut coordinator =
                 engine.coordinator.take().expect("coordinator sockets should be present");
             let data_socket = engine.data_sockets.first_mut().expect("data socket");
@@ -760,7 +833,12 @@ async fn coordinator_rebroadcasts_engine_start_wave_control() {
     let engine0_task = tokio::spawn({
         let handshake_address = handshake_address.clone();
         async move {
-            let mut engine = setup_mock_engine_sockets(handshake_address, &[0x00, 0x00]).await;
+            let mut engine = setup_mock_engine_sockets_with_ready(
+                handshake_address,
+                &[0x00, 0x00],
+                two_rank_ready(0),
+            )
+            .await;
             let mut coordinator =
                 engine.coordinator.take().expect("coordinator sockets should be present");
 
@@ -775,7 +853,12 @@ async fn coordinator_rebroadcasts_engine_start_wave_control() {
     let engine1_task = tokio::spawn({
         let handshake_address = handshake_address.clone();
         async move {
-            let mut engine = setup_mock_engine_sockets(handshake_address, &[0x01, 0x00]).await;
+            let mut engine = setup_mock_engine_sockets_with_ready(
+                handshake_address,
+                &[0x01, 0x00],
+                two_rank_ready(1),
+            )
+            .await;
             let mut coordinator =
                 engine.coordinator.take().expect("coordinator sockets should be present");
 
@@ -906,7 +989,7 @@ async fn client_fail_closes_when_main_output_path_receives_dp_control() {
     init_tracing();
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-0".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let (shutdown_tx, engine_task) = spawn_mock_engine_task(
         handshake_address.clone(),
@@ -975,7 +1058,7 @@ async fn client_fail_closes_when_main_output_path_receives_dp_control() {
         &ipc,
     )
     .await;
-    assert_eq!(client.engine_identities()[0], b"engine-0");
+    assert_eq!(client.engine_identities()[0], &[0x00, 0x00]);
     assert!(client.ready_responses()[0].max_model_len > 0);
     assert_eq!(client.vllm_version(), "test-vllm-version");
 
@@ -1011,7 +1094,7 @@ async fn duplicate_request_ids_are_rejected_without_sending_a_second_add() {
     init_tracing();
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-dup".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let (shutdown_tx, engine_task) = spawn_mock_engine_task(
         handshake_address.clone(),
@@ -1083,7 +1166,7 @@ async fn finished_requests_without_final_output_is_treated_as_unexpected_close()
     init_tracing();
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-finished-only".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let (shutdown_tx, engine_task) = spawn_mock_engine_task(
         handshake_address.clone(),
@@ -1145,7 +1228,7 @@ async fn dropping_a_live_stream_triggers_abort() {
     init_tracing();
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-drop".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let (shutdown_tx, engine_task) = spawn_mock_engine_task(
         handshake_address.clone(),
@@ -1201,7 +1284,7 @@ async fn dropping_multiple_live_streams_aborts_all_in_a_burst() {
     init_tracing();
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-burst".to_vec();
+    let engine_id = vec![0x00, 0x00];
     let request_ids = ["req-1", "req-2", "req-3"];
 
     let (shutdown_tx, engine_task) = spawn_mock_engine_task(
@@ -1288,7 +1371,7 @@ async fn dispatcher_failure_propagates_to_streams_and_future_calls() {
     init_tracing();
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-fail".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let (shutdown_tx, engine_task) = spawn_mock_engine_task(
         handshake_address.clone(),
@@ -1354,7 +1437,7 @@ async fn is_sleeping_wrapper_sends_typed_request_and_returns_typed_response() {
     init_tracing();
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-utility-success".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let (shutdown_tx, engine_task) = spawn_mock_engine_task(
         handshake_address.clone(),
@@ -1419,7 +1502,7 @@ async fn call_utility_failure_message_surfaces_as_error() {
     init_tracing();
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-utility-fail".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let (shutdown_tx, engine_task) = spawn_mock_engine_task(
         handshake_address.clone(),
@@ -1483,7 +1566,7 @@ async fn dispatcher_failure_propagates_to_waiting_utility_calls() {
     init_tracing();
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-utility-dispatcher-fail".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let (shutdown_tx, engine_task) = spawn_mock_engine_task(
         handshake_address.clone(),
@@ -1532,7 +1615,7 @@ async fn connect_times_out_without_ready_message() {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut options = SocketOptions::default();
-        options.peer_identity(PeerIdentity::try_from(b"engine-timeout".to_vec()).unwrap());
+        options.peer_identity(PeerIdentity::try_from(vec![0x00, 0x00]).unwrap());
         let mut handshake = DealerSocket::with_options(options);
         handshake.connect(&engine_handshake).await.unwrap();
         handshake
@@ -1574,7 +1657,7 @@ async fn engine_core_dead_sentinel_marks_client_unhealthy_and_sticks() {
     init_tracing();
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-dead".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let (shutdown_tx, engine_task) = spawn_mock_engine_task(
         handshake_address.clone(),
@@ -1633,7 +1716,7 @@ async fn output_loop_failure_marks_client_unhealthy_and_records_first_error() {
     init_tracing();
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-output-failure".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let (shutdown_tx, engine_task) = spawn_mock_engine_task(
         handshake_address.clone(),
@@ -1689,7 +1772,7 @@ async fn client_decodes_multipart_logprob_outputs() {
     init_tracing();
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-multipart-logprobs".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let (shutdown_tx, engine_task) = spawn_mock_engine_task(
         handshake_address.clone(),
@@ -1747,9 +1830,12 @@ async fn multi_engine_client_shares_transport_and_routes_by_inflight_count() {
     let (finish_req_2_tx, finish_req_2_rx) = oneshot::channel();
     let (finish_req_3_tx, finish_req_3_rx) = oneshot::channel();
 
+    let mut ready0 = crate::mock_engine::default_ready_response();
+    ready0.data_parallel_size = 2;
     let (init_rx_0, shutdown_tx_0, engine_task_0) = spawn_mock_engine_task_with_init(
         handshake_address.clone(),
-        b"engine-0".to_vec(),
+        vec![0x00, 0x00],
+        ready0,
         |dealer, push| {
             Box::pin(async move {
                 let add_1 = recv_engine_message(dealer).await;
@@ -1796,9 +1882,13 @@ async fn multi_engine_client_shares_transport_and_routes_by_inflight_count() {
             })
         },
     );
+    let mut ready1 = crate::mock_engine::default_ready_response();
+    ready1.data_parallel_size = 2;
+    ready1.data_parallel_rank = 1;
     let (init_rx_1, shutdown_tx_1, engine_task_1) = spawn_mock_engine_task_with_init(
         handshake_address.clone(),
-        b"engine-1".to_vec(),
+        vec![0x01, 0x00],
+        ready1,
         |dealer, push| {
             Box::pin(async move {
                 let add_2 = recv_engine_message(dealer).await;
@@ -1851,10 +1941,10 @@ async fn multi_engine_client_shares_transport_and_routes_by_inflight_count() {
     assert_eq!(client.engine_count(), 2);
     assert_eq!(
         client.engine_identities(),
-        vec![b"engine-0".as_slice(), b"engine-1".as_slice()]
+        vec![[0x00, 0x00].as_slice(), [0x01, 0x00].as_slice()]
     );
     assert_eq!(client.ready_responses().len(), 2);
-    assert_eq!(client.engine_identities()[0], b"engine-0");
+    assert_eq!(client.engine_identities()[0], &[0x00, 0x00]);
 
     let mut stream_1 = client.call(sample_request_with_id("req-1")).await.unwrap();
     let mut stream_2 = client.call(sample_request_with_id("req-2")).await.unwrap();
@@ -1920,9 +2010,10 @@ async fn multi_engine_abort_is_grouped_and_utility_fans_out_to_all_engines() {
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
 
-    let (shutdown_tx_0, engine_task_0) = spawn_mock_engine_task(
+    let (shutdown_tx_0, engine_task_0) = spawn_mock_engine_task_with_ready(
         handshake_address.clone(),
         EngineId::from_engine_index(0).into_frame().to_vec(),
+        two_rank_ready(0),
         |dealer, push| {
             Box::pin(async move {
                 let utility = recv_engine_message(dealer).await;
@@ -1976,9 +2067,10 @@ async fn multi_engine_abort_is_grouped_and_utility_fans_out_to_all_engines() {
         },
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let (shutdown_tx_1, engine_task_1) = spawn_mock_engine_task(
+    let (shutdown_tx_1, engine_task_1) = spawn_mock_engine_task_with_ready(
         handshake_address.clone(),
         EngineId::from_engine_index(1).into_frame().to_vec(),
+        two_rank_ready(1),
         |dealer, push| {
             Box::pin(async move {
                 let utility = recv_engine_message(dealer).await;
@@ -2089,9 +2181,10 @@ async fn collective_rpc_flattens_results_from_all_engines() {
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
 
-    let (shutdown_tx_0, engine_task_0) = spawn_mock_engine_task(
+    let (shutdown_tx_0, engine_task_0) = spawn_mock_engine_task_with_ready(
         handshake_address.clone(),
-        b"engine-0".to_vec(),
+        vec![0x00, 0x00],
+        two_rank_ready(0),
         |dealer, push| {
             Box::pin(async move {
                 let utility = recv_engine_message(dealer).await;
@@ -2122,9 +2215,10 @@ async fn collective_rpc_flattens_results_from_all_engines() {
         },
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let (shutdown_tx_1, engine_task_1) = spawn_mock_engine_task(
+    let (shutdown_tx_1, engine_task_1) = spawn_mock_engine_task_with_ready(
         handshake_address.clone(),
-        b"engine-1".to_vec(),
+        vec![0x01, 0x00],
+        two_rank_ready(1),
         |dealer, push| {
             Box::pin(async move {
                 let utility = recv_engine_message(dealer).await;
@@ -2196,7 +2290,7 @@ async fn collective_rpc_flattens_results_from_all_engines() {
 /// name and serialized args match, and replies with `result`.
 fn spawn_mock_utility_engine(
     handshake_address: String,
-    engine_id: Vec<u8>,
+    data_parallel_rank: u32,
     expected_method: &'static str,
     expected_args: Value,
     result: bool,
@@ -2204,35 +2298,40 @@ fn spawn_mock_utility_engine(
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<()>,
 ) {
-    spawn_mock_engine_task(handshake_address, engine_id, move |dealer, push| {
-        Box::pin(async move {
-            let utility = recv_engine_message(dealer).await;
-            assert_eq!(utility[0].as_ref(), &[0x03]);
-            let payload = decode_value(&utility[1]);
-            let array = match payload {
-                Value::Array(array) => array,
-                other => panic!("expected utility payload array, got {other:?}"),
-            };
-            // Utility requests serialize as `(client_index, call_id, method, args)`.
-            let call_id = array[1].as_u64().expect("call_id");
-            assert_eq!(array[2], Value::from(expected_method));
-            assert_eq!(array[3], expected_args, "unexpected utility args");
-            send_outputs(
-                push,
-                UtilityCallOutput {
-                    engine_index: 0,
-                    timestamp: 0.0,
-                    output: UtilityOutput {
-                        call_id: call_id.into(),
-                        failure_message: None,
-                        result: Some(utility_result_value(result)),
-                    },
-                }
-                .into(),
-            )
-            .await;
-        })
-    })
+    spawn_mock_engine_task_with_ready(
+        handshake_address,
+        EngineId::from_engine_index(data_parallel_rank),
+        two_rank_ready(data_parallel_rank),
+        move |dealer, push| {
+            Box::pin(async move {
+                let utility = recv_engine_message(dealer).await;
+                assert_eq!(utility[0].as_ref(), &[0x03]);
+                let payload = decode_value(&utility[1]);
+                let array = match payload {
+                    Value::Array(array) => array,
+                    other => panic!("expected utility payload array, got {other:?}"),
+                };
+                // Utility requests serialize as `(client_index, call_id, method, args)`.
+                let call_id = array[1].as_u64().expect("call_id");
+                assert_eq!(array[2], Value::from(expected_method));
+                assert_eq!(array[3], expected_args, "unexpected utility args");
+                send_outputs(
+                    push,
+                    UtilityCallOutput {
+                        engine_index: data_parallel_rank,
+                        timestamp: 0.0,
+                        output: UtilityOutput {
+                            call_id: call_id.into(),
+                            failure_message: None,
+                            result: Some(utility_result_value(result)),
+                        },
+                    }
+                    .into(),
+                )
+                .await;
+            })
+        },
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2243,14 +2342,14 @@ async fn is_sleeping_returns_error_when_engines_disagree() {
 
     let (shutdown_tx_0, engine_task_0) = spawn_mock_utility_engine(
         handshake_address.clone(),
-        b"engine-0".to_vec(),
+        0,
         "is_sleeping",
         Value::Array(vec![]),
         true,
     );
     let (shutdown_tx_1, engine_task_1) = spawn_mock_utility_engine(
         handshake_address.clone(),
-        b"engine-1".to_vec(),
+        1,
         "is_sleeping",
         Value::Array(vec![]),
         false,
@@ -2293,14 +2392,14 @@ async fn is_sleeping_returns_value_when_all_engines_agree() {
 
     let (shutdown_tx_0, engine_task_0) = spawn_mock_utility_engine(
         handshake_address.clone(),
-        b"engine-0".to_vec(),
+        0,
         "is_sleeping",
         Value::Array(vec![]),
         true,
     );
     let (shutdown_tx_1, engine_task_1) = spawn_mock_utility_engine(
         handshake_address.clone(),
-        b"engine-1".to_vec(),
+        1,
         "is_sleeping",
         Value::Array(vec![]),
         true,
@@ -2336,14 +2435,14 @@ async fn reset_prefix_cache_returns_true_when_all_engines_succeed() {
 
     let (shutdown_tx_0, engine_task_0) = spawn_mock_utility_engine(
         handshake_address.clone(),
-        b"engine-0".to_vec(),
+        0,
         "reset_prefix_cache",
         Value::Array(vec![Value::from(false), Value::from(false)]),
         true,
     );
     let (shutdown_tx_1, engine_task_1) = spawn_mock_utility_engine(
         handshake_address.clone(),
-        b"engine-1".to_vec(),
+        1,
         "reset_prefix_cache",
         Value::Array(vec![Value::from(false), Value::from(false)]),
         true,
@@ -2379,14 +2478,14 @@ async fn reset_prefix_cache_returns_false_when_any_engine_fails() {
 
     let (shutdown_tx_0, engine_task_0) = spawn_mock_utility_engine(
         handshake_address.clone(),
-        b"engine-0".to_vec(),
+        0,
         "reset_prefix_cache",
         Value::Array(vec![Value::from(false), Value::from(false)]),
         true,
     );
     let (shutdown_tx_1, engine_task_1) = spawn_mock_utility_engine(
         handshake_address.clone(),
-        b"engine-1".to_vec(),
+        1,
         "reset_prefix_cache",
         Value::Array(vec![Value::from(false), Value::from(false)]),
         false,
@@ -2604,6 +2703,21 @@ fn python_msgpack_fixtures_match_rust_encoding() {
         rust_ready_keys, python_ready_keys,
         "EngineCoreReadyResponse drifted from the Python dataclass",
     );
+    let python_ready: crate::protocol::handshake::EngineCoreReadyResponse =
+        rmp_serde::from_slice(&hex::decode(ready_response_hex).unwrap()).unwrap();
+    assert_eq!(python_ready.max_model_len, 32_768);
+    assert_eq!(python_ready.num_gpu_blocks, 1_000);
+    assert_eq!(python_ready.kv_cache_size_tokens, Some(16_000));
+    assert_eq!(python_ready.kv_cache_max_concurrency, Some(8.5));
+    assert_eq!(python_ready.tensor_parallel_size, 2);
+    assert_eq!(python_ready.data_parallel_rank, 3);
+    assert_eq!(python_ready.max_num_seqs, 64);
+    assert_eq!(python_ready.kv_connector.as_deref(), Some("NixlConnector"));
+    assert_eq!(python_ready.kv_role.as_deref(), Some("kv_consumer"));
+    assert_eq!(python_ready.kv_engine_id.as_deref(), Some("engine-3"));
+    assert_eq!(python_ready.kv_events_publisher.as_deref(), Some("zmq"));
+    assert!(python_ready.supports_lora);
+    assert_eq!(python_ready.max_loras, 8);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2666,14 +2780,26 @@ async fn bootstrapped_connects_with_contiguous_engine_ids() {
         }
     });
 
-    let (_dealer0, _push0) = setup_bootstrapped_mock_engine(
+    let rank0 = crate::mock_engine::default_ready_response();
+    let mut rank1 = rank0.clone();
+    let mut rank0 = rank0;
+    rank0.data_parallel_size = 2;
+    rank1.data_parallel_size = 2;
+    rank1.data_parallel_rank = 1;
+    let (_dealer0, _push0) = setup_bootstrapped_mock_engine_with_ready(
         input_address.clone(),
         output_address.clone(),
         &[0x00, 0x00],
+        rank0,
     )
     .await;
-    let (_dealer1, _push1) =
-        setup_bootstrapped_mock_engine(input_address, output_address, &[0x01, 0x00]).await;
+    let (_dealer1, _push1) = setup_bootstrapped_mock_engine_with_ready(
+        input_address,
+        output_address,
+        &[0x01, 0x00],
+        rank1,
+    )
+    .await;
     let client = client_task.await.unwrap();
 
     assert_eq!(client.engine_count(), 2);
@@ -2709,8 +2835,16 @@ async fn bootstrapped_connects_with_nonzero_engine_start_index() {
         }
     });
 
-    let (_dealer, _push) =
-        setup_bootstrapped_mock_engine(input_address, output_address, &[0x03, 0x00]).await;
+    let mut ready = crate::mock_engine::default_ready_response();
+    ready.data_parallel_size = 4;
+    ready.data_parallel_rank = 3;
+    let (_dealer, _push) = setup_bootstrapped_mock_engine_with_ready(
+        input_address,
+        output_address,
+        &[0x03, 0x00],
+        ready,
+    )
+    .await;
     let client = client_task.await.unwrap();
 
     assert_eq!(client.engine_count(), 1);

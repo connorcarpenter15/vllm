@@ -214,10 +214,17 @@ where
 
     // Optionally bind the private engine RPC service on a separate port.
     let engine_rpc_setup = if let Some(engine_rpc_port) = config.engine_rpc_port {
-        let engine_rpc_host = config
-            .engine_rpc_host
-            .as_deref()
-            .unwrap_or_else(|| grpc_bind_host(&config.listener_mode));
+        let engine_rpc_host = config.engine_rpc_host.as_deref().unwrap_or("127.0.0.1");
+        let loopback = engine_rpc_host == "localhost"
+            || engine_rpc_host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback());
+        if !loopback {
+            warn!(
+                host = engine_rpc_host,
+                "engine RPC is an unauthenticated control plane exposed beyond loopback"
+            );
+        }
         let engine_rpc_listener =
             TcpListener::bind((engine_rpc_host, engine_rpc_port)).await.with_context(|| {
                 format!("failed to bind engine RPC listener on {engine_rpc_host}:{engine_rpc_port}")
@@ -233,15 +240,11 @@ where
         let engine_rpc = grpc::engine_rpc::EngineServer::new(
             grpc::engine_rpc::EngineServiceImpl::new(state.clone()),
         );
-        let lora = grpc::engine_rpc::LoraManagerServer::new(
-            grpc::engine_rpc::LoraManagerServiceImpl::new(state.clone()),
-        );
         let svc = TonicServer::builder()
             .http2_keepalive_interval(Some(GRPC_KEEPALIVE_INTERVAL))
             .http2_keepalive_timeout(Some(GRPC_KEEPALIVE_TIMEOUT))
             .layer(middleware::request_runtime_layer(state.clone()))
-            .add_service(engine_rpc)
-            .add_service(lora);
+            .add_service(engine_rpc);
         info!(%addr, tls = engine_rpc_tls.is_some(), "starting engine RPC server");
         Some((engine_rpc_listener, svc, engine_rpc_tls))
     } else {

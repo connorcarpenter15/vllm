@@ -271,7 +271,7 @@ async fn http_test_server(
 #[serial]
 async fn list_models_via_http_client() {
     let (client, server_task, _engine_task) =
-        http_test_server(b"engine-http-models", default_stream_output_specs()).await;
+        http_test_server(&[0x00, 0x00], default_stream_output_specs()).await;
 
     let models = client.models().list().await.expect("list models");
     let model_ids: Vec<&str> = models.data.iter().map(|m| m.id.as_str()).collect();
@@ -284,7 +284,7 @@ async fn list_models_via_http_client() {
 #[serial]
 async fn non_streaming_chat_via_http_client() {
     let (client, server_task, engine_task) =
-        http_test_server(b"engine-http-chat", default_stream_output_specs()).await;
+        http_test_server(&[0x00, 0x00], default_stream_output_specs()).await;
 
     let request = CreateChatCompletionRequestArgs::default()
         .model("test-model")
@@ -318,7 +318,7 @@ async fn non_streaming_chat_via_http_client() {
 #[serial]
 async fn streaming_chat_via_http_client() {
     let (client, server_task, engine_task) =
-        http_test_server(b"engine-http-stream", default_stream_output_specs()).await;
+        http_test_server(&[0x00, 0x00], default_stream_output_specs()).await;
 
     let request = CreateChatCompletionRequestArgs::default()
         .model("test-model")

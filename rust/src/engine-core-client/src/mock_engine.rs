@@ -68,8 +68,8 @@ pub fn default_ready_response() -> EngineCoreReadyResponse {
         kv_events_publisher: None,
         kv_events_endpoint: None,
         kv_events_topic: None,
-        kv_events_consolidated_endpoint: None,
         supports_lora: false,
+        max_loras: 0,
     }
 }
 
@@ -163,7 +163,8 @@ pub async fn connect_to_frontend(
     let engine_handshake = engine_handshake.as_ref();
     wait_for_ipc_endpoint(engine_handshake, config.connect_timeout).await?;
 
-    let peer_identity = peer_identity(engine_id)?;
+    let engine_id = engine_id.into();
+    let peer_identity = peer_identity(engine_id.clone())?;
     let mut options = SocketOptions::default();
     options.peer_identity(peer_identity.clone());
     let mut handshake = DealerSocket::with_options(options);
