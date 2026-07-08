@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use enum_as_inner::EnumAsInner;
+use rmpv::Value;
 use thiserror_ext::AsReport;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -172,6 +173,20 @@ pub async fn connect_handshake(
         None
     };
 
+    // When the in-process coordinator is active (coordinated DP for MoE), this
+    // frontend owns the startup handshake that the Python engines would
+    // otherwise use to agree on the torch.distributed DP rendezvous port.
+    // Native vLLM's rank-0 API server broadcasts `data_parallel_master_port` +
+    // `_data_parallel_master_port_list` in the INIT reply; without it every
+    // headless engine independently calls `get_open_ports_list` and picks a
+    // different port, so multi-node DP rendezvous (the TCPStore master) hangs.
+    // Replicate that broadcast so all engines pop the same port in lockstep.
+    let dp_parallel_config = if coordinator.is_some() {
+        build_dp_master_port_config(local_host)
+    } else {
+        BTreeMap::new()
+    };
+
     // 2. Bind the shared handshake socket once. All engines connect to this socket with their own
     //    identities, and startup order does not matter.
     let mut handshake_socket = RouterSocket::new();
@@ -210,6 +225,7 @@ pub async fn connect_handshake(
                     &input_address,
                     &output_address,
                     coordinator.as_ref(),
+                    &dp_parallel_config,
                 )
                 .await?;
                 debug!(handshake_address, ?engine_id, "sent INIT to engine");
@@ -409,6 +425,76 @@ fn decode_handshake_message(
     Ok((actual_id, handshake_message))
 }
 
+/// Pick `count` free TCP ports on `local_host` for the data-parallel
+/// torch.distributed rendezvous (the TCPStore master that DP rank 0 binds).
+///
+/// Mirrors vLLM's `get_open_ports_list`: bind all listeners simultaneously so
+/// the OS never hands out the same ephemeral port twice, record the assigned
+/// ports, then release the listeners so the engine can bind them.
+fn pick_dp_master_ports(local_host: &str, count: usize) -> Vec<u16> {
+    use std::net::TcpListener;
+
+    let mut listeners = Vec::with_capacity(count);
+    let mut ports = Vec::with_capacity(count);
+    for _ in 0..count {
+        let bound =
+            TcpListener::bind((local_host, 0u16)).or_else(|_| TcpListener::bind(("0.0.0.0", 0u16)));
+        match bound {
+            Ok(listener) => match listener.local_addr() {
+                Ok(addr) => {
+                    ports.push(addr.port());
+                    listeners.push(listener);
+                }
+                Err(err) => {
+                    warn!(error = %err, "failed to read DP master port; continuing with fewer");
+                    break;
+                }
+            },
+            Err(err) => {
+                warn!(error = %err, "failed to bind a DP master port; continuing with fewer");
+                break;
+            }
+        }
+    }
+    // Listeners drop here, releasing the ports for the engines to bind.
+    drop(listeners);
+    ports
+}
+
+/// Build the `parallel_config` overrides broadcast to every engine in the
+/// startup-handshake INIT message so they agree on the DP rendezvous port.
+///
+/// Matches vLLM's config-init semantics (the scalar `data_parallel_master_port`
+/// is popped off the end of the freshly allocated list, and the remaining ports
+/// form the shared `_data_parallel_master_port_list` that each engine pops from
+/// in lockstep when initializing the torch.distributed DP process group).
+fn build_dp_master_port_config(local_host: &str) -> BTreeMap<String, Value> {
+    let mut config = BTreeMap::new();
+    let mut ports = pick_dp_master_ports(local_host, 5);
+    let Some(scalar) = ports.pop() else {
+        warn!(
+            local_host,
+            "could not allocate any DP master ports; multi-node DP rendezvous may fail"
+        );
+        return config;
+    };
+    info!(
+        scalar_port = scalar,
+        ?ports,
+        "broadcasting DP master ports to engines for torch.distributed rendezvous"
+    );
+    let list: Vec<Value> = ports.into_iter().map(|p| Value::from(u32::from(p))).collect();
+    config.insert(
+        "data_parallel_master_port".to_string(),
+        Value::from(u32::from(scalar)),
+    );
+    config.insert(
+        "_data_parallel_master_port_list".to_string(),
+        Value::Array(list),
+    );
+    config
+}
+
 /// Send an INIT message to the engine with the local socket addresses for the
 /// engine to connect to, using the handshake socket.
 async fn send_init_message(
@@ -417,6 +503,7 @@ async fn send_init_message(
     input_address: &str,
     output_address: &str,
     coordinator: Option<&CoordinatorBootstrap>,
+    parallel_config: &BTreeMap<String, Value>,
 ) -> Result<()> {
     let init_message = HandshakeInitMessage {
         addresses: HandshakeAddresses {
@@ -426,7 +513,7 @@ async fn send_init_message(
             coordinator_output: coordinator.map(|c| c.output_address.clone()),
             frontend_stats_publish_address: None,
         },
-        parallel_config: Default::default(),
+        parallel_config: parallel_config.clone(),
     };
     let payload = encode_msgpack(&init_message)?;
     let message = ZmqMessage::try_from(vec![engine_id.to_frame(), Bytes::from(payload)])
@@ -582,7 +669,11 @@ pub async fn run_output_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::bind_local_sockets;
+    use std::collections::BTreeSet;
+
+    use rmpv::Value;
+
+    use super::{bind_local_sockets, build_dp_master_port_config, pick_dp_master_ports};
 
     #[tokio::test]
     async fn bind_local_sockets_resolves_zero_port_bindings() {
@@ -592,5 +683,40 @@ mod tests {
         assert!(input_address.starts_with("tcp://127.0.0.1:"));
         assert!(output_address.starts_with("tcp://127.0.0.1:"));
         assert_ne!(input_address, output_address);
+    }
+
+    #[test]
+    fn pick_dp_master_ports_returns_distinct_nonzero_ports() {
+        let ports = pick_dp_master_ports("127.0.0.1", 5);
+        assert_eq!(ports.len(), 5, "expected 5 ports on a healthy host");
+        assert!(ports.iter().all(|&p| p != 0), "ports must be concrete");
+        let unique: BTreeSet<u16> = ports.iter().copied().collect();
+        assert_eq!(unique.len(), ports.len(), "ports must be distinct");
+    }
+
+    #[test]
+    fn build_dp_master_port_config_broadcasts_scalar_and_list() {
+        let config = build_dp_master_port_config("127.0.0.1");
+
+        let scalar = config
+            .get("data_parallel_master_port")
+            .and_then(Value::as_u64)
+            .expect("scalar port present");
+        assert!(scalar != 0);
+
+        let list = config
+            .get("_data_parallel_master_port_list")
+            .and_then(Value::as_array)
+            .expect("port list present");
+        // 5 picked, one popped into the scalar, 4 remain in the shared list.
+        assert_eq!(list.len(), 4);
+        assert!(list.iter().all(|v| v.as_u64().is_some_and(|p| p != 0)));
+
+        // The scalar and every list entry must be distinct so engines never
+        // collide when popping in lockstep.
+        let mut all: Vec<u64> = list.iter().filter_map(Value::as_u64).collect();
+        all.push(scalar);
+        let unique: BTreeSet<u64> = all.iter().copied().collect();
+        assert_eq!(unique.len(), all.len());
     }
 }
