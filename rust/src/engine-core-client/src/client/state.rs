@@ -162,6 +162,12 @@ impl RequestRegistry {
 
     fn choose_engine_for_request(&mut self, data_parallel_rank: Option<u32>) -> Result<EngineId> {
         if let Some(rank) = data_parallel_rank {
+            if u16::try_from(rank).is_err() {
+                return Err(Error::InvalidDataParallelRank {
+                    rank,
+                    num_engines: self.routing_per_engine.len() as u32,
+                });
+            }
             // Route to the engine at the specified rank index.
             let engine_id = EngineId::from_engine_index(rank);
             return self
@@ -859,6 +865,21 @@ mod tests {
             error,
             crate::error::Error::InvalidDataParallelRank {
                 rank: 1,
+                num_engines: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn register_rejects_rank_that_aliases_connected_identity() {
+        let engine_0 = EngineId::from_engine_index(0);
+        let mut registry = RequestRegistry::new(&[connected_engine(engine_0)]);
+
+        let error = registry.register("req-alias".to_string(), None, Some(65_536)).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::Error::InvalidDataParallelRank {
+                rank: 65_536,
                 num_engines: 1,
             }
         ));
