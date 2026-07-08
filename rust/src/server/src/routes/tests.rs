@@ -3,6 +3,8 @@
 // response body is fully drained, which closes the mock engine connection too
 // early and causes flaky `closed unexpectedly` failures.
 
+mod lora_concurrency;
+
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
@@ -651,7 +653,7 @@ async fn test_app() -> axum::Router {
 
 async fn test_app_with_dev_mode(dev_mode_enabled: bool) -> axum::Router {
     let (chat, _engine_task) = test_models_with_engine_outputs_and_backend(
-        b"engine-openai",
+        &[0x00, 0x00],
         default_stream_output_specs(),
         Arc::new(FakeChatBackend::new()),
     )
@@ -673,7 +675,7 @@ async fn test_dev_mode_app_with_ready(
 ) -> (axum::Router, MockEngineTask) {
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-world-size".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let engine_task = MockEngineTask::new(spawn_mock_engine_task_with_ready(
         handshake_address.clone(),
@@ -706,7 +708,7 @@ async fn test_dev_mode_app_with_ready(
 
 async fn test_app_with_request_id_headers() -> (axum::Router, MockEngineTask) {
     let (chat, engine_task) = test_models_with_engine_outputs_and_backend(
-        b"engine-openai-request-id",
+        &[0x00, 0x00],
         default_stream_output_specs(),
         Arc::new(FakeChatBackend::new()),
     )
@@ -724,7 +726,7 @@ async fn test_app_with_request_id_headers() -> (axum::Router, MockEngineTask) {
 
 async fn test_app_with_api_keys(api_keys: Vec<String>) -> (axum::Router, MockEngineTask) {
     let (chat, engine_task) = test_models_with_engine_outputs_and_backend(
-        b"engine-openai-api-key",
+        &[0x00, 0x00],
         default_stream_output_specs(),
         Arc::new(FakeChatBackend::new()),
     )
@@ -740,7 +742,7 @@ async fn test_app_with_cors_and_keys(
     api_keys: Vec<String>,
 ) -> (axum::Router, MockEngineTask) {
     let (chat, engine_task) = test_models_with_engine_outputs_and_backend(
-        b"engine-openai-cors",
+        &[0x00, 0x00],
         default_stream_output_specs(),
         Arc::new(FakeChatBackend::new()),
     )
@@ -772,7 +774,7 @@ where
 {
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-openai-health".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let engine_task = MockEngineTask::new(spawn_mock_engine_task(
         handshake_address.clone(),
@@ -805,7 +807,7 @@ where
 {
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-openai-admin".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let engine_task = MockEngineTask::new(spawn_mock_engine_task(
         handshake_address.clone(),
@@ -846,7 +848,7 @@ async fn test_app_with_stream_output_specs(
     output_specs: Vec<(Vec<u32>, Option<EngineCoreFinishReason>)>,
 ) -> (axum::Router, MockEngineTask) {
     let (chat, engine_task) = test_models_with_engine_outputs_and_backend(
-        b"engine-openai",
+        &[0x00, 0x00],
         output_specs,
         Arc::new(FakeChatBackend::new()),
     )
@@ -865,7 +867,7 @@ async fn test_app_with_backend_and_stream_output_specs(
     output_specs: Vec<(Vec<u32>, Option<EngineCoreFinishReason>)>,
 ) -> (axum::Router, MockEngineTask) {
     let (chat, engine_task) =
-        test_models_with_engine_outputs_and_backend(b"engine-openai", output_specs, backend).await;
+        test_models_with_engine_outputs_and_backend(&[0x00, 0x00], output_specs, backend).await;
     (
         build_router(Arc::new(AppState::new(
             vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()],
@@ -884,7 +886,7 @@ where
 {
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-openai-check-request".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let engine_task = MockEngineTask::new(spawn_mock_engine_task(
         handshake_address.clone(),
@@ -926,7 +928,7 @@ where
 }
 
 async fn test_chat_with_engine_handle() -> (ChatLlm, MockEngineTask) {
-    test_chat_with_engine_outputs(b"engine-openai-chat", default_stream_output_specs()).await
+    test_chat_with_engine_outputs(&[0x00, 0x00], default_stream_output_specs()).await
 }
 
 async fn server_load(app: &axum::Router) -> u64 {
@@ -1031,7 +1033,7 @@ async fn list_models_returns_configured_model() {
 #[serial]
 async fn list_models_base_card_includes_metadata() {
     let (chat, _engine_task) = test_models_with_engine_outputs_and_backend(
-        b"engine-openai-models-meta",
+        &[0x00, 0x00],
         default_stream_output_specs(),
         Arc::new(FakeChatBackend::new()),
     )
@@ -1900,6 +1902,222 @@ async fn load_lora_adapter_rejects_engine_false_result() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn load_lora_adapter_replaces_in_place_with_existing_id() {
+    let (mut app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            for (expected_path, expected_inplace) in
+                [("org/adapter-a", false), ("org/adapter-b", true)]
+            {
+                let utility = recv_engine_message(dealer).await;
+                let payload = decode_value(&utility[1]).expect("decode utility payload");
+                let array = payload.as_array().expect("utility payload array");
+                assert_eq!(array[2], Value::from("add_lora"));
+                let lora = array[3].as_array().unwrap()[0].as_array().unwrap();
+                assert_eq!(lora[0], Value::from("adapter-a"));
+                assert_eq!(lora[1], Value::from(1));
+                assert_eq!(lora[2], Value::from(expected_path));
+                assert_eq!(lora[5], Value::from(expected_inplace));
+                send_outputs(
+                    push,
+                    utility_outputs(
+                        array[1].as_u64().expect("call id"),
+                        utility_result_value(true),
+                    ),
+                )
+                .await;
+            }
+        })
+    })
+    .await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/load_lora_adapter")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "lora_name": "adapter-a",
+                        "lora_path": "org/adapter-a"
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/load_lora_adapter")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "lora_name": "adapter-a",
+                        "lora_path": "org/adapter-b",
+                        "load_inplace": true
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    drop(app);
+    engine_task.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn failed_in_place_replacement_restores_previous_adapter() {
+    let (mut app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            for (expected_path, expected_inplace, result) in [
+                ("org/adapter-a", false, true),
+                ("org/adapter-b", true, false),
+                ("org/adapter-a", true, true),
+            ] {
+                let utility = recv_engine_message(dealer).await;
+                let payload = decode_value(&utility[1]).expect("decode utility payload");
+                let array = payload.as_array().expect("utility payload array");
+                assert_eq!(array[2], Value::from("add_lora"));
+                let lora = array[3].as_array().unwrap()[0].as_array().unwrap();
+                assert_eq!(lora[0], Value::from("adapter-a"));
+                assert_eq!(lora[1], Value::from(1));
+                assert_eq!(lora[2], Value::from(expected_path));
+                assert_eq!(lora[5], Value::from(expected_inplace));
+                send_outputs(
+                    push,
+                    utility_outputs(
+                        array[1].as_u64().expect("call id"),
+                        utility_result_value(result),
+                    ),
+                )
+                .await;
+            }
+        })
+    })
+    .await;
+
+    for (path, load_inplace, expected_status) in [
+        ("org/adapter-a", false, StatusCode::OK),
+        ("org/adapter-b", true, StatusCode::INTERNAL_SERVER_ERROR),
+    ] {
+        let response = app
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/load_lora_adapter")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "lora_name": "adapter-a",
+                            "lora_path": path,
+                            "load_inplace": load_inplace
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("call app");
+        assert_eq!(response.status(), expected_status);
+    }
+
+    let models = app
+        .call(Request::builder().uri("/v1/models").body(Body::empty()).expect("build request"))
+        .await
+        .expect("call app");
+    let body = to_bytes(models.into_body(), usize::MAX).await.expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
+    assert_eq!(json["data"][1]["root"], "org/adapter-a");
+
+    drop(app);
+    engine_task.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn list_models_omits_loras_after_indeterminate_compensation() {
+    let (mut app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            for (expected_path, result) in [("org/adapter-a", true), ("org/adapter-b", false)] {
+                let utility = recv_engine_message(dealer).await;
+                let payload = decode_value(&utility[1]).expect("decode utility payload");
+                let array = payload.as_array().expect("utility payload array");
+                let lora = array[3].as_array().unwrap()[0].as_array().unwrap();
+                assert_eq!(lora[2], Value::from(expected_path));
+                send_outputs(
+                    push,
+                    utility_outputs(
+                        array[1].as_u64().expect("call id"),
+                        utility_result_value(result),
+                    ),
+                )
+                .await;
+            }
+
+            let restore = recv_engine_message(dealer).await;
+            let payload = decode_value(&restore[1]).expect("decode restore payload");
+            let lora = payload.as_array().unwrap()[3].as_array().unwrap()[0].as_array().unwrap();
+            assert_eq!(lora[2], Value::from("org/adapter-a"));
+            // End without acknowledging restoration, leaving engine state
+            // indeterminate and forcing the registry to fail closed.
+        })
+    })
+    .await;
+
+    for (path, load_inplace, expected_status) in [
+        ("org/adapter-a", false, StatusCode::OK),
+        ("org/adapter-b", true, StatusCode::INTERNAL_SERVER_ERROR),
+    ] {
+        let response = app
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/load_lora_adapter")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "lora_name": "adapter-a",
+                            "lora_path": path,
+                            "load_inplace": load_inplace
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("call app");
+        assert_eq!(response.status(), expected_status);
+    }
+
+    let models = app
+        .call(Request::builder().uri("/v1/models").body(Body::empty()).expect("build request"))
+        .await
+        .expect("call app");
+    let body = to_bytes(models.into_body(), usize::MAX).await.expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
+    let model_ids: Vec<&str> = json["data"]
+        .as_array()
+        .expect("model data")
+        .iter()
+        .map(|model| model["id"].as_str().expect("model id"))
+        .collect();
+    assert_eq!(model_ids, ["Qwen/Qwen1.5-0.5B-Chat"]);
+
+    drop(app);
+    engine_task.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn load_lora_adapter_rejects_base_model_name_collision() {
     let (mut app, engine_task) =
         test_admin_app_with_engine_script(|_, _| boxed_test_future(async move {})).await;
@@ -1981,7 +2199,7 @@ async fn http_metrics_record_list_models_requests() {
 async fn request_metrics_use_served_model_name_label() {
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-openai-served-model-metrics".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let engine_task = MockEngineTask::new(spawn_mock_engine_task(
         handshake_address.clone(),
@@ -2286,7 +2504,7 @@ async fn non_stream_chat_image_url_reaches_engine_mm_features() {
 async fn non_stream_chat_includes_logprobs_and_prompt_logprobs() {
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-openai-chat-logprobs".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let engine_task = MockEngineTask::new(spawn_mock_engine_task(
         handshake_address.clone(),
@@ -3142,7 +3360,7 @@ async fn non_stream_completions_token_id_echo_return_token_ids_keeps_prompt_ids_
 async fn non_stream_completions_include_logprobs() {
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-openai-completion-logprobs".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let engine_task = MockEngineTask::new(spawn_mock_engine_task(
         handshake_address.clone(),
@@ -3241,7 +3459,7 @@ async fn non_stream_completions_include_logprobs() {
 async fn non_stream_completions_include_prompt_logprobs() {
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-openai-completion-prompt-logprobs".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let engine_task = MockEngineTask::new(spawn_mock_engine_task(
         handshake_address.clone(),
@@ -3354,7 +3572,7 @@ async fn non_stream_completions_include_prompt_logprobs() {
 async fn non_stream_chat_completions_still_succeed() {
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-openai-chat-non-stream".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let engine_task = MockEngineTask::new(spawn_mock_engine_task(
         handshake_address.clone(),
@@ -3415,11 +3633,8 @@ async fn non_stream_chat_completions_still_succeed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn chat_completions_accepts_request_body_larger_than_axum_default() {
-    let (chat, engine_task) = test_chat_with_engine_outputs(
-        b"engine-openai-chat-large-body",
-        default_stream_output_specs(),
-    )
-    .await;
+    let (chat, engine_task) =
+        test_chat_with_engine_outputs(&[0x00, 0x00], default_stream_output_specs()).await;
     let mut app = build_router(Arc::new(AppState::new(
         vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()],
         chat,
@@ -3457,7 +3672,7 @@ async fn chat_completions_accepts_request_body_larger_than_axum_default() {
 async fn non_stream_completions_still_succeed() {
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-openai-completion-non-stream".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let engine_task = MockEngineTask::new(spawn_mock_engine_task(
         handshake_address.clone(),
@@ -3520,7 +3735,7 @@ async fn non_stream_completions_still_succeed() {
 async fn chat_completions_header_request_id_takes_precedence() {
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-chat-request-id-precedence".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let engine_task = MockEngineTask::new(spawn_mock_engine_task(
         handshake_address.clone(),
@@ -3595,7 +3810,7 @@ async fn chat_completions_header_request_id_takes_precedence() {
 async fn non_stream_raw_generate_returns_token_output_envelope() {
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-raw-generate-non-stream".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let engine_task = MockEngineTask::new(spawn_mock_engine_task(
         handshake_address.clone(),
@@ -3712,7 +3927,7 @@ async fn non_stream_raw_generate_returns_token_output_envelope() {
 async fn stream_raw_generate_returns_sse_chunks_and_usage() {
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-raw-generate-stream".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let engine_task = MockEngineTask::new(spawn_mock_engine_task(
         handshake_address.clone(),
@@ -4425,7 +4640,7 @@ async fn include_reasoning_false_suppresses_reasoning_in_non_stream_chat() {
 async fn include_reasoning_false_suppresses_non_stream_output_metadata() {
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-openai-hidden-reasoning-logprobs".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let engine_task = MockEngineTask::new(spawn_mock_engine_task(
         handshake_address.clone(),
@@ -4597,7 +4812,7 @@ async fn tool_calls_are_mapped_to_tool_call_sse_chunks() {
 async fn tool_call_sse_chunks_can_carry_logprobs() {
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-openai-chat-tools-logprobs".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let engine_task = MockEngineTask::new(spawn_mock_engine_task(
         handshake_address.clone(),
@@ -6187,7 +6402,7 @@ where
 {
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-openai-profiler".to_vec();
+    let engine_id = vec![0x00, 0x00];
 
     let engine_task = MockEngineTask::new(spawn_mock_engine_task(
         handshake_address.clone(),

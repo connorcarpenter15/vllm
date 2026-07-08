@@ -80,9 +80,22 @@ class EngineCoreReadyResponse:
     vllm_version: str
     world_size: int
     data_parallel_size: int
+    tensor_parallel_size: int
+    pipeline_parallel_size: int
+    data_parallel_rank: int
+    max_num_seqs: int
+    max_num_batched_tokens: int
+    supports_lora: bool
+    max_loras: int
     # KV cache capacity (None for encoder-only/attention-free models).
     kv_cache_size_tokens: int | None = None
     kv_cache_max_concurrency: float | None = None
+    kv_connector: str | None = None
+    kv_role: str | None = None
+    kv_engine_id: str | None = None
+    kv_events_publisher: str | None = None
+    kv_events_endpoint: str | None = None
+    kv_events_topic: str | None = None
 
 
 class EngineCoreRequest(

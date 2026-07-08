@@ -490,7 +490,7 @@ async fn wait_for_input_registrations(
         ready_responses.insert(actual_id, ready_response);
     }
 
-    Ok(expected_engines
+    let engines = expected_engines
         .into_iter()
         .map(|engine_id| {
             let ready_response = ready_responses
@@ -501,7 +501,97 @@ async fn wait_for_input_registrations(
                 ready_response,
             }
         })
-        .collect())
+        .collect::<Vec<_>>();
+    validate_ready_responses(&engines)?;
+    Ok(engines)
+}
+
+/// Validate the private engine/frontend startup contract before publishing a
+/// client. There is no compatibility mode: incomplete or internally
+/// inconsistent engine metadata is a startup error.
+fn validate_ready_responses(engines: &[ConnectedEngine]) -> Result<()> {
+    let Some(first) = engines.first() else {
+        bail_unexpected_handshake_message!("no engine ready responses were received");
+    };
+    let expected = &first.ready_response;
+    let mut ranks = BTreeSet::new();
+
+    for engine in engines {
+        let response = &engine.ready_response;
+        if response.world_size == 0
+            || response.tensor_parallel_size == 0
+            || response.pipeline_parallel_size == 0
+            || response.data_parallel_size == 0
+            || response.max_num_seqs == 0
+            || response.max_num_batched_tokens == 0
+        {
+            bail_unexpected_handshake_message!(
+                "engine {:?} reported zero topology or scheduler capacity: {:?}",
+                engine.engine_id,
+                response
+            );
+        }
+        if response.data_parallel_rank as u64 >= response.data_parallel_size {
+            bail_unexpected_handshake_message!(
+                "engine {:?} reported data-parallel rank {} outside size {}",
+                engine.engine_id,
+                response.data_parallel_rank,
+                response.data_parallel_size
+            );
+        }
+        let Some(engine_index) = engine.engine_id.engine_index() else {
+            bail_unexpected_handshake_message!(
+                "engine identity {:?} is not a two-byte Python engine index",
+                engine.engine_id
+            );
+        };
+        if !ranks.insert(response.data_parallel_rank) {
+            bail_unexpected_handshake_message!(
+                "duplicate data-parallel rank {} in engine ready responses",
+                response.data_parallel_rank
+            );
+        }
+        if engine_index != response.data_parallel_rank {
+            bail_unexpected_handshake_message!(
+                "engine identity rank {engine_index} does not match reported data-parallel rank {}",
+                response.data_parallel_rank
+            );
+        }
+        if response.supports_lora != (response.max_loras > 0) {
+            bail_unexpected_handshake_message!(
+                "engine {:?} reported inconsistent LoRA capability (supports_lora={}, max_loras={})",
+                engine.engine_id,
+                response.supports_lora,
+                response.max_loras
+            );
+        }
+
+        let uniform = response.block_size == expected.block_size
+            && response.dtype == expected.dtype
+            && response.vllm_version == expected.vllm_version
+            && response.world_size == expected.world_size
+            && response.data_parallel_size == expected.data_parallel_size
+            && response.tensor_parallel_size == expected.tensor_parallel_size
+            && response.pipeline_parallel_size == expected.pipeline_parallel_size
+            && response.max_num_seqs == expected.max_num_seqs
+            && response.max_num_batched_tokens == expected.max_num_batched_tokens
+            && response.kv_connector == expected.kv_connector
+            && response.kv_role == expected.kv_role
+            && response.kv_events_publisher == expected.kv_events_publisher
+            && response.kv_events_endpoint == expected.kv_events_endpoint
+            && response.kv_events_topic == expected.kv_events_topic
+            && response.supports_lora == expected.supports_lora
+            && response.max_loras == expected.max_loras;
+        if !uniform {
+            bail_unexpected_handshake_message!(
+                "engine {:?} reported topology or capabilities inconsistent with engine {:?}",
+                engine.engine_id,
+                first.engine_id
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Send an encoded message to the engine through the input socket.

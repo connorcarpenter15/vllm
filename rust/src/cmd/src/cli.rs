@@ -150,6 +150,17 @@ pub struct SharedRuntimeArgs {
     #[arg(long)]
     #[serde(default)]
     pub grpc_port: Option<u16>,
+    /// TCP port for the engine RPC service consumed by out-of-process
+    /// frontends. When not set, no engine RPC server is started.
+    #[arg(long)]
+    #[serde(default)]
+    pub engine_rpc_port: Option<u16>,
+    /// Bind host for the unauthenticated engine control service. Defaults to
+    /// loopback. Setting a non-loopback host deliberately exposes privileged
+    /// lifecycle RPCs and should only be done on an access-controlled network.
+    #[arg(long)]
+    #[serde(default)]
+    pub engine_rpc_host: Option<String>,
     /// Maximum time to wait for active requests to drain during shutdown.
     #[arg(long, default_value_t = 0)]
     #[serde(default)]
@@ -399,6 +410,8 @@ impl SharedRuntimeArgs {
             api_keys: self.api_key,
             disable_log_stats: self.disable_log_stats,
             grpc_port: self.grpc_port,
+            engine_rpc_port: self.engine_rpc_port,
+            engine_rpc_host: self.engine_rpc_host,
             shutdown_timeout,
             keep_alive_timeout,
             profiler,
@@ -451,6 +464,8 @@ impl SharedRuntimeArgs {
             api_keys: self.api_key,
             disable_log_stats: self.disable_log_stats,
             grpc_port: self.grpc_port,
+            engine_rpc_port: self.engine_rpc_port,
+            engine_rpc_host: self.engine_rpc_host,
             shutdown_timeout,
             keep_alive_timeout,
             profiler,

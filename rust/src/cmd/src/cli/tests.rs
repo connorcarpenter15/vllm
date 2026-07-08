@@ -40,6 +40,8 @@ fn serve_args_forward_python_flags_with_separator() {
                         ),
                         max_logprobs: None,
                         grpc_port: None,
+                        engine_rpc_port: None,
+                        engine_rpc_host: None,
                         shutdown_timeout: 0,
                         http_timeout_keep_alive: None,
                         chat_template: None,
@@ -130,6 +132,55 @@ fn serve_args_auto_forward_enable_lora_to_python() {
         ]
     "#]]
     .assert_debug_eq(&args.managed_engine.python_args);
+}
+
+#[test]
+fn serve_args_forward_lora_capacity_to_python() {
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "Qwen/Qwen3-0.6B",
+        "--enable-lora",
+        "--max-loras",
+        "4",
+        "--max-lora-rank",
+        "64",
+    ])
+    .unwrap();
+
+    let Command::Serve(args) = cli.command else {
+        panic!("expected serve args");
+    };
+    expect![[r#"
+        [
+            "--enable-lora",
+            "--max-loras",
+            "4",
+            "--max-lora-rank",
+            "64",
+        ]
+    "#]]
+    .assert_debug_eq(&args.managed_engine.python_args);
+}
+
+#[test]
+fn serve_args_accept_engine_rpc_binding() {
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "Qwen/Qwen3-0.6B",
+        "--engine-rpc-port",
+        "50051",
+        "--engine-rpc-host",
+        "127.0.0.1",
+    ])
+    .unwrap();
+
+    let Command::Serve(args) = cli.command else {
+        panic!("expected serve args");
+    };
+    assert_eq!(args.runtime.engine_rpc_port, Some(50051));
+    assert_eq!(args.runtime.engine_rpc_host.as_deref(), Some("127.0.0.1"));
 }
 
 #[test]
@@ -736,6 +787,8 @@ fn frontend_args_accept_json() {
                         max_model_len: None,
                         max_logprobs: None,
                         grpc_port: None,
+                        engine_rpc_port: None,
+                        engine_rpc_host: None,
                         shutdown_timeout: 0,
                         http_timeout_keep_alive: None,
                         chat_template: None,
@@ -1258,6 +1311,8 @@ fn serve_args_accept_handshake_aliases() {
                         max_model_len: None,
                         max_logprobs: None,
                         grpc_port: None,
+                        engine_rpc_port: None,
+                        engine_rpc_host: None,
                         shutdown_timeout: 0,
                         http_timeout_keep_alive: None,
                         chat_template: None,
@@ -1427,6 +1482,8 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
             api_keys: [],
             disable_log_stats: false,
             grpc_port: None,
+            engine_rpc_port: None,
+            engine_rpc_host: None,
             shutdown_timeout: 0ns,
             keep_alive_timeout: 5s,
             profiler: None,
@@ -1511,6 +1568,8 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
             api_keys: [],
             disable_log_stats: false,
             grpc_port: None,
+            engine_rpc_port: None,
+            engine_rpc_host: None,
             shutdown_timeout: 0ns,
             keep_alive_timeout: 5s,
             profiler: None,
@@ -1613,6 +1672,8 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
             api_keys: [],
             disable_log_stats: false,
             grpc_port: None,
+            engine_rpc_port: None,
+            engine_rpc_host: None,
             shutdown_timeout: 0ns,
             keep_alive_timeout: 5s,
             profiler: None,

@@ -82,6 +82,21 @@ pub async fn setup_mock_engine_sockets(
         .expect("connect mock engine")
 }
 
+/// Complete the handshake with an explicit engine-ready response.
+pub async fn setup_mock_engine_sockets_with_ready(
+    engine_handshake: String,
+    engine_id: impl Into<EngineId>,
+    ready_response: EngineCoreReadyResponse,
+) -> MockEngineSockets {
+    connect_to_frontend(
+        engine_handshake,
+        engine_id,
+        test_mock_engine_config_with_ready(ready_response),
+    )
+    .await
+    .expect("connect mock engine")
+}
+
 /// Connect one mock engine directly to already-bootstrapped frontend
 /// input/output sockets.
 pub async fn setup_bootstrapped_mock_engine(
@@ -89,11 +104,27 @@ pub async fn setup_bootstrapped_mock_engine(
     output_address: String,
     engine_id: impl Into<EngineId>,
 ) -> (DealerSocket, PushSocket) {
+    setup_bootstrapped_mock_engine_with_ready(
+        input_address,
+        output_address,
+        engine_id,
+        default_ready_response(),
+    )
+    .await
+}
+
+/// Connect a bootstrapped mock engine with an explicit ready response.
+pub async fn setup_bootstrapped_mock_engine_with_ready(
+    input_address: String,
+    output_address: String,
+    engine_id: impl Into<EngineId>,
+    ready_response: EngineCoreReadyResponse,
+) -> (DealerSocket, PushSocket) {
     connect_to_bootstrapped_frontend(
         input_address,
         output_address,
         engine_id,
-        test_mock_engine_config(),
+        test_mock_engine_config_with_ready(ready_response),
     )
     .await
     .expect("connect bootstrapped mock engine")
@@ -147,10 +178,35 @@ where
         + Send
         + 'static,
 {
+    spawn_mock_engine_task_with_config(engine_handshake, engine_id, test_mock_engine_config(), run)
+}
+
+/// Variant of [`spawn_mock_engine_task`] with an explicit startup response.
+pub fn spawn_mock_engine_task_with_config<F>(
+    engine_handshake: String,
+    engine_id: impl Into<EngineId>,
+    config: MockEngineConfig,
+    run: F,
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>)
+where
+    F: for<'a> FnOnce(
+            &'a mut DealerSocket,
+            &'a mut PushSocket,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
+        + Send
+        + 'static,
+{
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let engine_id = engine_id.into();
     let engine_task = tokio::spawn(async move {
-        let (mut dealer, mut push) = setup_mock_engine(engine_handshake, engine_id).await;
+        let MockEngineSockets { data_sockets, .. } =
+            connect_to_frontend(engine_handshake, engine_id, config)
+                .await
+                .expect("connect mock engine");
+        let MockEngineDataSockets {
+            mut dealer,
+            mut push,
+        } = data_sockets.into_iter().next().expect("mock engine data socket");
         run(&mut dealer, &mut push).await;
         let _ = shutdown_rx.await;
     });

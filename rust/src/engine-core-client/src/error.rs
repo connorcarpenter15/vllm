@@ -87,6 +87,8 @@ pub enum Error {
     },
     #[error("utility call `{method}` closed unexpectedly (call_id={call_id})")]
     UtilityCallClosed { method: String, call_id: u64 },
+    #[error("utility call `{method}` timed out after {timeout:?}")]
+    UtilityCallTimeout { method: String, timeout: Duration },
     #[error("utility call `{method}` returned inconsistent results across engines: {values}")]
     InconsistentUtilityResults { method: String, values: String },
 

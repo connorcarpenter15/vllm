@@ -50,6 +50,20 @@ class EngineCoreSamplingParams(msgspec.Struct, dict=True, omit_defaults=True):
     output_kind: RequestOutputKind = RequestOutputKind.DELTA
 
 
+class LoRARequest(
+    msgspec.Struct,
+    array_like=True,
+    omit_defaults=True,
+):
+    lora_name: str
+    lora_int_id: int
+    lora_path: str = ""
+    base_model_name: str | None = None
+    tensorizer_config_dict: dict | None = None
+    load_inplace: bool = False
+    is_3d_lora_weight: bool = False
+
+
 class EngineCoreRequest(
     msgspec.Struct,
     array_like=True,
@@ -61,7 +75,7 @@ class EngineCoreRequest(
     sampling_params: EngineCoreSamplingParams | None
     pooling_params: object | None
     arrival_time: float
-    lora_request: object | None = None
+    lora_request: LoRARequest | None = None
     cache_salt: str | None = None
     data_parallel_rank: int | None = None
     prompt_embeds: object | None = None
@@ -135,6 +149,15 @@ request = EngineCoreRequest(
     ),
     pooling_params=None,
     arrival_time=42.5,
+    lora_request=LoRARequest(
+        lora_name="adapter-a",
+        lora_int_id=17,
+        lora_path="/models/adapter-a",
+        base_model_name="Qwen/Qwen3-0.6B",
+        tensorizer_config_dict={"format": "safetensors"},
+        load_inplace=True,
+        is_3d_lora_weight=True,
+    ),
     client_index=0,
 )
 
@@ -362,8 +385,21 @@ class EngineCoreReadyResponse:
     vllm_version: str
     world_size: int
     data_parallel_size: int
+    tensor_parallel_size: int
+    pipeline_parallel_size: int
+    data_parallel_rank: int
+    max_num_seqs: int
+    max_num_batched_tokens: int
+    supports_lora: bool
+    max_loras: int
     kv_cache_size_tokens: int | None = None
     kv_cache_max_concurrency: float | None = None
+    kv_connector: str | None = None
+    kv_role: str | None = None
+    kv_engine_id: str | None = None
+    kv_events_publisher: str | None = None
+    kv_events_endpoint: str | None = None
+    kv_events_topic: str | None = None
 
 
 ready_response = EngineCoreReadyResponse(
@@ -375,6 +411,21 @@ ready_response = EngineCoreReadyResponse(
     vllm_version="0.0.0",
     data_parallel_size=1,
     world_size=1,
+    kv_cache_size_tokens=16000,
+    kv_cache_max_concurrency=8.5,
+    tensor_parallel_size=2,
+    pipeline_parallel_size=1,
+    data_parallel_rank=3,
+    max_num_seqs=64,
+    max_num_batched_tokens=4096,
+    kv_connector="NixlConnector",
+    kv_role="kv_consumer",
+    kv_engine_id="engine-3",
+    kv_events_publisher="zmq",
+    kv_events_endpoint="tcp://127.0.0.1:5557",
+    kv_events_topic="kv",
+    supports_lora=True,
+    max_loras=8,
 )
 
 print(msgspec.msgpack.encode(request).hex())

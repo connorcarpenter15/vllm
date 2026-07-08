@@ -11,6 +11,7 @@ use vllm_text::{
 };
 
 use super::pb;
+use super::struct_json::{json_to_prost_struct, prost_struct_to_json};
 
 // ========================================================================================
 // Request conversion
@@ -65,7 +66,7 @@ pub fn to_text_request(
         // Thread kv_transfer_params through vllm_xargs, matching the HTTP route
         // convention.
         if let Some(kv_struct) = kv.kv_transfer_params.as_ref() {
-            let kv_json = proto_struct_to_json(kv_struct);
+            let kv_json = prost_struct_to_json(kv_struct);
             let map = sampling_params.vllm_xargs.get_or_insert_with(Default::default);
             map.insert("kv_transfer_params".to_string(), kv_json);
         }
@@ -342,7 +343,7 @@ fn to_finish_info(finished: &Finished, token_ids: &[u32]) -> pb::FinishInfo {
         num_output_tokens: finished.usage.output_token_count as u32,
         finish_reason,
         stop_reason,
-        kv_transfer_params: finished.kv_transfer_params.as_ref().and_then(json_to_proto_struct),
+        kv_transfer_params: finished.kv_transfer_params.as_ref().and_then(json_to_prost_struct),
     }
 }
 
@@ -404,56 +405,6 @@ fn positions_to_proto(
     }
 
     (logprobs, ranks, candidates)
-}
-
-// ========================================================================================
-// KV transfer params conversion (serde_json::Value ↔ prost_types::Struct)
-// ========================================================================================
-
-fn proto_struct_to_json(s: &prost_types::Struct) -> serde_json::Value {
-    serde_json::Value::Object(
-        s.fields.iter().map(|(k, v)| (k.clone(), proto_value_to_json(v))).collect(),
-    )
-}
-
-fn proto_value_to_json(v: &prost_types::Value) -> serde_json::Value {
-    use prost_types::value::Kind;
-    match v.kind.as_ref() {
-        None | Some(Kind::NullValue(_)) => serde_json::Value::Null,
-        Some(Kind::BoolValue(b)) => serde_json::Value::Bool(*b),
-        Some(Kind::NumberValue(n)) => serde_json::json!(*n),
-        Some(Kind::StringValue(s)) => serde_json::Value::String(s.clone()),
-        Some(Kind::ListValue(list)) => {
-            serde_json::Value::Array(list.values.iter().map(proto_value_to_json).collect())
-        }
-        Some(Kind::StructValue(s)) => proto_struct_to_json(s),
-    }
-}
-
-fn json_to_proto_struct(value: &serde_json::Value) -> Option<prost_types::Struct> {
-    match value {
-        serde_json::Value::Object(map) => Some(prost_types::Struct {
-            fields: map.iter().map(|(k, v)| (k.clone(), json_to_proto_value(v))).collect(),
-        }),
-        _ => None,
-    }
-}
-
-fn json_to_proto_value(v: &serde_json::Value) -> prost_types::Value {
-    use prost_types::value::Kind;
-    let kind = match v {
-        serde_json::Value::Null => Kind::NullValue(0),
-        serde_json::Value::Bool(b) => Kind::BoolValue(*b),
-        serde_json::Value::Number(n) => Kind::NumberValue(n.as_f64().unwrap_or(0.0)),
-        serde_json::Value::String(s) => Kind::StringValue(s.clone()),
-        serde_json::Value::Array(arr) => Kind::ListValue(prost_types::ListValue {
-            values: arr.iter().map(json_to_proto_value).collect(),
-        }),
-        serde_json::Value::Object(map) => Kind::StructValue(prost_types::Struct {
-            fields: map.iter().map(|(k, v)| (k.clone(), json_to_proto_value(v))).collect(),
-        }),
-    };
-    prost_types::Value { kind: Some(kind) }
 }
 
 // ========================================================================================

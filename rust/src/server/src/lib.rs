@@ -212,6 +212,45 @@ where
         None
     };
 
+    // Optionally bind the private engine RPC service on a separate port.
+    let engine_rpc_setup = if let Some(engine_rpc_port) = config.engine_rpc_port {
+        let engine_rpc_host = config.engine_rpc_host.as_deref().unwrap_or("127.0.0.1");
+        let loopback = engine_rpc_host == "localhost"
+            || engine_rpc_host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback());
+        if !loopback {
+            warn!(
+                host = engine_rpc_host,
+                "engine RPC is an unauthenticated control plane exposed beyond loopback"
+            );
+        }
+        let engine_rpc_listener =
+            TcpListener::bind((engine_rpc_host, engine_rpc_port)).await.with_context(|| {
+                format!("failed to bind engine RPC listener on {engine_rpc_host}:{engine_rpc_port}")
+            })?;
+        let addr = engine_rpc_listener.local_addr()?;
+        let engine_rpc_listener = Listener::Tcp(engine_rpc_listener);
+        let engine_rpc_tls = config
+            .tls
+            .as_ref()
+            .map(tls::build_grpc_server_config)
+            .transpose()
+            .context("invalid engine RPC TLS configuration")?;
+        let engine_rpc = grpc::engine_rpc::EngineServer::new(
+            grpc::engine_rpc::EngineServiceImpl::new(state.clone()),
+        );
+        let svc = TonicServer::builder()
+            .http2_keepalive_interval(Some(GRPC_KEEPALIVE_INTERVAL))
+            .http2_keepalive_timeout(Some(GRPC_KEEPALIVE_TIMEOUT))
+            .layer(middleware::request_runtime_layer(state.clone()))
+            .add_service(engine_rpc);
+        info!(%addr, tls = engine_rpc_tls.is_some(), "starting engine RPC server");
+        Some((engine_rpc_listener, svc, engine_rpc_tls))
+    } else {
+        None
+    };
+
     let scheme = if tls_config.is_some() {
         "https"
     } else {
@@ -318,8 +357,41 @@ where
         }
     };
 
-    let (http_res, grpc_res) = tokio::join!(http_fut, grpc_fut);
-    http_res.and(grpc_res)?;
+    let engine_rpc_fut = {
+        let shutdown = server_shutdown.child_token();
+        let server_shutdown = server_shutdown.clone();
+        let force_shutdown = force_shutdown.clone();
+        async move {
+            let Some((engine_rpc_listener, svc, engine_rpc_tls)) = engine_rpc_setup else {
+                // No engine RPC configured: wait for shutdown so we do not race
+                // the join! by resolving early and tripping the cancellation
+                // token.
+                shutdown.cancelled().await;
+                return Ok(());
+            };
+            let incoming = match engine_rpc_tls {
+                Some(context) => MaybeTlsListener::tls(engine_rpc_listener, context),
+                None => MaybeTlsListener::plain(engine_rpc_listener),
+            };
+            let server = svc.serve_with_incoming_shutdown(incoming, shutdown.cancelled_owned());
+
+            let result = tokio::select! {
+                result = server => {
+                    result.context("engine RPC server failed")
+                }
+                _ = force_shutdown.cancelled() => {
+                    warn!("engine RPC graceful shutdown deadline elapsed; aborting server");
+                    Ok(())
+                }
+            };
+
+            server_shutdown.cancel();
+            result
+        }
+    };
+
+    let (http_res, grpc_res, engine_rpc_res) = tokio::join!(http_fut, grpc_fut, engine_rpc_fut);
+    http_res.and(grpc_res).and(engine_rpc_res)?;
 
     let shutdown_deadline = shutdown_deadline
         .get()

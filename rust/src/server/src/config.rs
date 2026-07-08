@@ -203,6 +203,11 @@ pub struct Config {
     /// TCP port for the gRPC Generate service. When `None`, no gRPC server is
     /// started.
     pub grpc_port: Option<u16>,
+    /// TCP port for the engine RPC service. When `None`, no engine RPC
+    /// server is started.
+    pub engine_rpc_port: Option<u16>,
+    /// Bind host for the engine RPC service. `None` defaults to loopback.
+    pub engine_rpc_host: Option<String>,
     /// Maximum time to wait for active HTTP/gRPC requests to drain on shutdown.
     pub shutdown_timeout: Duration,
     /// Maximum idle time on a keep-alive HTTP connection before the server

@@ -51,7 +51,13 @@ pub async fn chat_completions(
 ) -> Response {
     let stream = body.stream;
     let request_context = resolve_request_context(&headers, body.request_id.as_deref());
-    let lora_resolution = state.resolve_model_with_loras(Some(&body.model)).await;
+    let mut lora_resolution = state.resolve_model_with_loras(Some(&body.model)).await;
+    if lora_resolution.lora_request.is_some() && !state.lora_state_is_consistent() {
+        return ApiError::server_error(
+            "LoRA state differs across engine ranks; restart the engine".to_string(),
+        )
+        .into_response();
+    }
 
     let prepared = match prepare_chat_request(body, &lora_resolution, request_context) {
         Ok(prepared) => prepared,
@@ -73,8 +79,8 @@ pub async fn chat_completions(
                 return chat_submit_error("failed to submit chat request", error).into_response();
             }
         };
-
     if stream {
+        let chat_stream = crate::lora::hold_lora_lease(chat_stream, lora_resolution.lease.take());
         let chunk_stream = chat_completion_chunk_stream(
             chat_stream,
             prepared.request_id,
@@ -87,6 +93,7 @@ pub async fn chat_completions(
 
         Sse::new(sse_stream).into_response()
     } else {
+        let _lora_lease = lora_resolution.lease.take();
         let response = match collect_chat_completion(
             chat_stream,
             prepared.request_id,

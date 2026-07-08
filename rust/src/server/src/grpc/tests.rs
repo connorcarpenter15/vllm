@@ -196,7 +196,11 @@ impl ChatRenderer for FakeTextBackend {
 async fn setup_grpc_service(
     engine_id: impl Into<EngineId>,
     output_specs: Vec<(Vec<u32>, Option<EngineCoreFinishReason>)>,
-) -> (GenerateServer<GenerateServiceImpl>, MockEngineTask) {
+) -> (
+    GenerateServer<GenerateServiceImpl>,
+    MockEngineTask,
+    Arc<AppState>,
+) {
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
     let engine_id = engine_id.into();
@@ -235,8 +239,9 @@ async fn setup_grpc_service(
     );
     let state = Arc::new(AppState::new(vec!["test-model".to_string()], chat));
     (
-        GenerateServer::new(GenerateServiceImpl::new(state)),
+        GenerateServer::new(GenerateServiceImpl::new(state.clone())),
         engine_task,
+        state,
     )
 }
 
@@ -250,7 +255,7 @@ async fn grpc_test_server(
     tokio::task::JoinHandle<()>,
     MockEngineTask,
 ) {
-    let (svc, engine_task) = setup_grpc_service(engine_id, output_specs).await;
+    let (svc, engine_task, _state) = setup_grpc_service(engine_id, output_specs).await;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind grpc listener");
     let addr = listener.local_addr().expect("local addr");
@@ -279,7 +284,7 @@ async fn grpc_tls_test_server(
     certs: &TestCerts,
     cert_reqs: i32,
 ) -> (String, tokio::task::JoinHandle<()>, MockEngineTask) {
-    let (svc, engine_task) = setup_grpc_service(engine_id, output_specs).await;
+    let (svc, engine_task, _state) = setup_grpc_service(engine_id, output_specs).await;
     let context = tls::build_grpc_server_config(&server_tls(certs, cert_reqs))
         .expect("build grpc tls config");
 
@@ -369,7 +374,8 @@ async fn grpc_server_with_keepalive(
     engine_id: impl Into<EngineId>,
     keepalive: Option<Duration>,
 ) -> (String, tokio::task::JoinHandle<()>, MockEngineTask) {
-    let (svc, engine_task) = setup_grpc_service(engine_id, default_stream_output_specs()).await;
+    let (svc, engine_task, _state) =
+        setup_grpc_service(engine_id, default_stream_output_specs()).await;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind grpc listener");
     let addr = listener.local_addr().expect("local addr").to_string();
@@ -429,9 +435,39 @@ async fn h2_unresponsive_peer_closed_within(addr: &str, wait: Duration) -> bool 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn drain_rejects_both_legacy_grpc_generation_methods() {
+    use pb::generate_server::Generate as _;
+
+    let (_svc, engine_task, state) =
+        setup_grpc_service(&[0x00, 0x00], default_stream_output_specs()).await;
+    state.begin_engine_drain();
+    let service = GenerateServiceImpl::new(state);
+    let request = || {
+        tonic::Request::new(pb::GenerateRequest {
+            request_id: "draining".to_string(),
+            model: "test-model".to_string(),
+            prompt: Some(pb::generate_request::Prompt::Text("hello".to_string())),
+            ..Default::default()
+        })
+    };
+
+    assert_eq!(
+        service.generate(request()).await.unwrap_err().code(),
+        tonic::Code::Unavailable
+    );
+    let stream_error = match service.generate_stream(request()).await {
+        Ok(_) => panic!("streaming generation must be rejected while draining"),
+        Err(error) => error,
+    };
+    assert_eq!(stream_error.code(), tonic::Code::Unavailable);
+    drop(engine_task);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn unary_generate_returns_collected_text() {
     let (mut client, server_task, engine_task) =
-        grpc_test_server(b"engine-grpc-unary", default_stream_output_specs()).await;
+        grpc_test_server(&[0x00, 0x00], default_stream_output_specs()).await;
 
     let response = client
         .generate(pb::GenerateRequest {
@@ -474,7 +510,7 @@ async fn unary_generate_returns_collected_text() {
 #[serial]
 async fn unary_generate_with_token_ids_prompt() {
     let (mut client, server_task, engine_task) =
-        grpc_test_server(b"engine-grpc-token-ids", default_stream_output_specs()).await;
+        grpc_test_server(&[0x00, 0x00], default_stream_output_specs()).await;
 
     let response = client
         .generate(pb::GenerateRequest {
@@ -508,7 +544,7 @@ async fn unary_generate_with_token_ids_prompt() {
 #[serial]
 async fn unary_generate_returns_token_ids_when_requested() {
     let (mut client, server_task, engine_task) =
-        grpc_test_server(b"engine-grpc-tok-resp", default_stream_output_specs()).await;
+        grpc_test_server(&[0x00, 0x00], default_stream_output_specs()).await;
 
     let response = client
         .generate(pb::GenerateRequest {
@@ -548,7 +584,7 @@ async fn unary_generate_returns_token_ids_when_requested() {
 #[serial]
 async fn unary_generate_missing_prompt_returns_invalid_argument() {
     let (mut client, server_task, _engine_task) =
-        grpc_test_server(b"engine-grpc-no-prompt", default_stream_output_specs()).await;
+        grpc_test_server(&[0x00, 0x00], default_stream_output_specs()).await;
 
     let status = client
         .generate(pb::GenerateRequest {
@@ -570,7 +606,7 @@ async fn unary_generate_missing_prompt_returns_invalid_argument() {
 #[serial]
 async fn unary_generate_min_tokens_above_max_tokens_returns_invalid_argument() {
     let (mut client, server_task, _engine_task) =
-        grpc_test_server(b"engine-grpc-min-above-max", default_stream_output_specs()).await;
+        grpc_test_server(&[0x00, 0x00], default_stream_output_specs()).await;
 
     let status = client
         .generate(pb::GenerateRequest {
@@ -598,7 +634,7 @@ async fn unary_generate_min_tokens_above_max_tokens_returns_invalid_argument() {
 #[serial]
 async fn streaming_generate_yields_incremental_responses() {
     let (mut client, server_task, engine_task) =
-        grpc_test_server(b"engine-grpc-stream", default_stream_output_specs()).await;
+        grpc_test_server(&[0x00, 0x00], default_stream_output_specs()).await;
 
     let stream = client
         .generate_stream(pb::GenerateRequest {
@@ -661,11 +697,8 @@ async fn streaming_generate_yields_incremental_responses() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn streaming_generate_missing_prompt_returns_invalid_argument() {
-    let (mut client, server_task, _engine_task) = grpc_test_server(
-        b"engine-grpc-stream-no-prompt",
-        default_stream_output_specs(),
-    )
-    .await;
+    let (mut client, server_task, _engine_task) =
+        grpc_test_server(&[0x00, 0x00], default_stream_output_specs()).await;
 
     let status = client
         .generate_stream(pb::GenerateRequest {
@@ -685,11 +718,8 @@ async fn streaming_generate_missing_prompt_returns_invalid_argument() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn streaming_generate_min_tokens_above_max_tokens_returns_invalid_argument() {
-    let (mut client, server_task, _engine_task) = grpc_test_server(
-        b"engine-grpc-stream-min-above-max",
-        default_stream_output_specs(),
-    )
-    .await;
+    let (mut client, server_task, _engine_task) =
+        grpc_test_server(&[0x00, 0x00], default_stream_output_specs()).await;
 
     let status = client
         .generate_stream(pb::GenerateRequest {
@@ -717,7 +747,7 @@ async fn streaming_generate_min_tokens_above_max_tokens_returns_invalid_argument
 #[serial]
 async fn unary_generate_with_sampling_params() {
     let (mut client, server_task, engine_task) =
-        grpc_test_server(b"engine-grpc-sampling", default_stream_output_specs()).await;
+        grpc_test_server(&[0x00, 0x00], default_stream_output_specs()).await;
 
     let response = client
         .generate(pb::GenerateRequest {
@@ -753,7 +783,7 @@ async fn unary_generate_with_sampling_params() {
 #[serial]
 async fn unary_generate_rejects_wrong_model() {
     let (mut client, server_task, _engine_task) =
-        grpc_test_server(b"engine-grpc-wrong-model", default_stream_output_specs()).await;
+        grpc_test_server(&[0x00, 0x00], default_stream_output_specs()).await;
 
     let status = client
         .generate(pb::GenerateRequest {
@@ -778,11 +808,8 @@ async fn unary_generate_rejects_wrong_model() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn streaming_generate_rejects_wrong_model() {
-    let (mut client, server_task, _engine_task) = grpc_test_server(
-        b"engine-grpc-stream-wrong-model",
-        default_stream_output_specs(),
-    )
-    .await;
+    let (mut client, server_task, _engine_task) =
+        grpc_test_server(&[0x00, 0x00], default_stream_output_specs()).await;
 
     let status = client
         .generate_stream(pb::GenerateRequest {
@@ -808,7 +835,7 @@ async fn streaming_generate_rejects_wrong_model() {
 #[serial]
 async fn unary_generate_accepts_empty_model() {
     let (mut client, server_task, engine_task) =
-        grpc_test_server(b"engine-grpc-empty-model", default_stream_output_specs()).await;
+        grpc_test_server(&[0x00, 0x00], default_stream_output_specs()).await;
 
     // Empty `model` (proto3 default) is treated as "unset" and should be accepted.
     let response = client
@@ -837,7 +864,7 @@ async fn unary_generate_accepts_empty_model() {
 #[serial]
 async fn unary_generate_output_text_defaults_to_true() {
     let (mut client, server_task, engine_task) =
-        grpc_test_server(b"engine-grpc-default-text", default_stream_output_specs()).await;
+        grpc_test_server(&[0x00, 0x00], default_stream_output_specs()).await;
 
     // No response options at all — output_text should default to true.
     let response = client
@@ -866,13 +893,8 @@ async fn unary_generate_output_text_defaults_to_true() {
 #[serial]
 async fn grpc_generate_succeeds_over_tls() {
     let certs = TestCerts::generate();
-    let (addr, server_task, engine_task) = grpc_tls_test_server(
-        b"engine-grpc-tls-unary",
-        default_stream_output_specs(),
-        &certs,
-        0,
-    )
-    .await;
+    let (addr, server_task, engine_task) =
+        grpc_tls_test_server(&[0x00, 0x00], default_stream_output_specs(), &certs, 0).await;
 
     let mut client = grpc_tls_client(&certs, &addr, None).await.expect("tls client");
     let response = client
@@ -904,13 +926,8 @@ async fn grpc_generate_succeeds_over_tls() {
 #[serial]
 async fn grpc_tls_negotiates_h2_alpn() {
     let certs = TestCerts::generate();
-    let (addr, server_task, _engine_task) = grpc_tls_test_server(
-        b"engine-grpc-tls-alpn",
-        default_stream_output_specs(),
-        &certs,
-        0,
-    )
-    .await;
+    let (addr, server_task, _engine_task) =
+        grpc_tls_test_server(&[0x00, 0x00], default_stream_output_specs(), &certs, 0).await;
 
     let stream = grpc_tls_handshake(&certs, &addr).await.expect("handshake");
     assert_eq!(
@@ -926,13 +943,8 @@ async fn grpc_tls_negotiates_h2_alpn() {
 #[serial]
 async fn grpc_mtls_required_rejects_client_without_certificate() {
     let certs = TestCerts::generate();
-    let (addr, server_task, _engine_task) = grpc_tls_test_server(
-        b"engine-grpc-tls-mtls-reject",
-        default_stream_output_specs(),
-        &certs,
-        2,
-    )
-    .await;
+    let (addr, server_task, _engine_task) =
+        grpc_tls_test_server(&[0x00, 0x00], default_stream_output_specs(), &certs, 2).await;
 
     // With TLS 1.3 the missing-client-cert rejection surfaces on first use, not
     // at the handshake, so drive an RPC and assert the call fails.
@@ -965,13 +977,8 @@ async fn grpc_mtls_required_rejects_client_without_certificate() {
 #[serial]
 async fn grpc_mtls_required_accepts_valid_client_certificate() {
     let certs = TestCerts::generate();
-    let (addr, server_task, engine_task) = grpc_tls_test_server(
-        b"engine-grpc-tls-mtls-accept",
-        default_stream_output_specs(),
-        &certs,
-        2,
-    )
-    .await;
+    let (addr, server_task, engine_task) =
+        grpc_tls_test_server(&[0x00, 0x00], default_stream_output_specs(), &certs, 2).await;
 
     let mut client = grpc_tls_client(&certs, &addr, Some("client")).await.expect("mtls client");
     let response = client
@@ -1003,8 +1010,7 @@ async fn grpc_mtls_required_accepts_valid_client_certificate() {
 #[serial]
 async fn grpc_keepalive_closes_unresponsive_connection() {
     let (addr, server_task, _engine_task) =
-        grpc_server_with_keepalive(b"engine-grpc-keepalive", Some(Duration::from_millis(150)))
-            .await;
+        grpc_server_with_keepalive(&[0x00, 0x00], Some(Duration::from_millis(150))).await;
 
     let closed = h2_unresponsive_peer_closed_within(&addr, Duration::from_secs(5)).await;
     assert!(
@@ -1020,8 +1026,7 @@ async fn grpc_keepalive_closes_unresponsive_connection() {
 async fn grpc_without_keepalive_keeps_unresponsive_connection_open() {
     // Without keepalive the same unresponsive peer is NOT
     // closed, proving the close above is attributable to keepalive.
-    let (addr, server_task, _engine_task) =
-        grpc_server_with_keepalive(b"engine-grpc-no-keepalive", None).await;
+    let (addr, server_task, _engine_task) = grpc_server_with_keepalive(&[0x00, 0x00], None).await;
 
     let closed = h2_unresponsive_peer_closed_within(&addr, Duration::from_secs(1)).await;
     assert!(
