@@ -12,6 +12,54 @@ use vllm_text::{
 };
 
 use super::pb;
+use super::struct_json::{json_to_prost_struct, prost_struct_to_json};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvRole {
+    Aggregated,
+    Prefill,
+    Decode,
+}
+
+pub fn role_from_kv_role(kv_role: Option<&str>) -> KvRole {
+    match kv_role {
+        Some("kv_producer") => KvRole::Prefill,
+        Some("kv_consumer") => KvRole::Decode,
+        _ => KvRole::Aggregated,
+    }
+}
+
+pub fn validate_disaggregated_request(
+    request: &pb::GenerateRequest,
+    role: KvRole,
+) -> Result<(), Status> {
+    let has_transfer_params = request
+        .kv
+        .as_ref()
+        .and_then(|kv| kv.kv_transfer_params.as_ref())
+        .is_some_and(|params| !params.fields.is_empty());
+    if role == KvRole::Decode && !has_transfer_params {
+        return Err(Status::invalid_argument(
+            "kv.kv_transfer_params is required for decode requests",
+        ));
+    }
+    Ok(())
+}
+
+pub fn mark_prefill_request(request: &mut TextRequest) {
+    let params = request
+        .sampling_params
+        .vllm_xargs
+        .get_or_insert_with(Default::default)
+        .entry("kv_transfer_params".to_string())
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    if let Some(params) = params.as_object_mut() {
+        params.insert(
+            "do_remote_decode".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+}
 
 pub fn media_parts_from_request(media: &[pb::MediaItem]) -> Result<Vec<MediaContentPart>, Status> {
     let mut parts = Vec::with_capacity(media.len());
@@ -101,7 +149,7 @@ pub fn to_text_request(
         // Thread kv_transfer_params through vllm_xargs, matching the HTTP route
         // convention.
         if let Some(kv_struct) = kv.kv_transfer_params.as_ref() {
-            let kv_json = proto_struct_to_json(kv_struct);
+            let kv_json = prost_struct_to_json(kv_struct);
             let map = sampling_params.vllm_xargs.get_or_insert_with(Default::default);
             map.insert("kv_transfer_params".to_string(), kv_json);
         }
@@ -378,7 +426,7 @@ fn to_finish_info(finished: &Finished, token_ids: &[u32]) -> pb::FinishInfo {
         num_output_tokens: finished.usage.output_token_count as u32,
         finish_reason,
         stop_reason,
-        kv_transfer_params: finished.kv_transfer_params.as_ref().and_then(json_to_proto_struct),
+        kv_transfer_params: finished.kv_transfer_params.as_ref().and_then(json_to_prost_struct),
     }
 }
 
@@ -443,56 +491,6 @@ fn positions_to_proto(
 }
 
 // ========================================================================================
-// KV transfer params conversion (serde_json::Value ↔ prost_types::Struct)
-// ========================================================================================
-
-fn proto_struct_to_json(s: &prost_types::Struct) -> serde_json::Value {
-    serde_json::Value::Object(
-        s.fields.iter().map(|(k, v)| (k.clone(), proto_value_to_json(v))).collect(),
-    )
-}
-
-fn proto_value_to_json(v: &prost_types::Value) -> serde_json::Value {
-    use prost_types::value::Kind;
-    match v.kind.as_ref() {
-        None | Some(Kind::NullValue(_)) => serde_json::Value::Null,
-        Some(Kind::BoolValue(b)) => serde_json::Value::Bool(*b),
-        Some(Kind::NumberValue(n)) => serde_json::json!(*n),
-        Some(Kind::StringValue(s)) => serde_json::Value::String(s.clone()),
-        Some(Kind::ListValue(list)) => {
-            serde_json::Value::Array(list.values.iter().map(proto_value_to_json).collect())
-        }
-        Some(Kind::StructValue(s)) => proto_struct_to_json(s),
-    }
-}
-
-fn json_to_proto_struct(value: &serde_json::Value) -> Option<prost_types::Struct> {
-    match value {
-        serde_json::Value::Object(map) => Some(prost_types::Struct {
-            fields: map.iter().map(|(k, v)| (k.clone(), json_to_proto_value(v))).collect(),
-        }),
-        _ => None,
-    }
-}
-
-fn json_to_proto_value(v: &serde_json::Value) -> prost_types::Value {
-    use prost_types::value::Kind;
-    let kind = match v {
-        serde_json::Value::Null => Kind::NullValue(0),
-        serde_json::Value::Bool(b) => Kind::BoolValue(*b),
-        serde_json::Value::Number(n) => Kind::NumberValue(n.as_f64().unwrap_or(0.0)),
-        serde_json::Value::String(s) => Kind::StringValue(s.clone()),
-        serde_json::Value::Array(arr) => Kind::ListValue(prost_types::ListValue {
-            values: arr.iter().map(json_to_proto_value).collect(),
-        }),
-        serde_json::Value::Object(map) => Kind::StructValue(prost_types::Struct {
-            fields: map.iter().map(|(k, v)| (k.clone(), json_to_proto_value(v))).collect(),
-        }),
-    };
-    prost_types::Value { kind: Some(kind) }
-}
-
-// ========================================================================================
 // Options extracted from the request for response building
 // ========================================================================================
 
@@ -531,8 +529,8 @@ mod tests {
 
     use super::pb::finish_info::{FinishReason as PbFinishReason, StopReason as PbStopReason};
     use super::{
-        ResponseOpts, media_parts_from_request, pb, to_finish_info, to_sequence_output,
-        to_text_request,
+        KvRole, ResponseOpts, mark_prefill_request, media_parts_from_request, pb, to_finish_info,
+        to_sequence_output, to_text_request, validate_disaggregated_request,
     };
 
     fn base_request() -> pb::GenerateRequest {
@@ -565,6 +563,22 @@ mod tests {
         }])
         .unwrap_err();
         assert_eq!(error.code(), tonic::Code::Unimplemented);
+    }
+
+    #[test]
+    fn decode_requires_kv_transfer_params() {
+        let error = validate_disaggregated_request(&base_request(), KvRole::Decode).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn prefill_marks_remote_decode() {
+        let mut text = to_text_request(base_request(), false, &["test-model".to_string()]).unwrap();
+        mark_prefill_request(&mut text);
+        assert_eq!(
+            text.sampling_params.vllm_xargs.as_ref().unwrap()["kv_transfer_params"]["do_remote_decode"],
+            serde_json::Value::Bool(true)
+        );
     }
 
     #[test]

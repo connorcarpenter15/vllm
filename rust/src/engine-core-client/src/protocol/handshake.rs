@@ -67,6 +67,20 @@ pub struct EngineCoreReadyResponse {
     pub max_num_batched_tokens: u64,
     /// Unique identifier for this server instance.
     pub instance_id: String,
+    /// KV transfer role (`kv_producer` / `kv_consumer` / `kv_both`), if any.
+    #[serde(default)]
+    pub kv_role: Option<String>,
+    /// KV-event publisher backend (`null` / `zmq`), if configured.
+    #[serde(default)]
+    pub kv_events_publisher: Option<String>,
+    /// ZMQ endpoint the engine publishes KV events on, if configured.
+    #[serde(default)]
+    pub kv_events_endpoint: Option<String>,
+    /// Topic the KV-event publisher tags events with, if configured.
+    #[serde(default)]
+    pub kv_events_topic: Option<String>,
+    /// Main-attention block size used by published KV events.
+    pub kv_event_block_size: u64,
 }
 
 /// Frontend-owned ZMQ addresses that are sent to the engine during startup

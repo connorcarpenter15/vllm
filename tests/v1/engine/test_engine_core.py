@@ -23,7 +23,7 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.engine import EngineCoreRequest
-from vllm.v1.engine.core import EngineCore
+from vllm.v1.engine.core import EngineCore, select_kv_event_block_size
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -42,6 +42,47 @@ PROMPT = "I am Gyoubu Masataka Oniwa"
 PROMPT_TOKENS = TOKENIZER(PROMPT).input_ids
 
 _REQUEST_COUNTER = 0
+
+
+@pytest.mark.parametrize(
+    ("metadata", "fallback", "expected"),
+    [
+        (
+            [
+                {"group_idx": 0, "kind": "sliding_window", "block_size": 4},
+                {"group_idx": 1, "kind": "mla_attention", "block_size": 256},
+            ],
+            4,
+            256,
+        ),
+        (
+            [{"group_idx": 0, "kind": "full_attention", "block_size": 16}],
+            16,
+            16,
+        ),
+        (
+            [
+                {"group_idx": 0, "kind": "mamba", "block_size": 8},
+                {
+                    "group_idx": 1,
+                    "kind": "sink_full_attention",
+                    "block_size": 128,
+                },
+            ],
+            8,
+            128,
+        ),
+        ([{"group_idx": 0, "kind": "mamba", "block_size": 8}], 32, 32),
+        ([], 16, 16),
+        (
+            [{"group_idx": 0, "kind": "full_attention", "block_size": None}],
+            64,
+            64,
+        ),
+    ],
+)
+def test_select_kv_event_block_size(metadata, fallback, expected):
+    assert select_kv_event_block_size(metadata, fallback) == expected
 
 
 def make_request() -> EngineCoreRequest:

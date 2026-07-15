@@ -64,6 +64,11 @@ pub fn default_ready_response() -> EngineCoreReadyResponse {
         max_num_seqs: 256,
         max_num_batched_tokens: 8192,
         instance_id: "test-instance".to_string(),
+        kv_role: None,
+        kv_events_publisher: None,
+        kv_events_endpoint: None,
+        kv_events_topic: None,
+        kv_event_block_size: DEFAULT_MOCK_BLOCK_SIZE,
     }
 }
 

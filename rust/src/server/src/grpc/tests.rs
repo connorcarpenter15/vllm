@@ -1145,14 +1145,12 @@ async fn discovery_and_lifecycle_methods_share_listener() {
         client.list_loras(pb::ListLorasRequest {}).await.unwrap_err().code(),
         tonic::Code::Unimplemented
     );
-    assert_eq!(
-        client
-            .get_kv_event_sources(pb::GetKvEventSourcesRequest {})
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::Unimplemented
-    );
+    let sources = client
+        .get_kv_event_sources(pb::GetKvEventSourcesRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(sources.sources.is_empty());
 
     let drain = client.drain(pb::DrainRequest {}).await.unwrap().into_inner();
     assert_eq!(drain.state, pb::DrainState::Complete as i32);

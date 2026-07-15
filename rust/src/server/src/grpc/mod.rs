@@ -1,6 +1,7 @@
 //! gRPC Generate service backed by the shared [`vllm_text::TextLlm`] facade.
 
 mod convert;
+mod struct_json;
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -93,6 +94,9 @@ impl GenerateServiceImpl {
         if !proto_request.lora_name.is_empty() {
             return Err(Status::unimplemented("LoRA request selection"));
         }
+        let ready = self.state.engine_core_client().ready_response();
+        let role = convert::role_from_kv_role(ready.kv_role.as_deref());
+        convert::validate_disaggregated_request(&proto_request, role)?;
         let media = convert::media_parts_from_request(&proto_request.media)?;
         let mut text_request =
             convert::to_text_request(proto_request, stream, self.state.served_model_names())?;
@@ -111,6 +115,10 @@ impl GenerateServiceImpl {
                 .map_err(|error| Status::internal(error.to_report_string()))?;
             text_request.prompt = Prompt::TokenIds(token_ids);
             text_request.mm_features = mm_features;
+        }
+
+        if role == convert::KvRole::Prefill {
+            convert::mark_prefill_request(&mut text_request);
         }
 
         Ok(text_request)
@@ -397,8 +405,77 @@ impl pb::control_server::Control for ControlServiceImpl {
         &self,
         _request: Request<pb::GetKvEventSourcesRequest>,
     ) -> Result<Response<pb::GetKvEventSourcesResponse>, Status> {
-        Err(Status::unimplemented("GetKvEventSources"))
+        let sources = self
+            .state
+            .engine_core_client()
+            .ready_responses()
+            .into_iter()
+            .filter_map(kv_event_source)
+            .collect();
+        Ok(Response::new(pb::GetKvEventSourcesResponse { sources }))
     }
+}
+
+fn kv_event_source(response: &EngineCoreReadyResponse) -> Option<pb::KvEventSource> {
+    if response.kv_events_publisher.as_deref() != Some("zmq") {
+        return None;
+    }
+    let endpoint = offset_endpoint_port(
+        response.kv_events_endpoint.as_ref()?,
+        response.data_parallel_rank,
+    );
+    Some(pb::KvEventSource {
+        transport: "zmq".to_string(),
+        endpoint_addr: Some(kv_endpoint_from_zmq(&endpoint)?),
+        topic: response.kv_events_topic.clone().unwrap_or_default(),
+        replay_endpoint: String::new(),
+        data_parallel_rank: Some(response.data_parallel_rank),
+        encoding: "msgpack".to_string(),
+        schema_version: 1,
+        buffer_steps: 0,
+        hwm: 0,
+        max_queue_size: 0,
+    })
+}
+
+fn offset_endpoint_port(endpoint: &str, data_parallel_rank: u32) -> String {
+    if data_parallel_rank == 0 || endpoint.is_empty() {
+        return endpoint.to_string();
+    }
+    if endpoint.contains("inproc") {
+        return format!("{endpoint}_dp{data_parallel_rank}");
+    }
+    if endpoint.contains("tcp")
+        && let Some((base_addr, port)) = endpoint.rsplit_once(':')
+        && let Ok(base_port) = port.parse::<u32>()
+    {
+        return format!("{base_addr}:{}", base_port + data_parallel_rank);
+    }
+    endpoint.to_string()
+}
+
+fn kv_endpoint_from_zmq(endpoint: &str) -> Option<pb::KvEventEndpoint> {
+    let rest = endpoint.strip_prefix("tcp://").unwrap_or(endpoint);
+    let (host, port) = rest.rsplit_once(':')?;
+    let port = port.parse().ok()?;
+    let host = match host.trim_matches(|character| character == '[' || character == ']') {
+        "*" | "0.0.0.0" | "::" | "" => advertise_host(),
+        concrete => concrete.to_string(),
+    };
+    Some(pb::KvEventEndpoint {
+        host,
+        port,
+        protocol: "tcp".to_string(),
+    })
+}
+
+fn advertise_host() -> String {
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|socket| {
+            socket.connect("10.255.255.255:1")?;
+            Ok(socket.local_addr()?.ip().to_string())
+        })
+        .unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
 fn text_error_to_status(error: vllm_text::Error) -> Status {

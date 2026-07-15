@@ -77,7 +77,11 @@ from vllm.v1.engine.utils import (
     get_physical_gpu_ids_for_local_dp_rank,
 )
 from vllm.v1.executor import Executor
-from vllm.v1.kv_cache_interface import KVCacheConfig, get_kv_cache_spec_kind
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheSpecKind,
+    get_kv_cache_spec_kind,
+)
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -91,6 +95,26 @@ logger = init_logger(__name__)
 HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
+
+_MAIN_ATTENTION_KV_CACHE_KINDS = frozenset(
+    (
+        KVCacheSpecKind.FULL_ATTENTION.value,
+        KVCacheSpecKind.MLA_ATTENTION.value,
+        KVCacheSpecKind.SINK_FULL_ATTENTION.value,
+    )
+)
+
+
+def select_kv_event_block_size(
+    group_metadata: list[dict[str, int | str | None]],
+    fallback_block_size: int,
+) -> int:
+    """Select the main-attention block size used by published KV events."""
+    for group in group_metadata:
+        if group.get("kind") in _MAIN_ATTENTION_KV_CACHE_KINDS:
+            block_size = group.get("block_size")
+            return int(block_size) if block_size else fallback_block_size
+    return fallback_block_size
 
 
 class EngineCore:
@@ -368,6 +392,13 @@ class EngineCore:
                 }
             )
         return metadata
+
+    def _kv_event_block_size(self) -> int:
+        """Return event granularity without changing native cache block size."""
+        return select_kv_event_block_size(
+            self.get_kv_cache_group_metadata(),
+            self.vllm_config.cache_config.block_size or 0,
+        )
 
     def add_request(self, request: Request, request_wave: int = 0):
         """Add request to the scheduler.
@@ -1536,6 +1567,8 @@ class EngineCoreProc(EngineCore):
             poller = zmq.Poller()
             parallel_config = self.vllm_config.parallel_config
             scheduler_config = self.vllm_config.scheduler_config
+            kv_transfer_config = self.vllm_config.kv_transfer_config
+            kv_events_config = self.vllm_config.kv_events_config
             ready_response = EngineCoreReadyResponse(
                 max_model_len=self.vllm_config.model_config.max_model_len,
                 num_gpu_blocks=self.vllm_config.cache_config.num_gpu_blocks or 0,
@@ -1560,6 +1593,15 @@ class EngineCoreProc(EngineCore):
                 max_num_seqs=scheduler_config.max_num_seqs,
                 max_num_batched_tokens=scheduler_config.max_num_batched_tokens,
                 instance_id=self.vllm_config.instance_id,
+                kv_role=(kv_transfer_config.kv_role if kv_transfer_config else None),
+                kv_events_publisher=(
+                    kv_events_config.publisher if kv_events_config else None
+                ),
+                kv_events_endpoint=(
+                    kv_events_config.endpoint if kv_events_config else None
+                ),
+                kv_events_topic=(kv_events_config.topic if kv_events_config else None),
+                kv_event_block_size=self._kv_event_block_size(),
             )
             ready_payload = msgspec.msgpack.encode(ready_response)
             for input_socket in input_sockets:

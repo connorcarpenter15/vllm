@@ -264,6 +264,7 @@ def test_apply_ready_response_syncs_block_size():
             max_num_seqs=256,
             max_num_batched_tokens=8192,
             instance_id="test-instance",
+            kv_event_block_size=256,
         )
     )
     client._apply_ready_response(payload)

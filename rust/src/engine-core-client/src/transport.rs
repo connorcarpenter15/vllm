@@ -563,7 +563,12 @@ fn validate_ready_responses(engines: &[ConnectedEngine]) -> Result<()> {
             && response.pipeline_parallel_size == expected.pipeline_parallel_size
             && response.decode_context_parallel_size == expected.decode_context_parallel_size
             && response.max_num_seqs == expected.max_num_seqs
-            && response.max_num_batched_tokens == expected.max_num_batched_tokens;
+            && response.max_num_batched_tokens == expected.max_num_batched_tokens
+            && response.kv_role == expected.kv_role
+            && response.kv_events_publisher == expected.kv_events_publisher
+            && response.kv_events_endpoint == expected.kv_events_endpoint
+            && response.kv_events_topic == expected.kv_events_topic
+            && response.kv_event_block_size == expected.kv_event_block_size;
         if !uniform {
             bail_unexpected_handshake_message!(
                 "engine {:?} reported topology or capabilities inconsistent with engine {:?}",
