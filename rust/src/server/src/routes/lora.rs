@@ -130,6 +130,9 @@ pub async fn load_lora_adapter(
         )
         .await
         .map_err(|error| match error {
+            LoadLoraError::Inconsistent => ApiError::server_error(
+                "LoRA state differs across engine ranks; restart the engine".to_string(),
+            ),
             LoadLoraError::AlreadyLoaded { lora_name } => ApiError::invalid_request(
                 format!(
                     "The lora adapter '{lora_name}' has already been loaded. If you want to load the adapter in place, set 'load_inplace' to true."
@@ -170,6 +173,9 @@ pub async fn unload_lora_adapter(
         .unload_lora(&request.lora_name, request.lora_int_id)
         .await
         .map_err(|error| match error {
+            UnloadLoraError::Inconsistent => ApiError::server_error(
+                "LoRA state differs across engine ranks; restart the engine".to_string(),
+            ),
             UnloadLoraError::NotFound { lora_name } => ApiError::model_not_found(lora_name),
             UnloadLoraError::IntIdMismatch {
                 lora_name,
@@ -185,12 +191,6 @@ pub async fn unload_lora_adapter(
                 "failed to unload LoRA adapter '{}': {}",
                 request.lora_name,
                 error.to_report_string()
-            )),
-            UnloadLoraError::NotRemoved {
-                lora_name,
-                lora_int_id,
-            } => ApiError::server_error(format!(
-                "failed to unload LoRA adapter '{lora_name}' with id {lora_int_id}"
             )),
         })?;
 

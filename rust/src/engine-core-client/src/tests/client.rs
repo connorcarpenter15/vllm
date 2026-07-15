@@ -16,7 +16,7 @@ use zeromq::prelude::{Socket, SocketRecv, SocketSend};
 use zeromq::util::PeerIdentity;
 use zeromq::{DealerSocket, PushSocket, SocketOptions, SubSocket, XPubSocket, ZmqMessage};
 
-use crate::protocol::handshake::{HandshakeInitMessage, ReadyMessage};
+use crate::protocol::handshake::{EngineCoreReadyResponse, HandshakeInitMessage, ReadyMessage};
 use crate::protocol::logprobs::MaybeWireLogprobs;
 use crate::protocol::multimodal::{
     MmFeatureSpec, MmField, MmFieldElem, MmFlatField, MmKwargValue, MmSlice, PlaceholderRange,
@@ -33,7 +33,7 @@ use crate::protocol::tensor::WireTensor;
 use crate::protocol::utility::{UtilityOutput, UtilityResultEnvelope};
 use crate::test_utils::{
     IpcNamespace, setup_bootstrapped_mock_engine, setup_mock_engine_sockets,
-    setup_mock_engine_with_init, spawn_mock_engine_task,
+    setup_mock_engine_with_init, spawn_mock_engine_task, spawn_mock_engine_task_with_ready,
 };
 use crate::{
     CoordinatorMode, ENGINE_CORE_DEAD_SENTINEL, EngineCoreClient, EngineCoreClientConfig, EngineId,
@@ -41,6 +41,8 @@ use crate::{
 };
 
 static TRACING: Once = Once::new();
+
+mod utility;
 
 fn expect_sample_logprobs(actual: &MaybeWireLogprobs) {
     expect_test::expect![[r#"
@@ -159,6 +161,18 @@ fn sample_request_with_id(request_id: &str) -> EngineCoreRequest {
             ..EngineCoreSamplingParams::for_test()
         }),
         arrival_time: 42.5,
+        lora_request: Some(crate::protocol::lora::LoraRequest {
+            lora_name: "adapter-a".to_string(),
+            lora_int_id: 17,
+            lora_path: "/models/adapter-a".to_string(),
+            base_model_name: Some("Qwen/Qwen3-0.6B".to_string()),
+            tensorizer_config_dict: Some(rmpv::Value::Map(vec![(
+                rmpv::Value::from("format"),
+                rmpv::Value::from("safetensors"),
+            )])),
+            load_inplace: true,
+            is_3d_lora_weight: true,
+        }),
         ..EngineCoreRequest::default()
     }
 }
@@ -313,6 +327,14 @@ fn bootstrapped_test_config(
         coordinator_mode,
         model_name: "test-model".to_string(),
         client_index,
+    }
+}
+
+fn two_rank_ready(rank: u32) -> EngineCoreReadyResponse {
+    EngineCoreReadyResponse {
+        data_parallel_size: 2,
+        data_parallel_rank: rank,
+        ..crate::mock_engine::default_ready_response()
     }
 }
 

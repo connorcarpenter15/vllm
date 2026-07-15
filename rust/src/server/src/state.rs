@@ -158,6 +158,11 @@ impl AppState {
         self.lora_manager.served_lora_requests().await
     }
 
+    /// Whether the dynamic LoRA registry is known to match every engine rank.
+    pub(crate) fn lora_state_is_consistent(&self) -> bool {
+        self.lora_manager.is_consistent()
+    }
+
     /// Resolve the requested model against one dynamic LoRA registry snapshot.
     pub async fn resolve_model_with_loras(&self, model_name: Option<&str>) -> LoraModelResolution {
         self.lora_manager.resolve_model(&self.served_model_names, model_name).await

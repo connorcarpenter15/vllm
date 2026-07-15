@@ -28,7 +28,12 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ListModelsR
     });
 
     let primary = state.primary_model_name().to_string();
-    let lora_cards = state.served_lora_requests().await.into_iter().map(|lora| ModelObject {
+    let loras = if state.lora_state_is_consistent() {
+        state.served_lora_requests().await
+    } else {
+        Vec::new()
+    };
+    let lora_cards = loras.into_iter().map(|lora| ModelObject {
         id: lora.lora_name,
         object: "model".to_string(),
         created,

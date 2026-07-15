@@ -3,6 +3,8 @@
 // response body is fully drained, which closes the mock engine connection too
 // early and causes flaky `closed unexpectedly` failures.
 
+mod lora_concurrency;
+
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
@@ -1893,6 +1895,222 @@ async fn load_lora_adapter_rejects_engine_false_result() {
     let body = to_bytes(models.into_body(), usize::MAX).await.expect("read body");
     let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
     assert_eq!(json["data"].as_array().expect("model data").len(), 1);
+
+    drop(app);
+    engine_task.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn load_lora_adapter_replaces_in_place_with_existing_id() {
+    let (mut app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            for (expected_path, expected_inplace) in
+                [("org/adapter-a", false), ("org/adapter-b", true)]
+            {
+                let utility = recv_engine_message(dealer).await;
+                let payload = decode_value(&utility[1]).expect("decode utility payload");
+                let array = payload.as_array().expect("utility payload array");
+                assert_eq!(array[2], Value::from("add_lora"));
+                let lora = array[3].as_array().unwrap()[0].as_array().unwrap();
+                assert_eq!(lora[0], Value::from("adapter-a"));
+                assert_eq!(lora[1], Value::from(1));
+                assert_eq!(lora[2], Value::from(expected_path));
+                assert_eq!(lora[5], Value::from(expected_inplace));
+                send_outputs(
+                    push,
+                    utility_outputs(
+                        array[1].as_u64().expect("call id"),
+                        utility_result_value(true),
+                    ),
+                )
+                .await;
+            }
+        })
+    })
+    .await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/load_lora_adapter")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "lora_name": "adapter-a",
+                        "lora_path": "org/adapter-a"
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/load_lora_adapter")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "lora_name": "adapter-a",
+                        "lora_path": "org/adapter-b",
+                        "load_inplace": true
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    drop(app);
+    engine_task.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn failed_in_place_replacement_restores_previous_adapter() {
+    let (mut app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            for (expected_path, expected_inplace, result) in [
+                ("org/adapter-a", false, true),
+                ("org/adapter-b", true, false),
+                ("org/adapter-a", true, true),
+            ] {
+                let utility = recv_engine_message(dealer).await;
+                let payload = decode_value(&utility[1]).expect("decode utility payload");
+                let array = payload.as_array().expect("utility payload array");
+                assert_eq!(array[2], Value::from("add_lora"));
+                let lora = array[3].as_array().unwrap()[0].as_array().unwrap();
+                assert_eq!(lora[0], Value::from("adapter-a"));
+                assert_eq!(lora[1], Value::from(1));
+                assert_eq!(lora[2], Value::from(expected_path));
+                assert_eq!(lora[5], Value::from(expected_inplace));
+                send_outputs(
+                    push,
+                    utility_outputs(
+                        array[1].as_u64().expect("call id"),
+                        utility_result_value(result),
+                    ),
+                )
+                .await;
+            }
+        })
+    })
+    .await;
+
+    for (path, load_inplace, expected_status) in [
+        ("org/adapter-a", false, StatusCode::OK),
+        ("org/adapter-b", true, StatusCode::INTERNAL_SERVER_ERROR),
+    ] {
+        let response = app
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/load_lora_adapter")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "lora_name": "adapter-a",
+                            "lora_path": path,
+                            "load_inplace": load_inplace
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("call app");
+        assert_eq!(response.status(), expected_status);
+    }
+
+    let models = app
+        .call(Request::builder().uri("/v1/models").body(Body::empty()).expect("build request"))
+        .await
+        .expect("call app");
+    let body = to_bytes(models.into_body(), usize::MAX).await.expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
+    assert_eq!(json["data"][1]["root"], "org/adapter-a");
+
+    drop(app);
+    engine_task.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn list_models_omits_loras_after_indeterminate_compensation() {
+    let (mut app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            for (expected_path, result) in [("org/adapter-a", true), ("org/adapter-b", false)] {
+                let utility = recv_engine_message(dealer).await;
+                let payload = decode_value(&utility[1]).expect("decode utility payload");
+                let array = payload.as_array().expect("utility payload array");
+                let lora = array[3].as_array().unwrap()[0].as_array().unwrap();
+                assert_eq!(lora[2], Value::from(expected_path));
+                send_outputs(
+                    push,
+                    utility_outputs(
+                        array[1].as_u64().expect("call id"),
+                        utility_result_value(result),
+                    ),
+                )
+                .await;
+            }
+
+            let restore = recv_engine_message(dealer).await;
+            let payload = decode_value(&restore[1]).expect("decode restore payload");
+            let lora = payload.as_array().unwrap()[3].as_array().unwrap()[0].as_array().unwrap();
+            assert_eq!(lora[2], Value::from("org/adapter-a"));
+            // End without acknowledging restoration, leaving engine state
+            // indeterminate and forcing the registry to fail closed.
+        })
+    })
+    .await;
+
+    for (path, load_inplace, expected_status) in [
+        ("org/adapter-a", false, StatusCode::OK),
+        ("org/adapter-b", true, StatusCode::INTERNAL_SERVER_ERROR),
+    ] {
+        let response = app
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/load_lora_adapter")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "lora_name": "adapter-a",
+                            "lora_path": path,
+                            "load_inplace": load_inplace
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("call app");
+        assert_eq!(response.status(), expected_status);
+    }
+
+    let models = app
+        .call(Request::builder().uri("/v1/models").body(Body::empty()).expect("build request"))
+        .await
+        .expect("call app");
+    let body = to_bytes(models.into_body(), usize::MAX).await.expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
+    let model_ids: Vec<&str> = json["data"]
+        .as_array()
+        .expect("model data")
+        .iter()
+        .map(|model| model["id"].as_str().expect("model id"))
+        .collect();
+    assert_eq!(model_ids, ["Qwen/Qwen1.5-0.5B-Chat"]);
 
     drop(app);
     engine_task.finish().await;
