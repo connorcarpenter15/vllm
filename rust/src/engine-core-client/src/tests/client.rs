@@ -2614,6 +2614,12 @@ fn python_msgpack_fixtures_match_rust_encoding() {
         rust_ready_keys, python_ready_keys,
         "EngineCoreReadyResponse drifted from the Python dataclass",
     );
+    let python_ready: crate::protocol::handshake::EngineCoreReadyResponse =
+        rmp_serde::from_slice(&hex::decode(ready_response_hex).unwrap()).unwrap();
+    assert_eq!(python_ready.kv_event_block_size, 256);
+    assert_eq!(python_ready.kv_events_publisher.as_deref(), Some("zmq"));
+    assert!(python_ready.supports_lora);
+    assert_eq!(python_ready.max_loras, 8);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

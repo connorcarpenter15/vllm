@@ -133,6 +133,35 @@ fn serve_args_auto_forward_enable_lora_to_python() {
 }
 
 #[test]
+fn serve_args_forward_lora_capacity_to_python() {
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "Qwen/Qwen3-0.6B",
+        "--enable-lora",
+        "--max-loras",
+        "4",
+        "--max-lora-rank",
+        "64",
+    ])
+    .unwrap();
+
+    let Command::Serve(args) = cli.command else {
+        panic!("expected serve args");
+    };
+    expect![[r#"
+        [
+            "--enable-lora",
+            "--max-loras",
+            "4",
+            "--max-lora-rank",
+            "64",
+        ]
+    "#]]
+    .assert_debug_eq(&args.managed_engine.python_args);
+}
+
+#[test]
 fn serve_args_forward_shutdown_timeout_to_managed_engine() {
     let cli = Cli::try_parse_from([
         "vllm-rs",

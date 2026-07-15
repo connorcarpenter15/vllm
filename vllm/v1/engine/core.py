@@ -1602,6 +1602,12 @@ class EngineCoreProc(EngineCore):
                 ),
                 kv_events_topic=(kv_events_config.topic if kv_events_config else None),
                 kv_event_block_size=self._kv_event_block_size(),
+                supports_lora=self.vllm_config.lora_config is not None,
+                max_loras=(
+                    self.vllm_config.lora_config.max_loras
+                    if self.vllm_config.lora_config is not None
+                    else 0
+                ),
             )
             ready_payload = msgspec.msgpack.encode(ready_response)
             for input_socket in input_sockets:

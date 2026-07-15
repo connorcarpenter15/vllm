@@ -81,6 +81,10 @@ pub struct EngineCoreReadyResponse {
     pub kv_events_topic: Option<String>,
     /// Main-attention block size used by published KV events.
     pub kv_event_block_size: u64,
+    /// Whether the engine was started with LoRA support enabled.
+    pub supports_lora: bool,
+    /// Maximum number of LoRA adapters the engine may keep active.
+    pub max_loras: u32,
 }
 
 /// Frontend-owned ZMQ addresses that are sent to the engine during startup

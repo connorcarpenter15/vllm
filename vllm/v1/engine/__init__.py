@@ -88,6 +88,8 @@ class EngineCoreReadyResponse:
     max_num_batched_tokens: int
     instance_id: str
     kv_event_block_size: int
+    supports_lora: bool
+    max_loras: int
     # KV cache capacity (None for encoder-only/attention-free models).
     kv_cache_size_tokens: int | None = None
     kv_cache_max_concurrency: float | None = None

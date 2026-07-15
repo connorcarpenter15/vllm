@@ -553,6 +553,14 @@ fn validate_ready_responses(engines: &[ConnectedEngine]) -> Result<()> {
                 response.data_parallel_rank
             );
         }
+        if response.supports_lora != (response.max_loras > 0) {
+            bail_unexpected_handshake_message!(
+                "engine {:?} reported inconsistent LoRA capability (supports_lora={}, max_loras={})",
+                engine.engine_id,
+                response.supports_lora,
+                response.max_loras
+            );
+        }
 
         let uniform = response.block_size == expected.block_size
             && response.dtype == expected.dtype
@@ -568,7 +576,9 @@ fn validate_ready_responses(engines: &[ConnectedEngine]) -> Result<()> {
             && response.kv_events_publisher == expected.kv_events_publisher
             && response.kv_events_endpoint == expected.kv_events_endpoint
             && response.kv_events_topic == expected.kv_events_topic
-            && response.kv_event_block_size == expected.kv_event_block_size;
+            && response.kv_event_block_size == expected.kv_event_block_size
+            && response.supports_lora == expected.supports_lora
+            && response.max_loras == expected.max_loras;
         if !uniform {
             bail_unexpected_handshake_message!(
                 "engine {:?} reported topology or capabilities inconsistent with engine {:?}",
@@ -717,6 +727,18 @@ mod tests {
                 ready_response: second,
             },
         ];
+        assert!(validate_ready_responses(&engines).is_err());
+    }
+
+    #[test]
+    fn ready_validation_rejects_inconsistent_lora_capacity() {
+        let mut ready_response = default_ready_response();
+        ready_response.supports_lora = true;
+        ready_response.max_loras = 0;
+        let engines = [ConnectedEngine {
+            engine_id: EngineId::from_engine_index(0),
+            ready_response,
+        }];
         assert!(validate_ready_responses(&engines).is_err());
     }
 }

@@ -93,6 +93,15 @@ pub(crate) enum UnloadLoraError {
     Engine(vllm_engine_core_client::Error),
 }
 
+#[derive(Debug)]
+pub(crate) enum LoadExactLoraError {
+    Inconsistent,
+    BaseModelName { lora_name: String },
+    Conflict { existing: LoraRequest },
+    Engine(vllm_engine_core_client::Error),
+    NotLoaded { lora_name: String },
+}
+
 enum ApplyLoadError {
     Engine(EngineCoreError),
     Rejected,
@@ -230,6 +239,62 @@ impl LoraManager {
         Ok(lora_request)
     }
 
+    /// Load an adapter with a caller-supplied ID.
+    pub async fn load_lora_exact(
+        &self,
+        engine_core_client: &EngineCoreClient,
+        base_model_names: &[String],
+        lora_request: LoraRequest,
+    ) -> Result<(LoraRequest, bool), LoadExactLoraError> {
+        let _guard = self.update_lock.lock().await;
+        if !self.is_consistent() {
+            return Err(LoadExactLoraError::Inconsistent);
+        }
+        if base_model_names.iter().any(|name| name == &lora_request.lora_name) {
+            return Err(LoadExactLoraError::BaseModelName {
+                lora_name: lora_request.lora_name,
+            });
+        }
+
+        let registry = self.registry.read().await;
+        if let Some(existing) = registry.values().find(|loaded| {
+            let existing = &loaded.request;
+            existing.lora_name == lora_request.lora_name
+                || existing.lora_int_id == lora_request.lora_int_id
+                || existing.lora_path == lora_request.lora_path
+        }) {
+            let existing = &existing.request;
+            if same_wire_identity(existing, &lora_request) {
+                return Ok((existing.clone(), true));
+            }
+            return Err(LoadExactLoraError::Conflict {
+                existing: existing.clone(),
+            });
+        }
+        drop(registry);
+
+        let mut mutation =
+            self.apply_load(engine_core_client, &lora_request, None)
+                .await
+                .map_err(|error| match error {
+                    ApplyLoadError::Engine(error) => LoadExactLoraError::Engine(error),
+                    ApplyLoadError::Rejected => LoadExactLoraError::NotLoaded {
+                        lora_name: lora_request.lora_name.clone(),
+                    },
+                })?;
+
+        self.id_counter.fetch_max(lora_request.lora_int_id, Ordering::Relaxed);
+        self.registry.write().await.insert(
+            lora_request.lora_name.clone(),
+            LoadedLora {
+                request: lora_request.clone(),
+                lease: std::sync::Arc::new(RwLock::new(())),
+            },
+        );
+        mutation.prove_final_state();
+        Ok((lora_request, false))
+    }
+
     /// Apply one load or replacement across every engine rank. The returned
     /// guard remains uncommitted until the caller updates the frontend
     /// registry, so cancellation between engine success and registry commit
@@ -351,6 +416,12 @@ impl LoraManager {
         mutation.prove_final_state();
         Ok(removed)
     }
+}
+
+fn same_wire_identity(left: &LoraRequest, right: &LoraRequest) -> bool {
+    left.lora_name == right.lora_name
+        && left.lora_int_id == right.lora_int_id
+        && left.lora_path == right.lora_path
 }
 
 fn same_lease(
@@ -489,6 +560,27 @@ mod tests {
     use vllm_engine_core_client::{EngineCoreClientConfig, TransportMode};
     use zeromq::ZmqMessage;
     use zeromq::prelude::{SocketRecv as _, SocketSend as _};
+
+    #[test]
+    fn wire_identity_ignores_internal_load_options() {
+        let public = LoraRequest::new(
+            "adapter-a".to_string(),
+            17,
+            "/adapters/a".to_string(),
+            false,
+            false,
+        );
+        let mut internal = public.clone();
+        internal.load_inplace = true;
+        internal.is_3d_lora_weight = true;
+        internal.base_model_name = Some("base".to_string());
+        internal.tensorizer_config_dict = Some(rmpv::Value::Map(vec![(
+            rmpv::Value::from("format"),
+            rmpv::Value::from("safetensors"),
+        )]));
+
+        assert!(same_wire_identity(&public, &internal));
+    }
 
     async fn reply_utility(push: &mut zeromq::PushSocket, call_id: u64, result: bool) {
         let output: EngineCoreOutputs = UtilityCallOutput {

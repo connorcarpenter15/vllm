@@ -393,6 +393,8 @@ class EngineCoreReadyResponse:
     max_num_batched_tokens: int
     instance_id: str
     kv_event_block_size: int
+    supports_lora: bool
+    max_loras: int
     kv_cache_size_tokens: int | None = None
     kv_cache_max_concurrency: float | None = None
     kv_role: str | None = None
@@ -422,6 +424,8 @@ ready_response = EngineCoreReadyResponse(
     kv_events_endpoint="tcp://127.0.0.1:5557",
     kv_events_topic="kv",
     kv_event_block_size=256,
+    supports_lora=True,
+    max_loras=8,
 )
 
 print(msgspec.msgpack.encode(request).hex())

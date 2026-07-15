@@ -69,6 +69,8 @@ pub fn default_ready_response() -> EngineCoreReadyResponse {
         kv_events_endpoint: None,
         kv_events_topic: None,
         kv_event_block_size: DEFAULT_MOCK_BLOCK_SIZE,
+        supports_lora: false,
+        max_loras: 0,
     }
 }
 

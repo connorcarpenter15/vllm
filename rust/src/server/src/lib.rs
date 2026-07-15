@@ -58,6 +58,7 @@ const GRPC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(7200);
 /// How long the server waits for a keepalive PING reply before dropping the gRPC
 /// connection. 20s matches the gRPC-core default.
 const GRPC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+const GRPC_LORA_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 async fn set_generate_not_serving(health_reporter: &HealthReporter) {
     health_reporter
@@ -95,6 +96,26 @@ async fn monitor_grpc_health(
     }
 
     set_grpc_not_serving(&health_reporter).await;
+}
+
+async fn monitor_lora_health(
+    state: Arc<AppState>,
+    health_reporter: HealthReporter,
+    shutdown: CancellationToken,
+) {
+    let mut interval = tokio::time::interval(GRPC_LORA_HEALTH_POLL_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = interval.tick() => {
+                if !state.lora_state_is_consistent() {
+                    set_grpc_not_serving(&health_reporter).await;
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// Resolve the public model names accepted by the frontend.
@@ -381,12 +402,16 @@ where
     };
 
     let grpc_health_fut = {
+        let state = state.clone();
         let shutdown = server_shutdown.child_token();
         async move {
             let Some((health_reporter, engine_health)) = grpc_health_setup else {
                 return;
             };
-            monitor_grpc_health(health_reporter, engine_health, shutdown).await;
+            let lora_health =
+                monitor_lora_health(state, health_reporter.clone(), shutdown.child_token());
+            let engine_health = monitor_grpc_health(health_reporter, engine_health, shutdown);
+            tokio::join!(engine_health, lora_health);
         }
     };
 

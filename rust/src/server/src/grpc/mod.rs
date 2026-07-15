@@ -1,6 +1,7 @@
 //! gRPC Generate service backed by the shared [`vllm_text::TextLlm`] facade.
 
 mod convert;
+mod lora_rpc;
 mod struct_json;
 
 use std::pin::Pin;
@@ -90,16 +91,34 @@ impl GenerateServiceImpl {
         &self,
         proto_request: pb::GenerateRequest,
         stream: bool,
-    ) -> Result<TextRequest, Status> {
-        if !proto_request.lora_name.is_empty() {
-            return Err(Status::unimplemented("LoRA request selection"));
-        }
+    ) -> Result<(TextRequest, crate::lora::LoraLease), Status> {
         let ready = self.state.engine_core_client().ready_response();
         let role = convert::role_from_kv_role(ready.kv_role.as_deref());
         convert::validate_disaggregated_request(&proto_request, role)?;
+        let supports_lora = ready.supports_lora;
         let media = convert::media_parts_from_request(&proto_request.media)?;
+        let lora_name = proto_request.lora_name.clone();
         let mut text_request =
             convert::to_text_request(proto_request, stream, self.state.served_model_names())?;
+
+        let mut lora_lease = None;
+        if !lora_name.is_empty() {
+            if !supports_lora {
+                return Err(Status::failed_precondition(
+                    "engine was not started with LoRA enabled",
+                ));
+            }
+            let mut resolution = self.state.resolve_model_with_loras(Some(&lora_name)).await;
+            lora_lease = resolution.lease.take();
+            if !self.state.lora_state_is_consistent() {
+                return Err(Status::failed_precondition(
+                    "LoRA state differs across engine ranks; restart the engine",
+                ));
+            }
+            text_request.lora_request = Some(resolution.lora_request.ok_or_else(|| {
+                Status::not_found(format!("LoRA adapter `{lora_name}` is not loaded"))
+            })?);
+        }
 
         if !media.is_empty() {
             let Prompt::TokenIds(mut token_ids) = text_request.prompt else {
@@ -121,7 +140,7 @@ impl GenerateServiceImpl {
             convert::mark_prefill_request(&mut text_request);
         }
 
-        Ok(text_request)
+        Ok((text_request, lora_lease))
     }
 }
 
@@ -173,6 +192,18 @@ impl ControlServiceImpl {
     fn in_flight(&self) -> u64 {
         self.admission.in_flight.load(Ordering::SeqCst)
     }
+
+    fn try_admit(&self) -> Option<AdmissionGuard> {
+        if self.admission.draining.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.admission.in_flight.fetch_add(1, Ordering::SeqCst);
+        if self.admission.draining.load(Ordering::SeqCst) {
+            self.admission.in_flight.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(AdmissionGuard(self.admission.clone()))
+    }
 }
 
 #[tonic::async_trait]
@@ -190,13 +221,14 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
             .ok_or_else(|| Status::unavailable("gRPC service is draining"))?;
         let proto_req = request.into_inner();
         let response_opts = ResponseOpts::from_proto(proto_req.response.as_ref());
-        let text_request = self.prepare_request(proto_req, false).await?;
+        let (text_request, lora_lease) = self.prepare_request(proto_req, false).await?;
 
         let request_id = text_request.request_id.clone();
         info!(%request_id, "grpc generate (unary)");
 
         let stream = self.state.chat.text().generate(text_request).await;
         let stream = stream.map_err(text_error_to_status)?;
+        let stream = crate::lora::hold_lora_lease(stream, lora_lease);
 
         let collected = stream.collect_output().await.map_err(text_error_to_status)?;
 
@@ -237,13 +269,14 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
             .ok_or_else(|| Status::unavailable("gRPC service is draining"))?;
         let proto_req = request.into_inner();
         let response_opts = ResponseOpts::from_proto(proto_req.response.as_ref());
-        let text_request = self.prepare_request(proto_req, true).await?;
+        let (text_request, lora_lease) = self.prepare_request(proto_req, true).await?;
 
         let request_id = text_request.request_id.clone();
         info!(%request_id, "grpc generate (stream)");
 
         let stream = self.state.chat.text().generate(text_request).await;
         let stream = stream.map_err(text_error_to_status)?;
+        let stream = crate::lora::hold_lora_lease(stream, lora_lease);
 
         let (tx, rx) = mpsc::channel(32);
 
@@ -313,7 +346,7 @@ impl pb::control_server::Control for ControlServiceImpl {
             total_kv_blocks: self.per_rank_kv_blocks(),
             max_running_requests: ready.max_num_seqs,
             max_batched_tokens: ready.max_num_batched_tokens,
-            max_loras: 0,
+            max_loras: ready.max_loras,
         }))
     }
 
@@ -321,6 +354,7 @@ impl pb::control_server::Control for ControlServiceImpl {
         &self,
         _request: Request<pb::GetModelInfoRequest>,
     ) -> Result<Response<pb::ModelInfo>, Status> {
+        let ready = self.ready();
         let served = self.state.served_model_names();
         Ok(Response::new(pb::ModelInfo {
             model_id: self.state.chat.text().model_id().to_string(),
@@ -329,7 +363,7 @@ impl pb::control_server::Control for ControlServiceImpl {
             tokenizer_modes: Vec::new(),
             supports_text_input: true,
             supports_token_ids_input: true,
-            supports_lora: false,
+            supports_lora: ready.supports_lora,
             supports_multimodal: self.state.chat.supports_multimodal(),
             reasoning_parser: self
                 .state
@@ -382,23 +416,29 @@ impl pb::control_server::Control for ControlServiceImpl {
 
     async fn load_lora(
         &self,
-        _request: Request<pb::LoadLoraRequest>,
+        request: Request<pb::LoadLoraRequest>,
     ) -> Result<Response<pb::LoadLoraResponse>, Status> {
-        Err(Status::unimplemented("LoadLora"))
+        let _guard = self
+            .try_admit()
+            .ok_or_else(|| Status::unavailable("gRPC service is draining"))?;
+        lora_rpc::load_lora(&self.state, request).await
     }
 
     async fn unload_lora(
         &self,
-        _request: Request<pb::UnloadLoraRequest>,
+        request: Request<pb::UnloadLoraRequest>,
     ) -> Result<Response<pb::UnloadLoraResponse>, Status> {
-        Err(Status::unimplemented("UnloadLora"))
+        let _guard = self
+            .try_admit()
+            .ok_or_else(|| Status::unavailable("gRPC service is draining"))?;
+        lora_rpc::unload_lora(&self.state, request).await
     }
 
     async fn list_loras(
         &self,
-        _request: Request<pb::ListLorasRequest>,
+        request: Request<pb::ListLorasRequest>,
     ) -> Result<Response<pb::ListLorasResponse>, Status> {
-        Err(Status::unimplemented("ListLoras"))
+        lora_rpc::list_loras(&self.state, request).await
     }
 
     async fn get_kv_event_sources(

@@ -1135,15 +1135,15 @@ async fn discovery_and_lifecycle_methods_share_listener() {
 
     assert_eq!(
         client.load_lora(pb::LoadLoraRequest::default()).await.unwrap_err().code(),
-        tonic::Code::Unimplemented
+        tonic::Code::FailedPrecondition
     );
     assert_eq!(
         client.unload_lora(pb::UnloadLoraRequest::default()).await.unwrap_err().code(),
-        tonic::Code::Unimplemented
+        tonic::Code::FailedPrecondition
     );
     assert_eq!(
         client.list_loras(pb::ListLorasRequest {}).await.unwrap_err().code(),
-        tonic::Code::Unimplemented
+        tonic::Code::FailedPrecondition
     );
     let sources = client
         .get_kv_event_sources(pb::GetKvEventSourcesRequest {})
