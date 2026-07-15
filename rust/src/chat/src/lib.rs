@@ -18,6 +18,7 @@ pub use event::{
     AssistantToolCall, ChatEvent,
 };
 use futures::{StreamExt, TryStreamExt as _};
+pub use llm_multimodal::MediaContentPart;
 pub use output::{
     ChatOutputProcessor, DefaultChatOutputProcessor, DynChatOutputProcessor,
     HarmonyChatOutputProcessor,
@@ -37,6 +38,7 @@ pub use request::{
     ChatToolChoice, GenerationPromptMode, ReasoningEffort, SamplingParams,
 };
 pub use stream::{ChatEventStream, ChatEventStreamTrait, CollectedAssistantMessage};
+pub use vllm_engine_core_client::protocol::multimodal::MmFeatures;
 pub use vllm_llm::FinishReason;
 
 mod backend;
@@ -193,6 +195,23 @@ impl ChatLlm {
             ParserSelection::None => None,
             ParserSelection::Explicit(name) => Some(name),
         }
+    }
+
+    /// Prepare media for an already-tokenized request.
+    pub async fn prepare_media(
+        &self,
+        media: Vec<MediaContentPart>,
+        token_ids: &mut Vec<u32>,
+    ) -> Result<Option<MmFeatures>> {
+        if media.is_empty() {
+            return Ok(None);
+        }
+        let info = self
+            .backend
+            .multimodal_model_info()
+            .ok_or(Error::UnsupportedMultimodalRenderer)?;
+        let features = info.prepare_multimodal(media, token_ids, self.model_dtype).await?;
+        Ok(Some(features))
     }
 
     /// Render, tokenize, and submit one chat request.

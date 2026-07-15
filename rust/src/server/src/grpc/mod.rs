@@ -14,7 +14,7 @@ use tonic::{Request, Response, Status};
 use tonic_health::server::HealthReporter;
 use tracing::info;
 use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
-use vllm_text::{DecodedTextEvent, TextOutputStreamExt as _};
+use vllm_text::{DecodedTextEvent, Prompt, TextOutputStreamExt as _, TextRequest};
 
 use self::convert::ResponseOpts;
 use crate::state::AppState;
@@ -84,6 +84,37 @@ impl GenerateServiceImpl {
         }
         Some(AdmissionGuard(self.admission.clone()))
     }
+
+    async fn prepare_request(
+        &self,
+        proto_request: pb::GenerateRequest,
+        stream: bool,
+    ) -> Result<TextRequest, Status> {
+        if !proto_request.lora_name.is_empty() {
+            return Err(Status::unimplemented("LoRA request selection"));
+        }
+        let media = convert::media_parts_from_request(&proto_request.media)?;
+        let mut text_request =
+            convert::to_text_request(proto_request, stream, self.state.served_model_names())?;
+
+        if !media.is_empty() {
+            let Prompt::TokenIds(mut token_ids) = text_request.prompt else {
+                return Err(Status::invalid_argument(
+                    "multimodal gRPC requests must provide token_ids input",
+                ));
+            };
+            let mm_features = self
+                .state
+                .chat
+                .prepare_media(media, &mut token_ids)
+                .await
+                .map_err(|error| Status::internal(error.to_report_string()))?;
+            text_request.prompt = Prompt::TokenIds(token_ids);
+            text_request.mm_features = mm_features;
+        }
+
+        Ok(text_request)
+    }
 }
 
 const GRPC_API_VERSION: &str = "vllm";
@@ -151,8 +182,7 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
             .ok_or_else(|| Status::unavailable("gRPC service is draining"))?;
         let proto_req = request.into_inner();
         let response_opts = ResponseOpts::from_proto(proto_req.response.as_ref());
-        let text_request =
-            convert::to_text_request(proto_req, false, self.state.served_model_names())?;
+        let text_request = self.prepare_request(proto_req, false).await?;
 
         let request_id = text_request.request_id.clone();
         info!(%request_id, "grpc generate (unary)");
@@ -199,8 +229,7 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
             .ok_or_else(|| Status::unavailable("gRPC service is draining"))?;
         let proto_req = request.into_inner();
         let response_opts = ResponseOpts::from_proto(proto_req.response.as_ref());
-        let text_request =
-            convert::to_text_request(proto_req, true, self.state.served_model_names())?;
+        let text_request = self.prepare_request(proto_req, true).await?;
 
         let request_id = text_request.request_id.clone();
         info!(%request_id, "grpc generate (stream)");
