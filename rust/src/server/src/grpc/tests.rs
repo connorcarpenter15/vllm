@@ -22,6 +22,7 @@ use vllm_chat::{
     ChatBackend, ChatLlm, ChatRenderer, ChatRequest, ChatTextBackend, DefaultChatOutputProcessor,
     DynChatOutputProcessor, DynChatRenderer, NewChatOutputProcessorOptions, RenderedPrompt,
 };
+use vllm_engine_core_client::mock_engine::DEFAULT_MOCK_MAX_MODEL_LEN;
 use vllm_engine_core_client::protocol::output::{
     EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
 };
@@ -204,7 +205,7 @@ async fn setup_grpc_service(
     engine_id: impl Into<EngineId>,
     output_specs: Vec<(Vec<u32>, Option<EngineCoreFinishReason>)>,
 ) -> (
-    GenerateServer<GenerateServiceImpl>,
+    GenerateServiceImpl,
     tokio::sync::watch::Receiver<bool>,
     MockEngineTask,
 ) {
@@ -227,7 +228,7 @@ async fn setup_grpc_service_with_engine<F>(
     engine_id: impl Into<EngineId>,
     run: F,
 ) -> (
-    GenerateServer<GenerateServiceImpl>,
+    GenerateServiceImpl,
     tokio::sync::watch::Receiver<bool>,
     MockEngineTask,
 )
@@ -261,11 +262,7 @@ where
         Arc::new(FakeTextBackend) as Arc<dyn ChatTextBackend>,
     );
     let state = Arc::new(AppState::new(vec!["test-model".to_string()], chat));
-    (
-        GenerateServer::new(GenerateServiceImpl::new(state)),
-        engine_health,
-        engine_task,
-    )
+    (GenerateServiceImpl::new(state), engine_health, engine_task)
 }
 
 /// Spin up a plaintext gRPC server backed by a mock engine. Returns the client,
@@ -285,7 +282,7 @@ async fn grpc_test_server(
 }
 
 async fn start_grpc_test_server(
-    generate_service: GenerateServer<GenerateServiceImpl>,
+    service: GenerateServiceImpl,
     engine_health: tokio::sync::watch::Receiver<bool>,
     engine_task: MockEngineTask,
 ) -> (
@@ -295,10 +292,12 @@ async fn start_grpc_test_server(
     tokio::task::JoinHandle<()>,
     MockEngineTask,
 ) {
-    let control_service = ControlServer::new(ControlServiceImpl::new());
     let (health_reporter, health_service) = health_reporter();
     health_reporter.set_serving::<GenerateServer<GenerateServiceImpl>>().await;
     health_reporter.set_serving::<ControlServer<ControlServiceImpl>>().await;
+    let control_service =
+        ControlServer::new(service.control_service(Some(health_reporter.clone())));
+    let generate_service = GenerateServer::new(service);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind grpc listener");
     let addr = listener.local_addr().expect("local addr");
@@ -346,6 +345,7 @@ async fn grpc_tls_test_server(
     cert_reqs: i32,
 ) -> (String, tokio::task::JoinHandle<()>, MockEngineTask) {
     let (svc, _engine_health, engine_task) = setup_grpc_service(engine_id, output_specs).await;
+    let svc = GenerateServer::new(svc);
     let context = tls::build_grpc_server_config(&server_tls(certs, cert_reqs))
         .expect("build grpc tls config");
 
@@ -437,6 +437,7 @@ async fn grpc_server_with_keepalive(
 ) -> (String, tokio::task::JoinHandle<()>, MockEngineTask) {
     let (svc, _engine_health, engine_task) =
         setup_grpc_service(engine_id, default_stream_output_specs()).await;
+    let svc = GenerateServer::new(svc);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind grpc listener");
     let addr = listener.local_addr().expect("local addr").to_string();
@@ -1104,7 +1105,7 @@ async fn grpc_without_keepalive_keeps_unresponsive_connection_open() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn canonical_health_and_unimplemented_extensions_share_listener() {
+async fn discovery_and_lifecycle_methods_share_listener() {
     let (_generate_client, mut client, mut health_client, server_task, _engine_task) =
         grpc_test_server(b"engine-grpc-stubs", default_stream_output_specs()).await;
 
@@ -1119,22 +1120,19 @@ async fn canonical_health_and_unimplemented_extensions_share_listener() {
         assert_eq!(health.status, HealthServingStatus::Serving as i32);
     }
 
-    assert_eq!(
-        client.get_server_info(pb::GetServerInfoRequest {}).await.unwrap_err().code(),
-        tonic::Code::Unimplemented
-    );
-    assert_eq!(
-        client.get_model_info(pb::GetModelInfoRequest {}).await.unwrap_err().code(),
-        tonic::Code::Unimplemented
-    );
+    let server = client.get_server_info(pb::GetServerInfoRequest {}).await.unwrap().into_inner();
+    assert_eq!(server.api_version, "vllm");
+    assert_eq!(server.max_model_len, DEFAULT_MOCK_MAX_MODEL_LEN as u32);
+    assert_eq!(server.parallelism.unwrap().tensor_parallel_size, 1);
+
+    let model = client.get_model_info(pb::GetModelInfoRequest {}).await.unwrap().into_inner();
+    assert_eq!(model.model_id, "test-model");
+    assert!(model.supports_text_input);
     assert_eq!(
         client.abort(pb::AbortRequest::default()).await.unwrap_err().code(),
-        tonic::Code::Unimplemented
+        tonic::Code::InvalidArgument
     );
-    assert_eq!(
-        client.drain(pb::DrainRequest {}).await.unwrap_err().code(),
-        tonic::Code::Unimplemented
-    );
+
     assert_eq!(
         client.load_lora(pb::LoadLoraRequest::default()).await.unwrap_err().code(),
         tonic::Code::Unimplemented
@@ -1155,6 +1153,27 @@ async fn canonical_health_and_unimplemented_extensions_share_listener() {
             .code(),
         tonic::Code::Unimplemented
     );
+
+    let drain = client.drain(pb::DrainRequest {}).await.unwrap().into_inner();
+    assert_eq!(drain.state, pb::DrainState::Complete as i32);
+    for service in ["vllm.Generate", ""] {
+        let health = health_client
+            .check(HealthCheckRequest {
+                service: service.to_string(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(health.status, HealthServingStatus::NotServing as i32);
+    }
+    let health = health_client
+        .check(HealthCheckRequest {
+            service: "vllm.Control".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(health.status, HealthServingStatus::Serving as i32);
 
     server_task.abort();
 }

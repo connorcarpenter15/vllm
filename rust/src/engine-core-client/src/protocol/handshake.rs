@@ -53,6 +53,20 @@ pub struct EngineCoreReadyResponse {
     pub kv_cache_size_tokens: Option<u64>,
     /// Maximum achievable request concurrency given the KV cache, if reported.
     pub kv_cache_max_concurrency: Option<f64>,
+    /// Tensor-parallel size of this engine.
+    pub tensor_parallel_size: u32,
+    /// Pipeline-parallel size of this engine.
+    pub pipeline_parallel_size: u32,
+    /// Decode-context-parallel size of this engine.
+    pub decode_context_parallel_size: u32,
+    /// This engine's data-parallel rank.
+    pub data_parallel_rank: u32,
+    /// Scheduler cap on concurrently running sequences.
+    pub max_num_seqs: u64,
+    /// Scheduler cap on batched tokens per step.
+    pub max_num_batched_tokens: u64,
+    /// Unique identifier for this server instance.
+    pub instance_id: String,
 }
 
 /// Frontend-owned ZMQ addresses that are sent to the engine during startup

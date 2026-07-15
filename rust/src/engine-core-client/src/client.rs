@@ -391,6 +391,19 @@ impl EngineCoreClient {
         self.engines.iter().map(|engine| &engine.ready_response).collect()
     }
 
+    /// Return the first engine's ready response.
+    ///
+    /// Topology, role, and scheduler limits are validated as uniform during
+    /// startup. Per-engine fields such as `data_parallel_rank` should be read
+    /// through [`ready_responses`](Self::ready_responses).
+    pub fn ready_response(&self) -> &EngineCoreReadyResponse {
+        &self
+            .engines
+            .first()
+            .expect("engine core client requires at least one engine")
+            .ready_response
+    }
+
     /// Return the engine-reported effective model dtype.
     pub fn model_dtype(&self) -> ModelDtype {
         self.engines

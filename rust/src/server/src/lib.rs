@@ -59,6 +59,20 @@ const GRPC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(7200);
 /// connection. 20s matches the gRPC-core default.
 const GRPC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
+async fn set_generate_not_serving(health_reporter: &HealthReporter) {
+    health_reporter
+        .set_not_serving::<grpc::GenerateServer<grpc::GenerateServiceImpl>>()
+        .await;
+    health_reporter.set_service_status("", ServingStatus::NotServing).await;
+}
+
+async fn set_grpc_not_serving(health_reporter: &HealthReporter) {
+    set_generate_not_serving(health_reporter).await;
+    health_reporter
+        .set_not_serving::<grpc::ControlServer<grpc::ControlServiceImpl>>()
+        .await;
+}
+
 async fn wait_until_engine_unhealthy(mut engine_health: watch::Receiver<bool>) {
     loop {
         if !*engine_health.borrow_and_update() {
@@ -80,13 +94,7 @@ async fn monitor_grpc_health(
         _ = shutdown.cancelled() => {}
     }
 
-    health_reporter
-        .set_not_serving::<grpc::GenerateServer<grpc::GenerateServiceImpl>>()
-        .await;
-    health_reporter
-        .set_not_serving::<grpc::ControlServer<grpc::ControlServiceImpl>>()
-        .await;
-    health_reporter.set_service_status("", ServingStatus::NotServing).await;
+    set_grpc_not_serving(&health_reporter).await;
 }
 
 /// Resolve the public model names accepted by the frontend.
@@ -241,9 +249,10 @@ where
         health_reporter
             .set_serving::<grpc::ControlServer<grpc::ControlServiceImpl>>()
             .await;
-        let generate_service =
-            grpc::GenerateServer::new(grpc::GenerateServiceImpl::new(state.clone()));
-        let control_service = grpc::ControlServer::new(grpc::ControlServiceImpl::new());
+        let service = grpc::GenerateServiceImpl::new(state.clone());
+        let control_service =
+            grpc::ControlServer::new(service.control_service(Some(health_reporter.clone())));
+        let generate_service = grpc::GenerateServer::new(service);
         let svc = TonicServer::builder()
             .http2_keepalive_interval(Some(GRPC_KEEPALIVE_INTERVAL))
             .http2_keepalive_timeout(Some(GRPC_KEEPALIVE_TIMEOUT))

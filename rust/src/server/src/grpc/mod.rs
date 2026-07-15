@@ -4,13 +4,16 @@ mod convert;
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use futures::{Stream, StreamExt as _};
 use thiserror_ext::AsReport as _;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+use tonic_health::server::HealthReporter;
 use tracing::info;
+use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
 use vllm_text::{DecodedTextEvent, TextOutputStreamExt as _};
 
 use self::convert::ResponseOpts;
@@ -28,23 +31,108 @@ pub use pb::generate_server::GenerateServer;
 mod tests;
 
 /// gRPC Generate service implementation backed by the shared application state.
+#[derive(Clone)]
 pub struct GenerateServiceImpl {
     state: Arc<AppState>,
+    admission: Arc<AdmissionState>,
 }
 
 impl GenerateServiceImpl {
     pub fn new(state: Arc<AppState>) -> Self {
-        Self { state }
+        Self {
+            state,
+            admission: Arc::new(AdmissionState::default()),
+        }
+    }
+
+    pub fn control_service(&self, health_reporter: Option<HealthReporter>) -> ControlServiceImpl {
+        ControlServiceImpl {
+            state: self.state.clone(),
+            admission: self.admission.clone(),
+            health_reporter,
+        }
     }
 }
 
-/// Unimplemented control-plane service registered on the existing gRPC listener.
 #[derive(Default)]
-pub struct ControlServiceImpl;
+struct AdmissionState {
+    draining: AtomicBool,
+    in_flight: AtomicU64,
+}
+
+struct AdmissionGuard(Arc<AdmissionState>);
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl GenerateServiceImpl {
+    fn is_draining(&self) -> bool {
+        self.admission.draining.load(Ordering::SeqCst)
+    }
+
+    fn try_admit(&self) -> Option<AdmissionGuard> {
+        if self.is_draining() {
+            return None;
+        }
+        self.admission.in_flight.fetch_add(1, Ordering::SeqCst);
+        if self.is_draining() {
+            self.admission.in_flight.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(AdmissionGuard(self.admission.clone()))
+    }
+}
+
+const GRPC_API_VERSION: &str = "vllm";
+
+pub struct ControlServiceImpl {
+    state: Arc<AppState>,
+    admission: Arc<AdmissionState>,
+    health_reporter: Option<HealthReporter>,
+}
 
 impl ControlServiceImpl {
-    pub fn new() -> Self {
-        Self
+    fn ready(&self) -> &EngineCoreReadyResponse {
+        self.state.engine_core_client().ready_response()
+    }
+
+    fn per_rank_kv_blocks(&self) -> u64 {
+        self.state
+            .engine_core_client()
+            .ready_responses()
+            .into_iter()
+            .map(|response| response.num_gpu_blocks)
+            .min()
+            .unwrap_or(0)
+    }
+
+    fn parallelism_info(&self) -> pb::ParallelismInfo {
+        let ready = self.ready();
+        pb::ParallelismInfo {
+            tensor_parallel_size: ready.tensor_parallel_size,
+            pipeline_parallel_size: ready.pipeline_parallel_size,
+            data_parallel_size: ready.data_parallel_size.min(u64::from(u32::MAX)) as u32,
+            data_parallel_rank: ready.data_parallel_rank,
+            data_parallel_start_rank: ready.data_parallel_rank,
+            decode_context_parallel_size: ready.decode_context_parallel_size,
+        }
+    }
+
+    fn begin_drain(&self) {
+        self.admission.draining.store(true, Ordering::SeqCst);
+    }
+
+    async fn report_not_serving(&self) {
+        if let Some(reporter) = &self.health_reporter {
+            crate::set_generate_not_serving(reporter).await;
+        }
+    }
+
+    fn in_flight(&self) -> u64 {
+        self.admission.in_flight.load(Ordering::SeqCst)
     }
 }
 
@@ -58,6 +146,9 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
         &self,
         request: Request<pb::GenerateRequest>,
     ) -> Result<Response<pb::GenerateResponse>, Status> {
+        let _guard = self
+            .try_admit()
+            .ok_or_else(|| Status::unavailable("gRPC service is draining"))?;
         let proto_req = request.into_inner();
         let response_opts = ResponseOpts::from_proto(proto_req.response.as_ref());
         let text_request =
@@ -103,6 +194,9 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
         &self,
         request: Request<pb::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStreamStream>, Status> {
+        let guard = self
+            .try_admit()
+            .ok_or_else(|| Status::unavailable("gRPC service is draining"))?;
         let proto_req = request.into_inner();
         let response_opts = ResponseOpts::from_proto(proto_req.response.as_ref());
         let text_request =
@@ -117,6 +211,7 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
         let (tx, rx) = mpsc::channel(32);
 
         tokio::spawn(async move {
+            let _guard = guard;
             futures::pin_mut!(stream);
             while let Some(event) = stream.next().await {
                 let response = match event {
@@ -170,28 +265,82 @@ impl pb::control_server::Control for ControlServiceImpl {
         &self,
         _request: Request<pb::GetServerInfoRequest>,
     ) -> Result<Response<pb::ServerInfo>, Status> {
-        Err(Status::unimplemented("GetServerInfo"))
+        let ready = self.ready();
+        Ok(Response::new(pb::ServerInfo {
+            engine_version: ready.vllm_version.clone(),
+            api_version: GRPC_API_VERSION.to_string(),
+            instance_id: ready.instance_id.clone(),
+            parallelism: Some(self.parallelism_info()),
+            max_model_len: ready.max_model_len.min(u64::from(u32::MAX)) as u32,
+            kv_block_size: ready.block_size.min(u64::from(u32::MAX)) as u32,
+            total_kv_blocks: self.per_rank_kv_blocks(),
+            max_running_requests: ready.max_num_seqs,
+            max_batched_tokens: ready.max_num_batched_tokens,
+            max_loras: 0,
+        }))
     }
 
     async fn get_model_info(
         &self,
         _request: Request<pb::GetModelInfoRequest>,
     ) -> Result<Response<pb::ModelInfo>, Status> {
-        Err(Status::unimplemented("GetModelInfo"))
+        let served = self.state.served_model_names();
+        Ok(Response::new(pb::ModelInfo {
+            model_id: self.state.chat.text().model_id().to_string(),
+            served_model_name: self.state.primary_model_name().to_string(),
+            served_model_aliases: served.iter().skip(1).cloned().collect(),
+            tokenizer_modes: Vec::new(),
+            supports_text_input: true,
+            supports_token_ids_input: true,
+            supports_lora: false,
+            supports_multimodal: self.state.chat.supports_multimodal(),
+            reasoning_parser: self
+                .state
+                .chat
+                .reasoning_parser_name()
+                .unwrap_or_default()
+                .to_string(),
+            tool_call_parser: self
+                .state
+                .chat
+                .tool_call_parser_name()
+                .unwrap_or_default()
+                .to_string(),
+        }))
     }
-
     async fn abort(
         &self,
-        _request: Request<pb::AbortRequest>,
+        request: Request<pb::AbortRequest>,
     ) -> Result<Response<pb::AbortResponse>, Status> {
-        Err(Status::unimplemented("Abort"))
+        let request = request.into_inner();
+        if request.request_ids.is_empty() {
+            return Err(Status::invalid_argument("request_ids is required"));
+        }
+        self.state
+            .engine_core_client()
+            .abort(&request.request_ids)
+            .await
+            .map_err(|error| Status::internal(error.to_report_string()))?;
+        Ok(Response::new(pb::AbortResponse {}))
     }
 
     async fn drain(
         &self,
         _request: Request<pb::DrainRequest>,
     ) -> Result<Response<pb::DrainResponse>, Status> {
-        Err(Status::unimplemented("Drain"))
+        self.begin_drain();
+        self.report_not_serving().await;
+        let in_flight = self.in_flight().min(u64::from(u32::MAX)) as u32;
+        let state = if in_flight == 0 {
+            pb::DrainState::Complete
+        } else {
+            pb::DrainState::InProgress
+        };
+        Ok(Response::new(pb::DrainResponse {
+            state: state as i32,
+            in_flight_requests: in_flight,
+            message: String::new(),
+        }))
     }
 
     async fn load_lora(
