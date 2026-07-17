@@ -36,7 +36,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
-use tonic::transport::Server as TonicServer;
+use tonic::{server::NamedService, transport::Server as TonicServer};
 use tonic_health::ServingStatus;
 use tonic_health::server::{HealthReporter, health_reporter};
 use tower::ServiceExt as _;
@@ -59,41 +59,65 @@ const GRPC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(7200);
 /// connection. 20s matches the gRPC-core default.
 const GRPC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
+type GenerateGrpcService = grpc::GenerateServer<grpc::GenerateServiceImpl>;
+
 async fn monitor_grpc_health(
-    health_reporter: HealthReporter,
+    mut health_reporter: HealthReporter,
     mut engine_health: watch::Receiver<bool>,
     shutdown: CancellationToken,
 ) {
-    tokio::select! {
+    let generate_service = GenerateGrpcService::NAME;
+    let status = ServingStatus::NotServing;
+    let health_event_first = tokio::select! {
         result = engine_health.wait_for(|healthy| !*healthy) => {
             match result {
                 Ok(_) => warn!(
-                    services = "vllm.Generate, overall",
-                    status = "NOT_SERVING",
+                    generate_service,
+                    overall_service = true,
+                    status = ?status,
                     reason = "engine_unhealthy",
                     "marking gRPC health services as not serving"
                 ),
                 Err(error) => warn!(
                     %error,
-                    services = "vllm.Generate, overall",
-                    status = "NOT_SERVING",
+                    generate_service,
+                    overall_service = true,
+                    status = ?status,
                     reason = "health_channel_closed",
                     "engine health channel closed; marking gRPC health services as not serving"
                 ),
             }
+            true
         }
-        _ = shutdown.cancelled() => info!(
-            services = "vllm.Generate, overall",
-            status = "NOT_SERVING",
+        _ = shutdown.cancelled() => {
+            info!(
+                generate_service,
+                overall_service = true,
+                status = ?status,
+                reason = "server_shutdown",
+                "server shutting down; marking gRPC health services as not serving"
+            );
+            false
+        }
+    };
+
+    health_reporter.set_not_serving::<GenerateGrpcService>().await;
+    // Generate is currently the only engine-backed gRPC service, so overall
+    // server health intentionally mirrors it.
+    health_reporter.set_service_status("", status).await;
+
+    if health_event_first {
+        shutdown.cancelled().await;
+        info!(
+            generate_service,
+            overall_service = true,
             reason = "server_shutdown",
-            "server shutting down; marking gRPC health services as not serving"
-        ),
+            "server shutting down; closing gRPC health watches"
+        );
     }
 
-    health_reporter
-        .set_not_serving::<grpc::GenerateServer<grpc::GenerateServiceImpl>>()
-        .await;
-    health_reporter.set_service_status("", ServingStatus::NotServing).await;
+    health_reporter.clear_service_status(generate_service).await;
+    health_reporter.clear_service_status("").await;
 }
 
 /// Resolve the public model names accepted by the frontend.
@@ -242,11 +266,9 @@ where
             .context("invalid gRPC TLS configuration")?;
         let (health_reporter, health_service) = health_reporter();
         let engine_health = state.engine_core_client().subscribe_health();
-        health_reporter
-            .set_serving::<grpc::GenerateServer<grpc::GenerateServiceImpl>>()
-            .await;
+        health_reporter.set_serving::<GenerateGrpcService>().await;
         let generate_service =
-            grpc::GenerateServer::new(grpc::GenerateServiceImpl::new(state.clone()));
+            GenerateGrpcService::new(grpc::GenerateServiceImpl::new(state.clone()));
         let svc = TonicServer::builder()
             .http2_keepalive_interval(Some(GRPC_KEEPALIVE_INTERVAL))
             .http2_keepalive_timeout(Some(GRPC_KEEPALIVE_TIMEOUT))

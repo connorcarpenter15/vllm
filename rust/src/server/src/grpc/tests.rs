@@ -261,13 +261,19 @@ async fn grpc_test_server(
     MockEngineTask,
 ) {
     let (svc, engine_health, engine_task) = setup_grpc_service(engine_id, output_specs).await;
-    let (channel, server_task) = start_grpc_test_server(svc, engine_health).await;
+    let (channel, server_task) = start_grpc_test_server(
+        svc,
+        engine_health,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     (GenerateClient::new(channel), server_task, engine_task)
 }
 
 async fn start_grpc_test_server(
     generate_service: GenerateServer<GenerateServiceImpl>,
     engine_health: tokio::sync::watch::Receiver<bool>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> (Channel, tokio::task::JoinHandle<()>) {
     let (health_reporter, health_service) = health_reporter();
     health_reporter.set_serving::<GenerateServer<GenerateServiceImpl>>().await;
@@ -280,8 +286,7 @@ async fn start_grpc_test_server(
         let server = TonicServer::builder()
             .add_service(health_service)
             .add_service(generate_service)
-            .serve_with_incoming(incoming);
-        let shutdown = tokio_util::sync::CancellationToken::new();
+            .serve_with_incoming_shutdown(incoming, shutdown.clone().cancelled_owned());
         let health_monitor =
             crate::monitor_grpc_health(health_reporter, engine_health, shutdown.clone());
         let server = async move {
@@ -1070,7 +1075,12 @@ async fn grpc_health_transitions_to_not_serving_when_engine_becomes_unhealthy() 
     let (generate_service, _connected_engine_health, _engine_task) =
         setup_grpc_service(b"engine-grpc-health-failure", default_stream_output_specs()).await;
     let (engine_health_tx, engine_health) = tokio::sync::watch::channel(true);
-    let (channel, server_task) = start_grpc_test_server(generate_service, engine_health).await;
+    let (channel, server_task) = start_grpc_test_server(
+        generate_service,
+        engine_health,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     let mut health_client = HealthClient::new(channel);
 
     let mut health_streams = Vec::new();
@@ -1124,4 +1134,63 @@ async fn grpc_health_transitions_to_not_serving_when_engine_becomes_unhealthy() 
     }
 
     server_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn grpc_health_watch_closes_on_graceful_shutdown() {
+    let (generate_service, engine_health, _engine_task) = setup_grpc_service(
+        b"engine-grpc-health-shutdown",
+        default_stream_output_specs(),
+    )
+    .await;
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let (channel, server_task) =
+        start_grpc_test_server(generate_service, engine_health, shutdown.clone()).await;
+    let mut health_client = HealthClient::new(channel);
+    let mut stream = health_client
+        .watch(HealthCheckRequest {
+            service: "vllm.Generate".to_string(),
+        })
+        .await
+        .expect("start health watch for vllm.Generate")
+        .into_inner();
+
+    let initial = stream
+        .message()
+        .await
+        .expect("read initial health status for vllm.Generate")
+        .expect("health watch ended before its initial status");
+    assert_eq!(
+        initial.status,
+        HealthServingStatus::Serving as i32,
+        "unexpected initial health status for vllm.Generate"
+    );
+
+    shutdown.cancel();
+
+    let update = tokio::time::timeout(Duration::from_secs(2), stream.message())
+        .await
+        .expect("timed out waiting for shutdown health update for vllm.Generate")
+        .expect("failed to read shutdown health update for vllm.Generate")
+        .expect("health watch ended before its shutdown update");
+    assert_eq!(
+        update.status,
+        HealthServingStatus::NotServing as i32,
+        "unexpected shutdown health status for vllm.Generate"
+    );
+
+    let stream_end = tokio::time::timeout(Duration::from_secs(2), stream.message())
+        .await
+        .expect("timed out waiting for vllm.Generate health watch to close")
+        .expect("failed while closing vllm.Generate health watch");
+    assert!(
+        stream_end.is_none(),
+        "vllm.Generate health watch remained open"
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("timed out waiting for gRPC server shutdown")
+        .expect("gRPC server task failed");
 }
