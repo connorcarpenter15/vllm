@@ -13,6 +13,10 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio_openssl::SslStream;
 use tonic::transport::{Channel, Endpoint, Server as TonicServer, Uri};
+use tonic_health::pb::HealthCheckRequest;
+use tonic_health::pb::health_check_response::ServingStatus as HealthServingStatus;
+use tonic_health::pb::health_client::HealthClient;
+use tonic_health::server::health_reporter;
 use tower::service_fn;
 use vllm_chat::{
     ChatBackend, ChatLlm, ChatRenderer, ChatRequest, ChatTextBackend, DefaultChatOutputProcessor,
@@ -23,7 +27,9 @@ use vllm_engine_core_client::protocol::output::{
 };
 use vllm_engine_core_client::protocol::request::EngineCoreRequest;
 use vllm_engine_core_client::test_utils::{IpcNamespace, spawn_mock_engine_task};
-use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig, EngineId};
+use vllm_engine_core_client::{
+    ENGINE_CORE_DEAD_SENTINEL, EngineCoreClient, EngineCoreClientConfig, EngineId,
+};
 use vllm_llm::Llm;
 use vllm_text::tokenizer::DynTokenizer;
 use vllm_text::{Prompt, TextBackend};
@@ -196,7 +202,37 @@ impl ChatRenderer for FakeTextBackend {
 async fn setup_grpc_service(
     engine_id: impl Into<EngineId>,
     output_specs: Vec<(Vec<u32>, Option<EngineCoreFinishReason>)>,
-) -> (GenerateServer<GenerateServiceImpl>, MockEngineTask) {
+) -> (
+    GenerateServer<GenerateServiceImpl>,
+    tokio::sync::watch::Receiver<bool>,
+    MockEngineTask,
+) {
+    setup_grpc_service_with_engine(engine_id, move |dealer, push| {
+        boxed_test_future(async move {
+            let add = recv_engine_message(dealer).await;
+            let request: EngineCoreRequest =
+                rmp_serde::from_slice(&add[1]).expect("decode request");
+            send_outputs(
+                push,
+                engine_outputs_for_request(&request.request_id, output_specs),
+            )
+            .await;
+        })
+    })
+    .await
+}
+
+async fn setup_grpc_service_with_engine<F>(
+    engine_id: impl Into<EngineId>,
+    run: F,
+) -> (
+    GenerateServer<GenerateServiceImpl>,
+    tokio::sync::watch::Receiver<bool>,
+    MockEngineTask,
+)
+where
+    F: for<'a> FnOnce(&'a mut DealerSocket, &'a mut PushSocket) -> TestFuture<'a> + Send + 'static,
+{
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
     let engine_id = engine_id.into();
@@ -204,18 +240,7 @@ async fn setup_grpc_service(
     let engine_task = MockEngineTask::new(spawn_mock_engine_task(
         handshake_address.clone(),
         engine_id.clone(),
-        move |dealer, push| {
-            boxed_test_future(async move {
-                let add = recv_engine_message(dealer).await;
-                let request: EngineCoreRequest =
-                    rmp_serde::from_slice(&add[1]).expect("decode request");
-                send_outputs(
-                    push,
-                    engine_outputs_for_request(&request.request_id, output_specs),
-                )
-                .await;
-            })
-        },
+        run,
     ));
 
     let client = EngineCoreClient::connect(
@@ -228,6 +253,7 @@ async fn setup_grpc_service(
     )
     .await
     .expect("connect client");
+    let engine_health = client.subscribe_health();
 
     let chat = ChatLlm::from_shared_backend(
         test_llm(client),
@@ -236,6 +262,7 @@ async fn setup_grpc_service(
     let state = Arc::new(AppState::new(vec!["test-model".to_string()], chat));
     (
         GenerateServer::new(GenerateServiceImpl::new(state)),
+        engine_health,
         engine_task,
     )
 }
@@ -250,25 +277,52 @@ async fn grpc_test_server(
     tokio::task::JoinHandle<()>,
     MockEngineTask,
 ) {
-    let (svc, engine_task) = setup_grpc_service(engine_id, output_specs).await;
+    let (svc, engine_health, engine_task) = setup_grpc_service(engine_id, output_specs).await;
+    let (generate_client, _health_client, server_task, engine_task) =
+        start_grpc_test_server(svc, engine_health, engine_task).await;
+    (generate_client, server_task, engine_task)
+}
+
+async fn start_grpc_test_server(
+    generate_service: GenerateServer<GenerateServiceImpl>,
+    engine_health: tokio::sync::watch::Receiver<bool>,
+    engine_task: MockEngineTask,
+) -> (
+    GenerateClient<tonic::transport::Channel>,
+    HealthClient<tonic::transport::Channel>,
+    tokio::task::JoinHandle<()>,
+    MockEngineTask,
+) {
+    let (health_reporter, health_service) = health_reporter();
+    health_reporter.set_serving::<GenerateServer<GenerateServiceImpl>>().await;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind grpc listener");
     let addr = listener.local_addr().expect("local addr");
 
     let server_task = tokio::spawn(async move {
         let incoming = MaybeTlsListener::plain(Listener::Tcp(listener));
-        TonicServer::builder()
-            .add_service(svc)
-            .serve_with_incoming(incoming)
-            .await
-            .expect("grpc server");
+        let server = TonicServer::builder()
+            .add_service(health_service)
+            .add_service(generate_service)
+            .serve_with_incoming(incoming);
+        let health_monitor = crate::monitor_grpc_health(
+            health_reporter,
+            engine_health,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let (server_result, ()) = tokio::join!(server, health_monitor);
+        server_result.expect("grpc server");
     });
 
-    let grpc_client = GenerateClient::connect(format!("http://{addr}"))
+    let channel = Endpoint::from_shared(format!("http://{addr}"))
+        .expect("grpc endpoint")
+        .connect()
         .await
-        .expect("connect grpc client");
+        .expect("connect grpc channel");
+    let generate_client = GenerateClient::new(channel.clone());
+    let health_client = HealthClient::new(channel);
 
-    (grpc_client, server_task, engine_task)
+    (generate_client, health_client, server_task, engine_task)
 }
 
 /// Spin up a TLS gRPC server (server cert from `certs`, `cert_reqs` mTLS mode).
@@ -279,7 +333,7 @@ async fn grpc_tls_test_server(
     certs: &TestCerts,
     cert_reqs: i32,
 ) -> (String, tokio::task::JoinHandle<()>, MockEngineTask) {
-    let (svc, engine_task) = setup_grpc_service(engine_id, output_specs).await;
+    let (svc, _engine_health, engine_task) = setup_grpc_service(engine_id, output_specs).await;
     let context = tls::build_grpc_server_config(&server_tls(certs, cert_reqs))
         .expect("build grpc tls config");
 
@@ -369,7 +423,8 @@ async fn grpc_server_with_keepalive(
     engine_id: impl Into<EngineId>,
     keepalive: Option<Duration>,
 ) -> (String, tokio::task::JoinHandle<()>, MockEngineTask) {
-    let (svc, engine_task) = setup_grpc_service(engine_id, default_stream_output_specs()).await;
+    let (svc, _engine_health, engine_task) =
+        setup_grpc_service(engine_id, default_stream_output_specs()).await;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind grpc listener");
     let addr = listener.local_addr().expect("local addr").to_string();
@@ -1030,4 +1085,80 @@ async fn grpc_without_keepalive_keeps_unresponsive_connection_open() {
     );
 
     server_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn canonical_health_shares_generate_listener() {
+    let (generate_service, engine_health, engine_task) =
+        setup_grpc_service(b"engine-grpc-health", default_stream_output_specs()).await;
+    let (_generate_client, mut health_client, server_task, _engine_task) =
+        start_grpc_test_server(generate_service, engine_health, engine_task).await;
+
+    for service in ["vllm.Generate", ""] {
+        let health = health_client
+            .check(HealthCheckRequest {
+                service: service.to_string(),
+            })
+            .await
+            .expect("check health")
+            .into_inner();
+        assert_eq!(health.status, HealthServingStatus::Serving as i32);
+    }
+
+    server_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn grpc_health_transitions_to_not_serving_when_engine_fails() {
+    let (fail_tx, fail_rx) = tokio::sync::oneshot::channel();
+    let (generate_service, engine_health, engine_task) =
+        setup_grpc_service_with_engine(b"engine-grpc-health-failure", move |_dealer, push| {
+            boxed_test_future(async move {
+                fail_rx.await.expect("trigger engine failure");
+                push.send(ZmqMessage::from(ENGINE_CORE_DEAD_SENTINEL.to_vec()))
+                    .await
+                    .expect("send engine-dead sentinel");
+            })
+        })
+        .await;
+    let (_generate_client, mut health_client, server_task, engine_task) =
+        start_grpc_test_server(generate_service, engine_health, engine_task).await;
+
+    let mut health_streams = Vec::new();
+    for service in ["vllm.Generate", ""] {
+        let mut stream = health_client
+            .watch(HealthCheckRequest {
+                service: service.to_string(),
+            })
+            .await
+            .expect("start health watch")
+            .into_inner();
+        let initial = stream
+            .message()
+            .await
+            .expect("read initial health")
+            .expect("initial health response");
+        assert_eq!(initial.status, HealthServingStatus::Serving as i32);
+        health_streams.push((service, stream));
+    }
+
+    fail_tx.send(()).expect("trigger engine failure");
+
+    for (service, mut stream) in health_streams {
+        let update = tokio::time::timeout(Duration::from_secs(2), stream.message())
+            .await
+            .expect("health update timeout")
+            .expect("read health update")
+            .expect("health update response");
+        assert_eq!(
+            update.status,
+            HealthServingStatus::NotServing as i32,
+            "unexpected health status for {service}"
+        );
+    }
+
+    server_task.abort();
+    engine_task.await.expect("mock engine task");
 }
