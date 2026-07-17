@@ -27,9 +27,7 @@ use vllm_engine_core_client::protocol::output::{
 };
 use vllm_engine_core_client::protocol::request::EngineCoreRequest;
 use vllm_engine_core_client::test_utils::{IpcNamespace, spawn_mock_engine_task};
-use vllm_engine_core_client::{
-    ENGINE_CORE_DEAD_SENTINEL, EngineCoreClient, EngineCoreClientConfig, EngineId,
-};
+use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig, EngineId};
 use vllm_llm::Llm;
 use vllm_text::tokenizer::DynTokenizer;
 use vllm_text::{Prompt, TextBackend};
@@ -207,32 +205,6 @@ async fn setup_grpc_service(
     tokio::sync::watch::Receiver<bool>,
     MockEngineTask,
 ) {
-    setup_grpc_service_with_engine(engine_id, move |dealer, push| {
-        boxed_test_future(async move {
-            let add = recv_engine_message(dealer).await;
-            let request: EngineCoreRequest =
-                rmp_serde::from_slice(&add[1]).expect("decode request");
-            send_outputs(
-                push,
-                engine_outputs_for_request(&request.request_id, output_specs),
-            )
-            .await;
-        })
-    })
-    .await
-}
-
-async fn setup_grpc_service_with_engine<F>(
-    engine_id: impl Into<EngineId>,
-    run: F,
-) -> (
-    GenerateServer<GenerateServiceImpl>,
-    tokio::sync::watch::Receiver<bool>,
-    MockEngineTask,
-)
-where
-    F: for<'a> FnOnce(&'a mut DealerSocket, &'a mut PushSocket) -> TestFuture<'a> + Send + 'static,
-{
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
     let engine_id = engine_id.into();
@@ -240,7 +212,18 @@ where
     let engine_task = MockEngineTask::new(spawn_mock_engine_task(
         handshake_address.clone(),
         engine_id.clone(),
-        run,
+        move |dealer, push| {
+            boxed_test_future(async move {
+                let add = recv_engine_message(dealer).await;
+                let request: EngineCoreRequest =
+                    rmp_serde::from_slice(&add[1]).expect("decode request");
+                send_outputs(
+                    push,
+                    engine_outputs_for_request(&request.request_id, output_specs),
+                )
+                .await;
+            })
+        },
     ));
 
     let client = EngineCoreClient::connect(
@@ -1111,19 +1094,11 @@ async fn canonical_health_shares_generate_listener() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn grpc_health_transitions_to_not_serving_when_engine_fails() {
-    let (fail_tx, fail_rx) = tokio::sync::oneshot::channel();
-    let (generate_service, engine_health, engine_task) =
-        setup_grpc_service_with_engine(b"engine-grpc-health-failure", move |_dealer, push| {
-            boxed_test_future(async move {
-                fail_rx.await.expect("trigger engine failure");
-                push.send(ZmqMessage::from(ENGINE_CORE_DEAD_SENTINEL.to_vec()))
-                    .await
-                    .expect("send engine-dead sentinel");
-            })
-        })
-        .await;
-    let (_generate_client, mut health_client, server_task, engine_task) =
+async fn grpc_health_transitions_to_not_serving_when_engine_becomes_unhealthy() {
+    let (generate_service, _connected_engine_health, engine_task) =
+        setup_grpc_service(b"engine-grpc-health-failure", default_stream_output_specs()).await;
+    let (engine_health_tx, engine_health) = tokio::sync::watch::channel(true);
+    let (_generate_client, mut health_client, server_task, _engine_task) =
         start_grpc_test_server(generate_service, engine_health, engine_task).await;
 
     let mut health_streams = Vec::new();
@@ -1144,7 +1119,7 @@ async fn grpc_health_transitions_to_not_serving_when_engine_fails() {
         health_streams.push((service, stream));
     }
 
-    fail_tx.send(()).expect("trigger engine failure");
+    engine_health_tx.send(false).expect("publish unhealthy engine state");
 
     for (service, mut stream) in health_streams {
         let update = tokio::time::timeout(Duration::from_secs(2), stream.message())
@@ -1160,5 +1135,4 @@ async fn grpc_health_transitions_to_not_serving_when_engine_fails() {
     }
 
     server_task.abort();
-    engine_task.await.expect("mock engine task");
 }
