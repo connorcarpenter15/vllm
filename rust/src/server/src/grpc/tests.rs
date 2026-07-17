@@ -281,11 +281,14 @@ async fn start_grpc_test_server(
             .add_service(health_service)
             .add_service(generate_service)
             .serve_with_incoming(incoming);
-        let health_monitor = crate::monitor_grpc_health(
-            health_reporter,
-            engine_health,
-            tokio_util::sync::CancellationToken::new(),
-        );
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let health_monitor =
+            crate::monitor_grpc_health(health_reporter, engine_health, shutdown.clone());
+        let server = async move {
+            let result = server.await;
+            shutdown.cancel();
+            result
+        };
         let (server_result, ()) = tokio::join!(server, health_monitor);
         server_result.expect("grpc server");
     });
