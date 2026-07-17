@@ -1081,34 +1081,51 @@ async fn grpc_health_transitions_to_not_serving_when_engine_becomes_unhealthy() 
 
     let mut health_streams = Vec::new();
     for service in ["vllm.Generate", ""] {
+        let service_label = if service.is_empty() {
+            "overall"
+        } else {
+            service
+        };
         let mut stream = health_client
             .watch(HealthCheckRequest {
                 service: service.to_string(),
             })
             .await
-            .expect("start health watch")
+            .unwrap_or_else(|error| {
+                panic!("failed to start health watch for {service_label}: {error}")
+            })
             .into_inner();
         let initial = stream
             .message()
             .await
-            .expect("read initial health")
-            .expect("initial health response");
-        assert_eq!(initial.status, HealthServingStatus::Serving as i32);
-        health_streams.push((service, stream));
+            .unwrap_or_else(|error| {
+                panic!("failed to read initial health status for {service_label}: {error}")
+            })
+            .unwrap_or_else(|| {
+                panic!("health watch for {service_label} ended before its initial status")
+            });
+        assert_eq!(
+            initial.status,
+            HealthServingStatus::Serving as i32,
+            "unexpected initial health status for {service_label}"
+        );
+        health_streams.push((service_label, stream));
     }
 
     engine_health_tx.send(false).expect("publish unhealthy engine state");
 
-    for (service, mut stream) in health_streams {
+    for (service_label, mut stream) in health_streams {
         let update = tokio::time::timeout(Duration::from_secs(2), stream.message())
             .await
-            .expect("health update timeout")
-            .expect("read health update")
-            .expect("health update response");
+            .unwrap_or_else(|_| panic!("timed out waiting for health update for {service_label}"))
+            .unwrap_or_else(|error| {
+                panic!("failed to read health update for {service_label}: {error}")
+            })
+            .unwrap_or_else(|| panic!("health watch for {service_label} ended before its update"));
         assert_eq!(
             update.status,
             HealthServingStatus::NotServing as i32,
-            "unexpected health status for {service}"
+            "unexpected health status for {service_label}"
         );
     }
 

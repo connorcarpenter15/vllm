@@ -65,8 +65,29 @@ async fn monitor_grpc_health(
     shutdown: CancellationToken,
 ) {
     tokio::select! {
-        _ = engine_health.wait_for(|healthy| !*healthy) => {}
-        _ = shutdown.cancelled() => {}
+        result = engine_health.wait_for(|healthy| !*healthy) => {
+            match result {
+                Ok(_) => warn!(
+                    services = "vllm.Generate, overall",
+                    status = "NOT_SERVING",
+                    reason = "engine_unhealthy",
+                    "marking gRPC health services as not serving"
+                ),
+                Err(error) => warn!(
+                    %error,
+                    services = "vllm.Generate, overall",
+                    status = "NOT_SERVING",
+                    reason = "health_channel_closed",
+                    "engine health channel closed; marking gRPC health services as not serving"
+                ),
+            }
+        }
+        _ = shutdown.cancelled() => info!(
+            services = "vllm.Generate, overall",
+            status = "NOT_SERVING",
+            reason = "server_shutdown",
+            "server shutting down; marking gRPC health services as not serving"
+        ),
     }
 
     health_reporter
