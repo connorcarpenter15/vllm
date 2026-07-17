@@ -260,22 +260,8 @@ async fn grpc_test_server(
     tokio::task::JoinHandle<()>,
     MockEngineTask,
 ) {
-    let (svc, engine_health, engine_task) = setup_grpc_service(engine_id, output_specs).await;
-    let (generate_client, _health_client, server_task, engine_task) =
-        start_grpc_test_server(svc, engine_health, engine_task).await;
-    (generate_client, server_task, engine_task)
-}
-
-async fn start_grpc_test_server(
-    generate_service: GenerateServer<GenerateServiceImpl>,
-    engine_health: tokio::sync::watch::Receiver<bool>,
-    engine_task: MockEngineTask,
-) -> (
-    GenerateClient<tonic::transport::Channel>,
-    HealthClient<tonic::transport::Channel>,
-    tokio::task::JoinHandle<()>,
-    MockEngineTask,
-) {
+    let (generate_service, engine_health, engine_task) =
+        setup_grpc_service(engine_id, output_specs).await;
     let (health_reporter, health_service) = health_reporter();
     health_reporter.set_serving::<GenerateServer<GenerateServiceImpl>>().await;
 
@@ -302,10 +288,8 @@ async fn start_grpc_test_server(
         .connect()
         .await
         .expect("connect grpc channel");
-    let generate_client = GenerateClient::new(channel.clone());
-    let health_client = HealthClient::new(channel);
 
-    (generate_client, health_client, server_task, engine_task)
+    (GenerateClient::new(channel), server_task, engine_task)
 }
 
 /// Spin up a TLS gRPC server (server cert from `certs`, `cert_reqs` mTLS mode).
@@ -1072,34 +1056,37 @@ async fn grpc_without_keepalive_keeps_unresponsive_connection_open() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn canonical_health_shares_generate_listener() {
-    let (generate_service, engine_health, engine_task) =
-        setup_grpc_service(b"engine-grpc-health", default_stream_output_specs()).await;
-    let (_generate_client, mut health_client, server_task, _engine_task) =
-        start_grpc_test_server(generate_service, engine_health, engine_task).await;
-
-    for service in ["vllm.Generate", ""] {
-        let health = health_client
-            .check(HealthCheckRequest {
-                service: service.to_string(),
-            })
-            .await
-            .expect("check health")
-            .into_inner();
-        assert_eq!(health.status, HealthServingStatus::Serving as i32);
-    }
-
-    server_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
 async fn grpc_health_transitions_to_not_serving_when_engine_becomes_unhealthy() {
-    let (generate_service, _connected_engine_health, engine_task) =
+    let (generate_service, _connected_engine_health, _engine_task) =
         setup_grpc_service(b"engine-grpc-health-failure", default_stream_output_specs()).await;
     let (engine_health_tx, engine_health) = tokio::sync::watch::channel(true);
-    let (_generate_client, mut health_client, server_task, _engine_task) =
-        start_grpc_test_server(generate_service, engine_health, engine_task).await;
+    let (health_reporter, health_service) = health_reporter();
+    health_reporter.set_serving::<GenerateServer<GenerateServiceImpl>>().await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind grpc listener");
+    let addr = listener.local_addr().expect("local addr");
+
+    let server_task = tokio::spawn(async move {
+        let incoming = MaybeTlsListener::plain(Listener::Tcp(listener));
+        let server = TonicServer::builder()
+            .add_service(health_service)
+            .add_service(generate_service)
+            .serve_with_incoming(incoming);
+        let health_monitor = crate::monitor_grpc_health(
+            health_reporter,
+            engine_health,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let (server_result, ()) = tokio::join!(server, health_monitor);
+        server_result.expect("grpc server");
+    });
+
+    let channel = Endpoint::from_shared(format!("http://{addr}"))
+        .expect("grpc endpoint")
+        .connect()
+        .await
+        .expect("connect grpc channel");
+    let mut health_client = HealthClient::new(channel);
 
     let mut health_streams = Vec::new();
     for service in ["vllm.Generate", ""] {
