@@ -167,7 +167,8 @@ impl ClientInner {
     /// Close all active request streams and utility calls with the first
     /// persistent health error.
     pub fn close_registries(&self, error: Arc<Error>) {
-        let persistent_error = self.transition_to_unhealthy(error);
+        let persistent_error = self.record_health_error(error);
+        self.publish_unhealthy();
         let request_senders = self.request_reg.lock().close();
         let utility_senders = self.utility_reg.lock().close();
 
@@ -271,17 +272,20 @@ impl ClientInner {
         Some(engine_id)
     }
 
-    /// Preserve the first health error, publish the sticky unhealthy
-    /// transition, and return the persistent error.
-    fn transition_to_unhealthy(&self, error: Arc<Error>) -> Arc<Error> {
-        let persistent_error = if let Some(existing) = self.health_error() {
+    /// Preserve and return the first persistent health error.
+    fn record_health_error(&self, error: Arc<Error>) -> Arc<Error> {
+        if let Some(existing) = self.health_error() {
             existing
         } else {
             self.health_error
                 .rcu(|current| current.clone().unwrap_or_else(|| error.clone()));
             self.health_error()
                 .expect("health error must be recorded before registries close")
-        };
+        }
+    }
+
+    /// Publish the sticky healthy-to-unhealthy transition.
+    fn publish_unhealthy(&self) {
         self.health_tx.send_if_modified(|healthy| {
             if !*healthy {
                 return false;
@@ -289,7 +293,6 @@ impl ClientInner {
             *healthy = false;
             true
         });
-        persistent_error
     }
 
     /// Assert there is a recorded health error and return a `Shared` variant
