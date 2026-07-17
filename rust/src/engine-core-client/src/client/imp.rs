@@ -55,7 +55,7 @@ impl ClientInner {
             request_reg: Mutex::new(RequestRegistry::new(engines)),
             utility_reg: Mutex::new(UtilityRegistry::default()),
             health_error: ArcSwapOption::empty(),
-            health_tx: watch::channel(true).0,
+            health_tx: watch::Sender::new(true),
         }
     }
 
@@ -167,7 +167,7 @@ impl ClientInner {
     /// Close all active request streams and utility calls with the first
     /// persistent health error.
     pub fn close_registries(&self, error: Arc<Error>) {
-        let persistent_error = self.record_health_error(error);
+        let persistent_error = self.transition_to_unhealthy(error);
         let request_senders = self.request_reg.lock().close();
         let utility_senders = self.utility_reg.lock().close();
 
@@ -271,17 +271,15 @@ impl ClientInner {
         Some(engine_id)
     }
 
-    /// Publish the first persistent health error and return the sticky error
-    /// recorded for this client. Later failures do not overwrite the first
-    /// one so `/health` and post-close callers observe a stable cause.
-    fn record_health_error(&self, error: Arc<Error>) -> Arc<Error> {
-        let persistent_error = if let Some(existing) = self.health_error.load_full() {
+    /// Preserve the first health error, publish the sticky unhealthy
+    /// transition, and return the persistent error.
+    fn transition_to_unhealthy(&self, error: Arc<Error>) -> Arc<Error> {
+        let persistent_error = if let Some(existing) = self.health_error() {
             existing
         } else {
             self.health_error
                 .rcu(|current| current.clone().unwrap_or_else(|| error.clone()));
-            self.health_error
-                .load_full()
+            self.health_error()
                 .expect("health error must be recorded before registries close")
         };
         self.health_tx.send_if_modified(|healthy| {
