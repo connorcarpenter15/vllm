@@ -274,14 +274,6 @@ where
     let force_shutdown = CancellationToken::new();
     let shutdown_deadline = Arc::new(OnceLock::new());
 
-    let (grpc_server_setup, grpc_health_setup) = match grpc_setup {
-        Some((listener, service, tls, reporter, engine_health)) => (
-            Some((listener, service, tls)),
-            Some((reporter, engine_health)),
-        ),
-        None => (None, None),
-    };
-
     // Spawn a task to trigger `force_shutdown` after shutdown deadline elapses.
     tokio::spawn({
         let shutdown = server_shutdown.clone();
@@ -346,7 +338,8 @@ where
         let server_shutdown = server_shutdown.clone();
         let force_shutdown = force_shutdown.clone();
         async move {
-            let Some((grpc_listener, svc, grpc_tls)) = grpc_server_setup else {
+            let Some((grpc_listener, svc, grpc_tls, health_reporter, engine_health)) = grpc_setup
+            else {
                 // No gRPC configured: just wait for shutdown so we do not race the
                 // join! by resolving early and tripping the cancellation token.
                 shutdown.cancelled().await;
@@ -356,34 +349,31 @@ where
                 Some(context) => MaybeTlsListener::tls(grpc_listener, context),
                 None => MaybeTlsListener::plain(grpc_listener),
             };
-            let server = svc.serve_with_incoming_shutdown(incoming, shutdown.cancelled_owned());
+            let server =
+                svc.serve_with_incoming_shutdown(incoming, shutdown.clone().cancelled_owned());
+            let health_monitor = monitor_grpc_health(health_reporter, engine_health, shutdown);
 
-            let result = tokio::select! {
-                result = server => {
-                    result.context("gRPC server failed")
-                }
-                _ = force_shutdown.cancelled() => {
-                    warn!("gRPC graceful shutdown deadline elapsed; aborting server");
-                    Ok(())
-                }
+            let server = async move {
+                let result = tokio::select! {
+                    result = server => {
+                        result.context("gRPC server failed")
+                    }
+                    _ = force_shutdown.cancelled() => {
+                        warn!("gRPC graceful shutdown deadline elapsed; aborting server");
+                        Ok(())
+                    }
+                };
+
+                server_shutdown.cancel();
+                result
             };
 
-            server_shutdown.cancel();
+            let (result, ()) = tokio::join!(server, health_monitor);
             result
         }
     };
 
-    let grpc_health_fut = {
-        let shutdown = server_shutdown.child_token();
-        async move {
-            let Some((health_reporter, engine_health)) = grpc_health_setup else {
-                return;
-            };
-            monitor_grpc_health(health_reporter, engine_health, shutdown).await;
-        }
-    };
-
-    let (http_res, grpc_res, ()) = tokio::join!(http_fut, grpc_fut, grpc_health_fut);
+    let (http_res, grpc_res) = tokio::join!(http_fut, grpc_fut);
     http_res.and(grpc_res)?;
 
     let shutdown_deadline = shutdown_deadline
