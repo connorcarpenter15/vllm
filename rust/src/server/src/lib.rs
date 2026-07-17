@@ -59,35 +59,20 @@ const GRPC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(7200);
 /// connection. 20s matches the gRPC-core default.
 const GRPC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
-async fn wait_until_engine_unhealthy(mut engine_health: watch::Receiver<bool>) {
-    loop {
-        if !*engine_health.borrow_and_update() {
-            return;
-        }
-        if engine_health.changed().await.is_err() {
-            return;
-        }
+async fn monitor_grpc_health(
+    health_reporter: HealthReporter,
+    mut engine_health: watch::Receiver<bool>,
+    shutdown: CancellationToken,
+) {
+    tokio::select! {
+        _ = engine_health.wait_for(|healthy| !*healthy) => {}
+        _ = shutdown.cancelled() => {}
     }
-}
 
-async fn set_grpc_not_serving(health_reporter: &HealthReporter) {
     health_reporter
         .set_not_serving::<grpc::GenerateServer<grpc::GenerateServiceImpl>>()
         .await;
     health_reporter.set_service_status("", ServingStatus::NotServing).await;
-}
-
-async fn monitor_grpc_health(
-    health_reporter: HealthReporter,
-    engine_health: watch::Receiver<bool>,
-    shutdown: CancellationToken,
-) {
-    tokio::select! {
-        _ = wait_until_engine_unhealthy(engine_health) => {}
-        _ = shutdown.cancelled() => {}
-    }
-
-    set_grpc_not_serving(&health_reporter).await;
 }
 
 /// Resolve the public model names accepted by the frontend.

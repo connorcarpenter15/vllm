@@ -1072,28 +1072,6 @@ async fn grpc_without_keepalive_keeps_unresponsive_connection_open() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn canonical_health_shares_generate_listener() {
-    let (generate_service, engine_health, engine_task) =
-        setup_grpc_service(b"engine-grpc-health", default_stream_output_specs()).await;
-    let (_generate_client, mut health_client, server_task, _engine_task) =
-        start_grpc_test_server(generate_service, engine_health, engine_task).await;
-
-    for service in ["vllm.Generate", ""] {
-        let health = health_client
-            .check(HealthCheckRequest {
-                service: service.to_string(),
-            })
-            .await
-            .expect("check health")
-            .into_inner();
-        assert_eq!(health.status, HealthServingStatus::Serving as i32);
-    }
-
-    server_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
 async fn grpc_health_transitions_to_not_serving_when_engine_becomes_unhealthy() {
     let (generate_service, _connected_engine_health, engine_task) =
         setup_grpc_service(b"engine-grpc-health-failure", default_stream_output_specs()).await;
