@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import os
 
 import pytest
 
+from vllm.entrypoints.cli import serve as serve_cli
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.entrypoints.openai.models.protocol import LoRAModulePath
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -62,6 +64,19 @@ def test_config_arg_parsing(serve_parser, cli_config_file):
         ]
     )
     assert args.port == 9000
+
+
+def test_openengine_defaults_reproducible_kv_hash_seed(serve_parser, monkeypatch):
+    """OpenEngine KV hashes must be comparable across engine processes."""
+    monkeypatch.setattr(
+        serve_cli.envs, "VLLM_RUST_FRONTEND_PATH", "/tmp/vllm-rs", raising=False
+    )
+    monkeypatch.delenv("PYTHONHASHSEED", raising=False)
+
+    args = serve_parser.parse_args(["--openengine-port", "50051"])
+    serve_cli.ServeSubcommand().validate(args)
+
+    assert os.environ["PYTHONHASHSEED"] == "0"
 
 
 ### Tests for LoRA module parsing
