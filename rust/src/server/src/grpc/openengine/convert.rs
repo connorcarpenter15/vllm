@@ -70,7 +70,11 @@ pub(super) async fn to_text_request(
     data_parallel_size: u64,
     state: &crate::state::AppState,
 ) -> Result<TextRequest, Status> {
-    validate_model(&request.model, state.served_model_names())?;
+    validate_model(
+        &request.model,
+        state.chat.model_id(),
+        state.served_model_names(),
+    )?;
     validate_role_and_handoff(&request, role, target_dp_rank, data_parallel_size)?;
 
     if request.media_options.as_ref().is_some_and(|options| !options.fields.is_empty()) {
@@ -176,8 +180,8 @@ pub(super) async fn to_text_request(
     })
 }
 
-fn validate_model(model: &str, served: &[String]) -> Result<(), Status> {
-    if model.is_empty() || served.iter().any(|served| served == model) {
+fn validate_model(model: &str, canonical: &str, served: &[String]) -> Result<(), Status> {
+    if model.is_empty() || model == canonical || served.iter().any(|served| served == model) {
         Ok(())
     } else {
         Err(Status::not_found(format!("model `{model}` not found")))

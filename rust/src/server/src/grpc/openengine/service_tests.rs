@@ -233,6 +233,28 @@ async fn aggregate_generation_streams_tokens_and_terminal_usage() {
 }
 
 #[tokio::test]
+async fn aggregate_generation_accepts_advertised_canonical_model_id() {
+    let (service, engine_task) = setup_service(default_ready_response(), true).await;
+    let mut request = base_request();
+    request.model = "canonical/test-model".to_string();
+    let responses: Vec<_> = service
+        .generate(Request::new(request))
+        .await
+        .expect("generate with canonical model id")
+        .into_inner()
+        .map(|response| response.expect("stream response"))
+        .collect()
+        .await;
+    assert!(responses.iter().any(|response| {
+        matches!(
+            response.event,
+            Some(pb::generate_response::Event::Finished(_))
+        )
+    }));
+    engine_task.await.expect("mock engine task");
+}
+
+#[tokio::test]
 async fn discovery_reports_prefill_profile_tokenizer_aliases_and_kv_source() {
     let mut ready = default_ready_response();
     ready.kv_connector = Some("NixlConnector".to_string());
