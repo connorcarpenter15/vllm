@@ -135,7 +135,7 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     Ok(Arc::new(
         AppState::new(served_model_names, chat)
             .with_model_path(config.model.clone())
-            .with_tokenizer_mode(config.renderer.to_string())
+            .with_tokenizer_mode(config.tokenizer_loader_mode().to_string())
             .with_api_server_options(config.api_server_options)
             .with_server_info(ServerInfoSnapshot::from_config(config))
             .with_api_keys(config.api_keys.clone())
@@ -237,7 +237,7 @@ where
             grpc::openengine::OpenEngineService::new(state.clone(), config.openengine_host.clone())
                 .context("invalid OpenEngine engine topology")?;
         let inference = grpc::openengine::InferenceServer::new(service.clone());
-        let control = grpc::openengine::ControlServer::new(service);
+        let control = grpc::openengine::ControlServer::new(service.clone());
         let svc = TonicServer::builder()
             .http2_keepalive_interval(Some(GRPC_KEEPALIVE_INTERVAL))
             .http2_keepalive_timeout(Some(GRPC_KEEPALIVE_TIMEOUT))
@@ -245,7 +245,7 @@ where
             .add_service(inference)
             .add_service(control);
         info!(%addr, "starting prototype OpenEngine server");
-        Some((openengine_listener, svc))
+        Some((openengine_listener, svc, service))
     } else {
         None
     };
@@ -369,7 +369,7 @@ where
         let server_shutdown = server_shutdown.clone();
         let force_shutdown = force_shutdown.clone();
         async move {
-            let Some((listener, svc)) = openengine_setup else {
+            let Some((listener, svc, service)) = openengine_setup else {
                 shutdown.cancelled().await;
                 return Ok(());
             };
@@ -382,6 +382,7 @@ where
                     Ok(())
                 }
             };
+            service.shutdown_background_tasks().await;
             server_shutdown.cancel();
             result
         }

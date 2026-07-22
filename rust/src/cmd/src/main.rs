@@ -7,6 +7,7 @@ mod logging;
 use std::env;
 use std::ffi::OsStr;
 use std::process::ExitStatus;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio_util::sync::CancellationToken;
@@ -20,6 +21,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const TOKIO_WORKER_THREADS_ENV: &str = "TOKIO_WORKER_THREADS";
 const DEFAULT_MAX_TOKIO_WORKER_THREADS: usize = 32;
+const SERVER_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Cap the default number of Tokio worker threads if the user did not
 /// explicitly set `TOKIO_WORKER_THREADS` to avoid spawning too many threads on
@@ -184,14 +186,33 @@ async fn async_main(cli: Cli) -> Result<()> {
             // that all serving tasks are notified.
             shutdown.cancel();
 
-            // Shutdown begins. Terminate the managed engine first.
-            engine.shutdown(shutdown_timeout).await?;
-            info!("managed engine shut down gracefully");
-            // Wait for the API server to shut down gracefully by draining in-flight
-            // requests.
-            if !matches!(shutdown_reason, ShutdownReason::Server(_)) {
-                serve_task.await.context("serve task join failed")??;
+            // Let the API/OpenEngine servers drain admitted requests while the
+            // Python engine is still available. Bound this independently so a
+            // stuck server cannot prevent process cleanup forever.
+            let server_shutdown = if matches!(shutdown_reason, ShutdownReason::Server(_)) {
+                Ok(())
+            } else {
+                let timeout = shutdown_timeout.saturating_add(SERVER_SHUTDOWN_GRACE);
+                match tokio::time::timeout(timeout, &mut serve_task).await {
+                    Ok(result) => {
+                        result.context("serve task join failed").and_then(|result| result)
+                    }
+                    Err(_) => {
+                        warn!(?timeout, "API server drain timed out; aborting serve task");
+                        serve_task.abort();
+                        let _ = serve_task.await;
+                        Err(anyhow!("API server drain timed out after {timeout:?}"))
+                    }
+                }
+            };
+
+            // Engine teardown must run even when server drain fails or times out.
+            let engine_shutdown = engine.shutdown(shutdown_timeout).await;
+            if engine_shutdown.is_ok() {
+                info!("managed engine shut down gracefully");
             }
+            engine_shutdown.context("failed to shut down managed engine")?;
+            server_shutdown?;
 
             match shutdown_reason {
                 ShutdownReason::Signal => Ok(()),

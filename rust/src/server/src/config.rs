@@ -222,6 +222,15 @@ pub struct Config {
 }
 
 impl Config {
+    /// Tokenizer loader mode used by the Rust frontend.
+    ///
+    /// `renderer` selects chat rendering only. The tokenizer itself is loaded
+    /// through the automatic Hugging Face-compatible path until a separate
+    /// loader-mode option is introduced.
+    pub fn tokenizer_loader_mode(&self) -> &'static str {
+        "auto"
+    }
+
     /// Validate frontend configuration that can be checked before engine
     /// startup.
     pub fn validate(&self) -> Result<()> {

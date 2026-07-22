@@ -396,6 +396,25 @@ fn serve_args_accept_explicit_deepseek_v32_renderer() {
 }
 
 #[test]
+fn explicit_hf_renderer_does_not_change_tokenizer_loader_discovery() {
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "Qwen/Qwen3-0.6B",
+        "--tokenizer-mode",
+        "hf",
+    ])
+    .unwrap();
+
+    let Command::Serve(args) = cli.command else {
+        panic!("expected serve args");
+    };
+    let config = args.to_frontend_config("tcp://127.0.0.1:62100".to_string());
+    assert_eq!(config.renderer, RendererSelection::Hf);
+    assert_eq!(config.tokenizer_loader_mode(), "auto");
+}
+
+#[test]
 fn serve_passes_enable_request_id_headers_into_config() {
     let cli = Cli::try_parse_from([
         "vllm-rs",

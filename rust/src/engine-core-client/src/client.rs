@@ -195,6 +195,17 @@ pub(crate) struct AbortRequest {
     cause: AbortCause,
 }
 
+/// Latest frontend/scheduler load observed for one engine rank.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EngineLoad {
+    pub engine_index: u32,
+    pub running_requests: u64,
+    pub queued_requests: u64,
+    pub frontend_inflight: u64,
+    pub kv_cache_usage: Option<f64>,
+    pub update_generation: u64,
+}
+
 /// Default ZMQ-based implementation that talks directly to a Python
 /// `EngineCoreProc`.
 pub struct EngineCoreClient {
@@ -392,6 +403,11 @@ impl EngineCoreClient {
     /// socket.
     pub fn ready_responses(&self) -> Vec<&EngineCoreReadyResponse> {
         self.engines.iter().map(|engine| &engine.ready_response).collect()
+    }
+
+    /// Return the latest scheduler load for every connected engine rank.
+    pub fn engine_loads(&self) -> Vec<EngineLoad> {
+        self.inner.engine_loads()
     }
 
     /// Return the engine-reported effective model dtype.
