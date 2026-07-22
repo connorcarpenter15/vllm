@@ -92,6 +92,22 @@ logger = init_logger(__name__)
 
 HANDSHAKE_TIMEOUT_MINS = 5
 
+_MAIN_ATTENTION_KV_CACHE_KINDS = frozenset(
+    ("full_attention", "mla_attention", "sink_full_attention")
+)
+
+
+def select_kv_event_block_size(
+    group_metadata: list[dict[str, int | str | None]], fallback_block_size: int
+) -> int:
+    """Return the block granularity emitted by the main attention cache."""
+    for group in group_metadata:
+        if group.get("kind") in _MAIN_ATTENTION_KV_CACHE_KINDS:
+            block_size = group.get("block_size")
+            return int(block_size) if block_size else fallback_block_size
+    return fallback_block_size
+
+
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
@@ -427,6 +443,12 @@ class EngineCore:
                 }
             )
         return metadata
+
+    def _kv_event_block_size(self) -> int:
+        return select_kv_event_block_size(
+            self.get_kv_cache_group_metadata(),
+            self.vllm_config.cache_config.block_size or 0,
+        )
 
     def add_request(self, request: Request, request_wave: int = 0):
         """Add request to the scheduler.
@@ -1010,6 +1032,7 @@ class EngineCoreProc(EngineCore):
         tensor_queue: Queue | None = None,
         *,
         engine_index: int = 0,
+        logical_data_parallel_size: int | None = None,
     ):
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
         self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
@@ -1018,6 +1041,11 @@ class EngineCoreProc(EngineCore):
         )
 
         self.engine_index = engine_index
+        self.logical_data_parallel_size = (
+            logical_data_parallel_size
+            if logical_data_parallel_size is not None
+            else vllm_config.parallel_config.data_parallel_size
+        )
         identity = self.engine_index.to_bytes(length=2, byteorder="little")
         self.engines_running = False
         self.shutdown_state = EngineShutdownState.RUNNING
@@ -1261,6 +1289,7 @@ class EngineCoreProc(EngineCore):
         try:
             vllm_config: VllmConfig = kwargs["vllm_config"]
             parallel_config: ParallelConfig = vllm_config.parallel_config
+            logical_data_parallel_size = parallel_config.data_parallel_size
             data_parallel = parallel_config.data_parallel_size > 1 or dp_rank > 0
             if data_parallel:
                 parallel_config.data_parallel_rank_local = local_dp_rank
@@ -1296,7 +1325,12 @@ class EngineCoreProc(EngineCore):
                 parallel_config.data_parallel_size = 1
                 parallel_config.data_parallel_size_local = 1
                 parallel_config.data_parallel_rank = 0
-                engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+                engine_core = EngineCoreProc(
+                    *args,
+                    engine_index=dp_rank,
+                    logical_data_parallel_size=logical_data_parallel_size,
+                    **kwargs,
+                )
 
             assert engine_core is not None
 
@@ -1621,20 +1655,59 @@ class EngineCoreProc(EngineCore):
 
             # Register sockets with poller.
             poller = zmq.Poller()
+            parallel_config = self.vllm_config.parallel_config
+            scheduler_config = self.vllm_config.scheduler_config
+            kv_transfer_config = self.vllm_config.kv_transfer_config
+            kv_events_config = self.vllm_config.kv_events_config
             ready_response = EngineCoreReadyResponse(
                 max_model_len=self.vllm_config.model_config.max_model_len,
                 num_gpu_blocks=self.vllm_config.cache_config.num_gpu_blocks or 0,
-                block_size=self.vllm_config.cache_config.block_size,
+                block_size=self._kv_event_block_size(),
                 dp_stats_address=self.frontend_stats_publish_address,
                 dtype=str(self.vllm_config.model_config.dtype).removeprefix("torch."),
                 vllm_version=VLLM_VERSION,
                 world_size=self.vllm_config.parallel_config.world_size,
-                data_parallel_size=self.vllm_config.parallel_config.data_parallel_size,
+                data_parallel_size=self.logical_data_parallel_size,
                 kv_cache_size_tokens=(
                     self.vllm_config.cache_config.kv_cache_size_tokens
                 ),
                 kv_cache_max_concurrency=(
                     self.vllm_config.cache_config.kv_cache_max_concurrency
+                ),
+                tensor_parallel_size=parallel_config.tensor_parallel_size,
+                pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+                data_parallel_rank=self.engine_index,
+                max_num_seqs=scheduler_config.max_num_seqs,
+                max_num_batched_tokens=scheduler_config.max_num_batched_tokens,
+                kv_connector=(
+                    kv_transfer_config.kv_connector if kv_transfer_config else None
+                ),
+                kv_role=(kv_transfer_config.kv_role if kv_transfer_config else None),
+                kv_engine_id=(
+                    kv_transfer_config.engine_id if kv_transfer_config else None
+                ),
+                kv_events_publisher=(
+                    kv_events_config.publisher if kv_events_config else None
+                ),
+                kv_events_endpoint=(
+                    kv_events_config.endpoint if kv_events_config else None
+                ),
+                kv_events_replay_endpoint=(
+                    kv_events_config.replay_endpoint if kv_events_config else None
+                ),
+                kv_events_topic=(kv_events_config.topic if kv_events_config else None),
+                kv_events_buffer_steps=(
+                    kv_events_config.buffer_steps if kv_events_config else 0
+                ),
+                kv_events_hwm=(kv_events_config.hwm if kv_events_config else 0),
+                kv_events_max_queue_size=(
+                    kv_events_config.max_queue_size if kv_events_config else 0
+                ),
+                supports_lora=self.vllm_config.lora_config is not None,
+                max_loras=(
+                    self.vllm_config.lora_config.max_loras
+                    if self.vllm_config.lora_config is not None
+                    else 0
                 ),
             )
             ready_payload = msgspec.msgpack.encode(ready_response)

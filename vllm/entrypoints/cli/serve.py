@@ -149,6 +149,15 @@ class ServeSubcommand(CLISubcommand):
 
     def validate(self, args: argparse.Namespace) -> None:
         validate_parsed_serve_args(args)
+        if args.openengine_port is not None and getattr(args, "grpc", False):
+            raise ValueError(
+                "--openengine-port cannot be combined with dedicated --grpc mode"
+            )
+        if args.openengine_port is not None and not envs.VLLM_RUST_FRONTEND_PATH:
+            raise ValueError(
+                "--openengine-port requires the Rust frontend; set "
+                "VLLM_USE_RUST_FRONTEND=1"
+            )
 
     def subparser_init(
         self, subparsers: argparse._SubParsersAction
