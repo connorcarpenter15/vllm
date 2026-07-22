@@ -467,7 +467,11 @@ pub(super) fn event_to_responses(
             finished,
         } => {
             let mut responses = Vec::with_capacity(2);
-            if !delta.is_empty() || !token_ids.is_empty() {
+            // A prefill request generates one token only to finalize the KV
+            // handoff. That internal token must not escape on the prefill-only
+            // OpenEngine stream; the decode request produces the user-visible
+            // output after importing the transferred prompt KV.
+            if role != pb::EngineRole::Prefill && (!delta.is_empty() || !token_ids.is_empty()) {
                 responses.push(pb::GenerateResponse {
                     request_id: request_id.to_string(),
                     event: Some(pb::generate_response::Event::Token(pb::TokenOutput {
@@ -805,5 +809,38 @@ mod tests {
             value.kind,
             Some(Kind::StringValue("9007199254740993".to_string()))
         );
+    }
+
+    #[test]
+    fn prefill_handoff_suppresses_internal_generated_token() {
+        let finished = Finished {
+            usage: vllm_llm::TokenUsage {
+                prompt_token_count: 4,
+                output_token_count: 1,
+                cached_token_count: 0,
+            },
+            finish_reason: FinishReason::Length,
+            kv_transfer_params: Some(serde_json::json!({
+                "remote_engine_id": "prefill",
+            })),
+            ec_transfer_params: None,
+        };
+        let responses = event_to_responses(
+            DecodedTextEvent::TextDelta {
+                delta: " internal".to_string(),
+                token_ids: vec![42],
+                logprobs: None,
+                finished: Some(finished),
+            },
+            "request",
+            pb::EngineRole::Prefill,
+            0,
+        );
+
+        assert_eq!(responses.len(), 1);
+        assert!(matches!(
+            responses[0].event,
+            Some(pb::generate_response::Event::PrefillReady(_))
+        ));
     }
 }
