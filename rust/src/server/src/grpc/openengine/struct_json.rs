@@ -15,6 +15,20 @@ pub(super) fn prost_struct_to_json(value: &prost_types::Struct) -> serde_json::V
     )
 }
 
+/// Restore exact integral protobuf numbers before handing engine-owned data
+/// back to vLLM. `google.protobuf.Struct` represents every number as a double,
+/// but NIXL requires block IDs, ports, ranks, and token counts to remain JSON
+/// integers. Decimal strings used for integers larger than 53 bits stay opaque.
+pub(super) fn prost_handoff_struct_to_json(value: &prost_types::Struct) -> serde_json::Value {
+    serde_json::Value::Object(
+        value
+            .fields
+            .iter()
+            .map(|(key, value)| (key.clone(), prost_handoff_value_to_json(value)))
+            .collect(),
+    )
+}
+
 fn prost_value_to_json(value: &prost_types::Value) -> serde_json::Value {
     use prost_types::value::Kind;
     match value.kind.as_ref() {
@@ -26,6 +40,28 @@ fn prost_value_to_json(value: &prost_types::Value) -> serde_json::Value {
             serde_json::Value::Array(value.values.iter().map(prost_value_to_json).collect())
         }
         Some(Kind::StructValue(value)) => prost_struct_to_json(value),
+    }
+}
+
+fn prost_handoff_value_to_json(value: &prost_types::Value) -> serde_json::Value {
+    use prost_types::value::Kind;
+    match value.kind.as_ref() {
+        Some(Kind::NumberValue(value))
+            if value.is_finite()
+                && value.fract() == 0.0
+                && value.abs() <= MAX_EXACT_JSON_INTEGER as f64 =>
+        {
+            if *value >= 0.0 {
+                serde_json::Value::Number(serde_json::Number::from(*value as u64))
+            } else {
+                serde_json::Value::Number(serde_json::Number::from(*value as i64))
+            }
+        }
+        Some(Kind::ListValue(value)) => {
+            serde_json::Value::Array(value.values.iter().map(prost_handoff_value_to_json).collect())
+        }
+        Some(Kind::StructValue(value)) => prost_handoff_struct_to_json(value),
+        _ => prost_value_to_json(value),
     }
 }
 
@@ -83,6 +119,26 @@ mod tests {
         assert_eq!(
             decoded,
             serde_json::json!({"small": 42.0, "large": "9007199254740993"})
+        );
+    }
+
+    #[test]
+    fn handoff_json_restores_exact_integral_numbers() {
+        let input = serde_json::json!({
+            "remote_block_ids": [[1, 2]],
+            "remote_port": 14579,
+            "remote_blocks_expiry_time": 12.5,
+            "large": 9_007_199_254_740_993_u64,
+        });
+        let encoded = json_to_prost_struct(&input).unwrap();
+        assert_eq!(
+            prost_handoff_struct_to_json(&encoded),
+            serde_json::json!({
+                "remote_block_ids": [[1, 2]],
+                "remote_port": 14579,
+                "remote_blocks_expiry_time": 12.5,
+                "large": "9007199254740993",
+            })
         );
     }
 }

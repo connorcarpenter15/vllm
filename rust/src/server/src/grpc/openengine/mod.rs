@@ -52,13 +52,25 @@ impl OpenEngineService {
             !ready.is_empty(),
             "OpenEngine requires at least one engine rank"
         );
-        let role = convert::role_from_kv_role(ready[0].kv_role.as_deref());
-        anyhow::ensure!(
-            ready
-                .iter()
-                .all(|response| convert::role_from_kv_role(response.kv_role.as_deref()) == role),
-            "OpenEngine requires a uniform KV role across local engine ranks"
-        );
+        let role = convert::role_from_kv_role(ready[0].kv_role.as_deref()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "vLLM OpenEngine does not support KV role `{}`",
+                ready[0].kv_role.as_deref().unwrap_or_default()
+            )
+        })?;
+        for response in ready.iter().skip(1) {
+            let rank_role =
+                convert::role_from_kv_role(response.kv_role.as_deref()).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "vLLM OpenEngine does not support KV role `{}`",
+                        response.kv_role.as_deref().unwrap_or_default()
+                    )
+                })?;
+            anyhow::ensure!(
+                rank_role == role,
+                "OpenEngine requires a uniform KV role across local engine ranks"
+            );
+        }
         anyhow::ensure!(
             ready
                 .iter()
@@ -284,7 +296,10 @@ impl pb::control_server::Control for OpenEngineService {
             engine_version: first.vllm_version.clone(),
             engine_role: self.role as i32,
             instance_id: self.instance_id.clone(),
-            supported_models: self.state.served_model_names().to_vec(),
+            // This process hosts one canonical model. Public names beyond the
+            // primary served name are aliases reported by ModelInfo, not
+            // additional models that require explicit sidecar selection.
+            supported_models: vec![self.state.chat.model_id().to_string()],
             parallelism: Some(pb::ParallelismInfo {
                 tensor_parallel_size: Some(first.tensor_parallel_size),
                 pipeline_parallel_size: Some(first.pipeline_parallel_size),

@@ -186,9 +186,19 @@ impl RequestRegistry {
     }
 
     /// Filter the given request IDs to the subset that are still tracked as
-    /// active and can be aborted, grouped by engine.
+    /// active and can be aborted, grouped by engine. An empty list selects all
+    /// active requests.
     pub fn abortable_request_ids(&self, request_ids: &[String]) -> BTreeMap<EngineId, Vec<String>> {
         let mut by_engine = BTreeMap::new();
+        if request_ids.is_empty() {
+            for (request_id, tracked) in &self.requests {
+                by_engine
+                    .entry(tracked.engine_id.clone())
+                    .or_insert_with(Vec::new)
+                    .push(request_id.clone());
+            }
+            return by_engine;
+        }
         for request_id in request_ids {
             let Some(tracked) = self.requests.get(request_id.as_str()) else {
                 continue;
@@ -706,6 +716,14 @@ mod tests {
             &vec!["req-1".to_string(), "req-3".to_string()]
         );
         assert_eq!(grouped.get(&engine_1).unwrap(), &vec!["req-2".to_string()]);
+
+        let mut all = registry.abortable_request_ids(&[]);
+        all.values_mut().for_each(|ids| ids.sort());
+        assert_eq!(
+            all.get(&engine_0).unwrap(),
+            &vec!["req-1".to_string(), "req-3".to_string()]
+        );
+        assert_eq!(all.get(&engine_1).unwrap(), &vec!["req-2".to_string()]);
     }
 
     #[test]

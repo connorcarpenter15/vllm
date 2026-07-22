@@ -13,18 +13,21 @@ use vllm_text::{
     SamplingParams, TextDecodeOptions, TextRequest,
 };
 
-use super::struct_json::{json_to_prost_struct, prost_struct_to_json};
+use super::struct_json::{
+    json_to_prost_struct, prost_handoff_struct_to_json, prost_struct_to_json,
+};
 
 pub(super) const HANDOFF_PROFILE: &str = "vllm.kv_transfer_params.v1";
 pub(super) const TRANSFER_BACKEND: &str = "nixl";
 const TARGET_DP_RANK: &str = "openengine-target-dp-rank";
 const PRIORITY: &str = "openengine-priority";
 
-pub(super) fn role_from_kv_role(kv_role: Option<&str>) -> pb::EngineRole {
+pub(super) fn role_from_kv_role(kv_role: Option<&str>) -> Option<pb::EngineRole> {
     match kv_role {
-        Some("kv_producer") => pb::EngineRole::Prefill,
-        Some("kv_consumer") => pb::EngineRole::Decode,
-        _ => pb::EngineRole::Aggregated,
+        Some("kv_producer") => Some(pb::EngineRole::Prefill),
+        Some("kv_consumer") => Some(pb::EngineRole::Decode),
+        None => Some(pb::EngineRole::Aggregated),
+        Some(_) => None,
     }
 }
 
@@ -92,10 +95,9 @@ pub(super) async fn to_text_request(
     let mm_features = if request.media.is_empty() {
         None
     } else {
+        tokenize_multimodal_prompt(&mut prompt, state.chat.text().tokenizer().as_ref())?;
         let Prompt::TokenIds(token_ids) = &mut prompt else {
-            return Err(Status::invalid_argument(
-                "multimodal OpenEngine requests require pre-tokenized input",
-            ));
+            unreachable!("multimodal text prompts are tokenized above");
         };
         let parts = media_parts(&request.media)?;
         state
@@ -132,7 +134,7 @@ pub(super) async fn to_text_request(
                 .expect("validated decode request has transfer attributes");
             sampling_params.vllm_xargs.get_or_insert_with(Default::default).insert(
                 "kv_transfer_params".to_string(),
-                prost_struct_to_json(attributes),
+                prost_handoff_struct_to_json(attributes),
             );
         }
         _ => {}
@@ -178,6 +180,19 @@ pub(super) async fn to_text_request(
         lora_request: None,
         arrival_time: None,
     })
+}
+
+fn tokenize_multimodal_prompt(
+    prompt: &mut Prompt,
+    tokenizer: &dyn vllm_text::tokenizer::Tokenizer,
+) -> Result<(), Status> {
+    if let Prompt::Text(text) = prompt {
+        let token_ids = tokenizer.encode(text, true).map_err(|error| {
+            Status::invalid_argument(format!("failed to tokenize multimodal prompt: {error}"))
+        })?;
+        *prompt = Prompt::TokenIds(token_ids);
+    }
+    Ok(())
 }
 
 fn validate_model(model: &str, canonical: &str, served: &[String]) -> Result<(), Status> {
@@ -664,6 +679,7 @@ pub(super) fn engine_error(
 mod tests {
     use prost_types::value::Kind;
     use tonic::metadata::MetadataValue;
+    use vllm_tokenizer::test_utils::TestTokenizer;
 
     use super::*;
 
@@ -717,6 +733,30 @@ mod tests {
             MetadataValue::try_from("2").expect("valid metadata"),
         );
         assert_eq!(metadata_options(&request).unwrap(), (Some(2), -7));
+    }
+
+    #[test]
+    fn multimodal_text_prompt_uses_shared_frontend_tokenizer() {
+        let mut prompt = Prompt::Text("image prompt".to_string());
+        tokenize_multimodal_prompt(&mut prompt, &TestTokenizer::new()).unwrap();
+        let Prompt::TokenIds(token_ids) = prompt else {
+            panic!("multimodal prompt was not tokenized");
+        };
+        assert!(!token_ids.is_empty());
+    }
+
+    #[test]
+    fn unsupported_kv_role_is_not_advertised_as_aggregate() {
+        assert_eq!(role_from_kv_role(None), Some(pb::EngineRole::Aggregated));
+        assert_eq!(
+            role_from_kv_role(Some("kv_producer")),
+            Some(pb::EngineRole::Prefill)
+        );
+        assert_eq!(
+            role_from_kv_role(Some("kv_consumer")),
+            Some(pb::EngineRole::Decode)
+        );
+        assert_eq!(role_from_kv_role(Some("kv_both")), None);
     }
 
     #[test]
