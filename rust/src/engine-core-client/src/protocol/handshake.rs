@@ -24,6 +24,19 @@ pub struct ReadyMessage {
     pub parallel_config_hash: Option<String>,
 }
 
+/// KV-event publisher configuration reported by EngineCore.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KvEventsConfig {
+    pub enable_kv_cache_events: bool,
+    pub publisher: String,
+    pub endpoint: String,
+    pub replay_endpoint: Option<String>,
+    pub buffer_steps: u32,
+    pub hwm: u32,
+    pub max_queue_size: u32,
+    pub topic: String,
+}
+
 /// Post-initialization configuration sent from each engine on the input socket
 /// registration message, after the handshake completes.
 ///
@@ -71,27 +84,9 @@ pub struct EngineCoreReadyResponse {
     pub kv_cache_size_tokens: Option<u64>,
     /// Maximum achievable request concurrency given the KV cache, if reported.
     pub kv_cache_max_concurrency: Option<f64>,
-    /// KV-event publisher backend, if configured.
+    /// KV-event publisher configuration, if configured.
     #[serde(default)]
-    pub kv_events_publisher: Option<String>,
-    /// Configured KV-event publish endpoint.
-    #[serde(default)]
-    pub kv_events_endpoint: Option<String>,
-    /// Configured KV-event replay endpoint.
-    #[serde(default)]
-    pub kv_events_replay_endpoint: Option<String>,
-    /// KV-event topic.
-    #[serde(default)]
-    pub kv_events_topic: Option<String>,
-    /// Number of event batches retained for replay.
-    #[serde(default)]
-    pub kv_events_buffer_steps: u32,
-    /// ZMQ publisher high-water mark.
-    #[serde(default)]
-    pub kv_events_hwm: u32,
-    /// Maximum publisher queue size.
-    #[serde(default)]
-    pub kv_events_max_queue_size: u32,
+    pub kv_events_config: Option<KvEventsConfig>,
 }
 
 /// Frontend-owned ZMQ addresses that are sent to the engine during startup

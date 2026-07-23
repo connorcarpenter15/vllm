@@ -122,14 +122,15 @@ pub(super) fn kv_event_source(
     response: &EngineCoreReadyResponse,
     data_parallel_rank: Option<u32>,
 ) -> Option<pb::KvEventSource> {
-    if response.kv_events_publisher.as_deref() != Some("zmq") {
+    let config = response.kv_events_config.as_ref()?;
+    if !config.enable_kv_cache_events || config.publisher != "zmq" {
         return None;
     }
 
     let rank = data_parallel_rank.unwrap_or_default();
-    let endpoint = offset_endpoint_port(response.kv_events_endpoint.as_deref()?, rank);
-    let replay_endpoint = response
-        .kv_events_replay_endpoint
+    let endpoint = offset_endpoint_port(&config.endpoint, rank);
+    let replay_endpoint = config
+        .replay_endpoint
         .as_deref()
         .map(|endpoint| offset_endpoint_port(endpoint, rank))
         .unwrap_or_default();
@@ -137,14 +138,14 @@ pub(super) fn kv_event_source(
     Some(pb::KvEventSource {
         transport: "zmq".to_string(),
         endpoint_addr: Some(kv_endpoint_from_zmq(&endpoint)?),
-        topic: response.kv_events_topic.clone().unwrap_or_default(),
+        topic: config.topic.clone(),
         replay_endpoint,
         data_parallel_rank,
         encoding: "msgpack".to_string(),
         schema_version: 1,
-        buffer_steps: response.kv_events_buffer_steps,
-        hwm: response.kv_events_hwm,
-        max_queue_size: response.kv_events_max_queue_size,
+        buffer_steps: config.buffer_steps,
+        hwm: config.hwm,
+        max_queue_size: config.max_queue_size,
     })
 }
 

@@ -2600,19 +2600,18 @@ fn python_msgpack_fixtures_match_rust_encoding() {
 
     let ready_response: EngineCoreReadyResponse =
         rmp_serde::from_slice(&hex::decode(ready_response_hex).unwrap()).unwrap();
-    assert_eq!(ready_response.kv_events_publisher.as_deref(), Some("zmq"));
+    let kv_events_config = ready_response.kv_events_config.expect("KV events config should decode");
+    assert!(kv_events_config.enable_kv_cache_events);
+    assert_eq!(kv_events_config.publisher, "zmq");
+    assert_eq!(kv_events_config.endpoint, "tcp://127.0.0.1:5557");
     assert_eq!(
-        ready_response.kv_events_endpoint.as_deref(),
-        Some("tcp://127.0.0.1:5557")
-    );
-    assert_eq!(
-        ready_response.kv_events_replay_endpoint.as_deref(),
+        kv_events_config.replay_endpoint.as_deref(),
         Some("tcp://127.0.0.1:5558")
     );
-    assert_eq!(ready_response.kv_events_topic.as_deref(), Some("kv"));
-    assert_eq!(ready_response.kv_events_buffer_steps, 10_000);
-    assert_eq!(ready_response.kv_events_hwm, 100_000);
-    assert_eq!(ready_response.kv_events_max_queue_size, 100_000);
+    assert_eq!(kv_events_config.topic, "kv");
+    assert_eq!(kv_events_config.buffer_steps, 10_000);
+    assert_eq!(kv_events_config.hwm, 100_000);
+    assert_eq!(kv_events_config.max_queue_size, 100_000);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

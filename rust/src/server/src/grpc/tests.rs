@@ -29,6 +29,7 @@ use vllm_engine_core_client::mock_engine::{
     DEFAULT_MOCK_BLOCK_SIZE, DEFAULT_MOCK_MAX_MODEL_LEN, DEFAULT_MOCK_NUM_GPU_BLOCKS,
     default_ready_response,
 };
+use vllm_engine_core_client::protocol::handshake::KvEventsConfig;
 use vllm_engine_core_client::protocol::output::{
     EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
 };
@@ -1295,17 +1296,22 @@ async fn control_aggregates_multi_engine_capacity() {
 #[test]
 fn kv_event_source_filters_and_maps_zmq_publisher() {
     let mut ready = default_ready_response();
-    ready.kv_events_publisher = Some("null".to_string());
-    ready.kv_events_endpoint = Some("tcp://*:5557".to_string());
-    ready.kv_events_replay_endpoint = Some("tcp://127.0.0.1:5558".to_string());
-    ready.kv_events_topic = Some("kv".to_string());
-    ready.kv_events_buffer_steps = 10_000;
-    ready.kv_events_hwm = 100_000;
-    ready.kv_events_max_queue_size = 100_000;
+    ready.kv_events_config = Some(KvEventsConfig {
+        enable_kv_cache_events: false,
+        publisher: "null".to_string(),
+        endpoint: "tcp://*:5557".to_string(),
+        replay_endpoint: Some("tcp://127.0.0.1:5558".to_string()),
+        buffer_steps: 10_000,
+        hwm: 100_000,
+        max_queue_size: 100_000,
+        topic: "kv".to_string(),
+    });
 
     assert!(kv_event_source(&ready, Some(2)).is_none());
 
-    ready.kv_events_publisher = Some("zmq".to_string());
+    let config = ready.kv_events_config.as_mut().unwrap();
+    config.enable_kv_cache_events = true;
+    config.publisher = "zmq".to_string();
     let source = kv_event_source(&ready, Some(2)).expect("configured ZMQ event source");
     assert_eq!(source.transport, "zmq");
     assert_eq!(source.topic, "kv");

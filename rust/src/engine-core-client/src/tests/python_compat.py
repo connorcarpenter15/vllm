@@ -354,6 +354,18 @@ multipart_prompt_logprobs = engine_outputs_wire(
 
 
 @dataclass
+class KVEventsConfig:
+    enable_kv_cache_events: bool
+    publisher: str
+    endpoint: str
+    replay_endpoint: str | None
+    buffer_steps: int
+    hwm: int
+    max_queue_size: int
+    topic: str
+
+
+@dataclass
 class EngineCoreReadyResponse:
     max_model_len: int
     num_gpu_blocks: int
@@ -372,13 +384,7 @@ class EngineCoreReadyResponse:
     instance_id: str
     kv_cache_size_tokens: int | None = None
     kv_cache_max_concurrency: float | None = None
-    kv_events_publisher: str | None = None
-    kv_events_endpoint: str | None = None
-    kv_events_replay_endpoint: str | None = None
-    kv_events_topic: str | None = None
-    kv_events_buffer_steps: int = 0
-    kv_events_hwm: int = 0
-    kv_events_max_queue_size: int = 0
+    kv_events_config: KVEventsConfig | None = None
 
 
 ready_response = EngineCoreReadyResponse(
@@ -397,13 +403,16 @@ ready_response = EngineCoreReadyResponse(
     max_num_seqs=256,
     max_num_batched_tokens=8192,
     instance_id="test-instance",
-    kv_events_publisher="zmq",
-    kv_events_endpoint="tcp://127.0.0.1:5557",
-    kv_events_replay_endpoint="tcp://127.0.0.1:5558",
-    kv_events_topic="kv",
-    kv_events_buffer_steps=10_000,
-    kv_events_hwm=100_000,
-    kv_events_max_queue_size=100_000,
+    kv_events_config=KVEventsConfig(
+        enable_kv_cache_events=True,
+        publisher="zmq",
+        endpoint="tcp://127.0.0.1:5557",
+        replay_endpoint="tcp://127.0.0.1:5558",
+        buffer_steps=10_000,
+        hwm=100_000,
+        max_queue_size=100_000,
+        topic="kv",
+    ),
 )
 
 print(msgspec.msgpack.encode(request).hex())
