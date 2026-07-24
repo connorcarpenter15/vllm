@@ -127,19 +127,11 @@ pub(super) fn kv_event_source(
         return None;
     }
 
-    let rank = data_parallel_rank.unwrap_or_default();
-    let endpoint = offset_endpoint_port(&config.endpoint, rank);
-    let replay_endpoint = config
-        .replay_endpoint
-        .as_deref()
-        .map(|endpoint| offset_endpoint_port(endpoint, rank))
-        .unwrap_or_default();
-
     Some(pb::KvEventSource {
         transport: "zmq".to_string(),
-        endpoint_addr: Some(kv_endpoint_from_zmq(&endpoint)?),
+        endpoint_addr: Some(kv_endpoint_from_zmq(&config.endpoint)?),
         topic: config.topic.clone(),
-        replay_endpoint,
+        replay_endpoint: config.replay_endpoint.clone().unwrap_or_default(),
         data_parallel_rank,
         encoding: "msgpack".to_string(),
         schema_version: 1,
@@ -149,28 +141,13 @@ pub(super) fn kv_event_source(
     })
 }
 
-fn offset_endpoint_port(endpoint: &str, data_parallel_rank: u32) -> String {
-    if data_parallel_rank == 0 || endpoint.is_empty() {
-        return endpoint.to_string();
-    }
-    if endpoint.contains("inproc") {
-        return format!("{endpoint}_dp{data_parallel_rank}");
-    }
-    if endpoint.contains("tcp")
-        && let Some((base_addr, port)) = endpoint.rsplit_once(':')
-        && let Ok(base_port) = port.parse::<u32>()
-    {
-        return format!("{base_addr}:{}", base_port + data_parallel_rank);
-    }
-    endpoint.to_string()
-}
-
 fn kv_endpoint_from_zmq(endpoint: &str) -> Option<pb::KvEventEndpoint> {
     let rest = endpoint.strip_prefix("tcp://").unwrap_or(endpoint);
     let (host, port) = rest.rsplit_once(':')?;
     let port = port.parse().ok()?;
-    let host = match host.trim_matches(|character| character == '[' || character == ']') {
-        "*" | "0.0.0.0" | "::" | "" => advertise_host(),
+    let host = host.trim_matches(|character| character == '[' || character == ']');
+    let host = match host {
+        "*" | "0.0.0.0" | "::" | "" => String::new(),
         concrete => concrete.to_string(),
     };
     Some(pb::KvEventEndpoint {
@@ -178,13 +155,4 @@ fn kv_endpoint_from_zmq(endpoint: &str) -> Option<pb::KvEventEndpoint> {
         port,
         protocol: "tcp".to_string(),
     })
-}
-
-fn advertise_host() -> String {
-    std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|socket| {
-            socket.connect("10.255.255.255:1")?;
-            Ok(socket.local_addr()?.ip().to_string())
-        })
-        .unwrap_or_else(|_| "127.0.0.1".to_string())
 }

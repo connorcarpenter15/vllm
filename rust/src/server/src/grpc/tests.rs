@@ -1299,8 +1299,8 @@ fn kv_event_source_filters_and_maps_zmq_publisher() {
     ready.kv_events_config = Some(KvEventsConfig {
         enable_kv_cache_events: false,
         publisher: "null".to_string(),
-        endpoint: "tcp://*:5557".to_string(),
-        replay_endpoint: Some("tcp://127.0.0.1:5558".to_string()),
+        endpoint: "tcp://*:5559".to_string(),
+        replay_endpoint: Some("tcp://*:5560".to_string()),
         buffer_steps: 10_000,
         hwm: 100_000,
         max_queue_size: 100_000,
@@ -1315,7 +1315,7 @@ fn kv_event_source_filters_and_maps_zmq_publisher() {
     let source = kv_event_source(&ready, Some(2)).expect("configured ZMQ event source");
     assert_eq!(source.transport, "zmq");
     assert_eq!(source.topic, "kv");
-    assert_eq!(source.replay_endpoint, "tcp://127.0.0.1:5560");
+    assert_eq!(source.replay_endpoint, "tcp://*:5560");
     assert_eq!(source.data_parallel_rank, Some(2));
     assert_eq!(source.encoding, "msgpack");
     assert_eq!(source.schema_version, 1);
@@ -1324,14 +1324,14 @@ fn kv_event_source_filters_and_maps_zmq_publisher() {
     assert_eq!(source.max_queue_size, 100_000);
 
     let endpoint = source.endpoint_addr.expect("event endpoint");
-    assert!(!["", "*", "0.0.0.0", "::"].contains(&endpoint.host.as_str()));
+    assert!(endpoint.host.is_empty());
     assert_eq!(endpoint.port, 5559);
     assert_eq!(endpoint.protocol, "tcp");
 
     let source = kv_event_source(&ready, None).expect("unindexed ZMQ event source");
     assert_eq!(source.data_parallel_rank, None);
-    assert_eq!(source.endpoint_addr.expect("event endpoint").port, 5557);
-    assert_eq!(source.replay_endpoint, "tcp://127.0.0.1:5558");
+    assert_eq!(source.endpoint_addr.expect("event endpoint").port, 5559);
+    assert_eq!(source.replay_endpoint, "tcp://*:5560");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
