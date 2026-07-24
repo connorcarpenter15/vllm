@@ -442,6 +442,7 @@ async fn discovery_reports_prefill_profile_tokenizer_aliases_and_kv_source() {
         .expect("server info")
         .into_inner();
     assert_eq!(server.schema_revision, 3);
+    assert_eq!(server.schema_release, super::SCHEMA_RELEASE);
     assert_eq!(server.engine_role, pb::EngineRole::Prefill as i32);
     assert_eq!(server.supported_models, vec!["canonical/test-model"]);
     let connector = server.kv_connector.expect("connector discovery");

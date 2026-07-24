@@ -36,7 +36,7 @@ use crate::state::AppState;
 pub(crate) use pb::control_server::ControlServer;
 pub(crate) use pb::inference_server::InferenceServer;
 
-const SCHEMA_RELEASE: &str = "b0cf2a4826d246192dc65b055dab6d2b38d2d67e";
+const SCHEMA_RELEASE: &str = "a66ff6f73a65e262a7c3edd5ea6fd0d8701d402f";
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const INFERENCE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -555,7 +555,6 @@ impl pb::control_server::Control for OpenEngineService {
                 .tool_call_parser_name()
                 .unwrap_or_default()
                 .to_string(),
-            tasks: Some(pb::TaskCapabilities::default()),
             extra: None,
             multimodal_capabilities: Some(pb::MultimodalCapabilities {
                 aggregate_modalities,
@@ -933,13 +932,6 @@ impl pb::control_server::Control for OpenEngineService {
         }))
     }
 
-    async fn get_kv_connector_info(
-        &self,
-        _request: Request<pb::GetKvConnectorInfoRequest>,
-    ) -> Result<Response<pb::KvConnectorInfo>, Status> {
-        Ok(Response::new(self.kv_connector_info()))
-    }
-
     async fn get_kv_event_sources(
         &self,
         request: Request<pb::GetKvEventSourcesRequest>,
@@ -1060,8 +1052,6 @@ fn drain_error(message: String) -> pb::DrainResponse {
             code: pb::ErrorCode::Internal as i32,
             message,
             retryable: false,
-            retry_after_ms: None,
-            details: None,
         })),
         in_flight_requests: None,
         open_kv_sessions: None,

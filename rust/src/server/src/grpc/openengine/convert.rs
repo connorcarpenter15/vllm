@@ -672,8 +672,6 @@ pub(super) fn engine_error(
             code: code as i32,
             message,
             retryable: false,
-            retry_after_ms: None,
-            details: None,
         })),
         usage,
     }
