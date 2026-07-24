@@ -6,6 +6,7 @@
 
 use tonic::Status;
 use uuid::Uuid;
+use vllm_chat::MediaContentPart;
 use vllm_engine_core_client::protocol::output::StopReason;
 use vllm_engine_core_client::protocol::structured_outputs::StructuredOutputsParams;
 use vllm_text::{
@@ -14,6 +15,42 @@ use vllm_text::{
 };
 
 use super::pb;
+
+pub fn media_parts_from_request(media: &[pb::MediaItem]) -> Result<Vec<MediaContentPart>, Status> {
+    let mut parts = Vec::with_capacity(media.len());
+    for item in media {
+        let modality = pb::Modality::try_from(item.modality).map_err(|_| {
+            Status::invalid_argument(format!("unknown media modality {}", item.modality))
+        })?;
+        match modality {
+            pb::Modality::Image | pb::Modality::Unspecified => {}
+            other => {
+                return Err(Status::unimplemented(format!(
+                    "media modality {other:?} is not supported by the gRPC service"
+                )));
+            }
+        }
+        let uuid = (!item.uuid.is_empty()).then(|| item.uuid.clone());
+        let part = match item.source.as_ref() {
+            Some(pb::media_item::Source::Url(url)) | Some(pb::media_item::Source::DataUri(url)) => {
+                MediaContentPart::ImageUrl {
+                    url: url.clone(),
+                    detail: None,
+                    uuid,
+                }
+            }
+            Some(pb::media_item::Source::RawBytes(bytes)) => MediaContentPart::ImageData {
+                data: bytes.clone(),
+                mime_type: (!item.mime_type.is_empty()).then(|| item.mime_type.clone()),
+                uuid,
+                detail: None,
+            },
+            None => return Err(Status::invalid_argument("media item has no source")),
+        };
+        parts.push(part);
+    }
+    Ok(parts)
+}
 
 // ========================================================================================
 // Request conversion
@@ -499,11 +536,15 @@ impl ResponseOpts {
 
 #[cfg(test)]
 mod tests {
+    use vllm_chat::MediaContentPart;
     use vllm_engine_core_client::protocol::output::StopReason;
     use vllm_text::{FinishReason, Finished, Prompt};
 
     use super::pb::finish_info::{FinishReason as PbFinishReason, StopReason as PbStopReason};
-    use super::{ResponseOpts, pb, to_finish_info, to_sequence_output, to_text_request};
+    use super::{
+        ResponseOpts, media_parts_from_request, pb, to_finish_info, to_sequence_output,
+        to_text_request,
+    };
 
     fn base_request() -> pb::GenerateRequest {
         pb::GenerateRequest {
@@ -512,6 +553,65 @@ mod tests {
             prompt: Some(pb::generate_request::Prompt::Text("hi".to_string())),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn image_media_preserves_wire_source_metadata() {
+        let parts = media_parts_from_request(&[
+            pb::MediaItem {
+                modality: pb::Modality::Image as i32,
+                source: Some(pb::media_item::Source::Url(
+                    "https://example.test/image.png".to_string(),
+                )),
+                uuid: "url-image".to_string(),
+                ..Default::default()
+            },
+            pb::MediaItem {
+                modality: pb::Modality::Image as i32,
+                source: Some(pb::media_item::Source::RawBytes(vec![1, 2, 3])),
+                mime_type: "image/png".to_string(),
+                uuid: "raw-image".to_string(),
+            },
+        ])
+        .expect("convert image media");
+
+        assert!(matches!(
+            &parts[0],
+            MediaContentPart::ImageUrl {
+                url,
+                uuid: Some(uuid),
+                ..
+            } if url == "https://example.test/image.png" && uuid == "url-image"
+        ));
+        assert!(matches!(
+            &parts[1],
+            MediaContentPart::ImageData {
+                data,
+                mime_type: Some(mime_type),
+                uuid: Some(uuid),
+                ..
+            } if data == &[1, 2, 3] && mime_type == "image/png" && uuid == "raw-image"
+        ));
+    }
+
+    #[test]
+    fn invalid_media_is_rejected_before_preprocessing() {
+        let missing_source = media_parts_from_request(&[pb::MediaItem {
+            modality: pb::Modality::Image as i32,
+            ..Default::default()
+        }])
+        .expect_err("reject missing source");
+        assert_eq!(missing_source.code(), tonic::Code::InvalidArgument);
+
+        let unsupported_modality = media_parts_from_request(&[pb::MediaItem {
+            modality: pb::Modality::Audio as i32,
+            source: Some(pb::media_item::Source::Url(
+                "https://example.test/audio.wav".to_string(),
+            )),
+            ..Default::default()
+        }])
+        .expect_err("reject unsupported modality");
+        assert_eq!(unsupported_modality.code(), tonic::Code::Unimplemented);
     }
 
     #[test]
