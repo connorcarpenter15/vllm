@@ -1296,6 +1296,7 @@ async fn control_aggregates_multi_engine_capacity() {
 #[test]
 fn kv_event_source_filters_and_maps_zmq_publisher() {
     let mut ready = default_ready_response();
+    ready.data_parallel_rank = 2;
     ready.kv_events_config = Some(KvEventsConfig {
         enable_kv_cache_events: false,
         publisher: "null".to_string(),
@@ -1307,12 +1308,12 @@ fn kv_event_source_filters_and_maps_zmq_publisher() {
         topic: "kv".to_string(),
     });
 
-    assert!(kv_event_source(&ready, Some(2)).is_none());
+    assert!(kv_event_source(&ready).is_none());
 
     let config = ready.kv_events_config.as_mut().unwrap();
     config.enable_kv_cache_events = true;
     config.publisher = "zmq".to_string();
-    let source = kv_event_source(&ready, Some(2)).expect("configured ZMQ event source");
+    let source = kv_event_source(&ready).expect("configured ZMQ event source");
     assert_eq!(source.transport, "zmq");
     assert_eq!(source.topic, "kv");
     assert_eq!(source.replay_endpoint, "tcp://*:5560");
@@ -1327,11 +1328,6 @@ fn kv_event_source_filters_and_maps_zmq_publisher() {
     assert!(endpoint.host.is_empty());
     assert_eq!(endpoint.port, 5559);
     assert_eq!(endpoint.protocol, "tcp");
-
-    let source = kv_event_source(&ready, None).expect("unindexed ZMQ event source");
-    assert_eq!(source.data_parallel_rank, None);
-    assert_eq!(source.endpoint_addr.expect("event endpoint").port, 5559);
-    assert_eq!(source.replay_endpoint, "tcp://*:5560");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

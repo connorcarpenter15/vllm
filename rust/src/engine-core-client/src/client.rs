@@ -406,15 +406,6 @@ impl EngineCoreClient {
             .ready_response
     }
 
-    /// Return each ready response with its engine index, when encoded in the
-    /// engine identity.
-    pub fn indexed_ready_responses(&self) -> Vec<(Option<u32>, &EngineCoreReadyResponse)> {
-        self.engines
-            .iter()
-            .map(|engine| (engine.engine_id.engine_index(), &engine.ready_response))
-            .collect()
-    }
-
     /// Return the engine-reported effective model dtype.
     pub fn model_dtype(&self) -> ModelDtype {
         self.engines

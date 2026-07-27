@@ -109,19 +109,12 @@ impl pb::control_server::Control for ControlServiceImpl {
         _request: Request<pb::GetKvEventSourcesRequest>,
     ) -> Result<Response<pb::GetKvEventSourcesResponse>, Status> {
         let client = self.state.engine_core_client();
-        let sources = client
-            .indexed_ready_responses()
-            .into_iter()
-            .filter_map(|(rank, response)| kv_event_source(response, rank))
-            .collect();
+        let sources = client.ready_responses().into_iter().filter_map(kv_event_source).collect();
         Ok(Response::new(pb::GetKvEventSourcesResponse { sources }))
     }
 }
 
-pub(super) fn kv_event_source(
-    response: &EngineCoreReadyResponse,
-    data_parallel_rank: Option<u32>,
-) -> Option<pb::KvEventSource> {
+pub(super) fn kv_event_source(response: &EngineCoreReadyResponse) -> Option<pb::KvEventSource> {
     let config = response.kv_events_config.as_ref()?;
     if !config.enable_kv_cache_events || config.publisher != "zmq" {
         return None;
@@ -132,7 +125,7 @@ pub(super) fn kv_event_source(
         endpoint_addr: Some(kv_endpoint_from_zmq(&config.endpoint)?),
         topic: config.topic.clone(),
         replay_endpoint: config.replay_endpoint.clone().unwrap_or_default(),
-        data_parallel_rank,
+        data_parallel_rank: Some(response.data_parallel_rank),
         encoding: "msgpack".to_string(),
         schema_version: 1,
         buffer_steps: config.buffer_steps,
