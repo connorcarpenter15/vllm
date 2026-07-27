@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-use openengine_proto::openengine::v1 as pb;
 use tonic::{Request, Status};
 use vllm_chat::MediaContentPart;
 use vllm_engine_core_client::protocol::output::StopReason;
@@ -13,11 +12,11 @@ use vllm_text::{
     SamplingParams, TextDecodeOptions, TextRequest,
 };
 
+use super::pb;
 use super::struct_json::{
     json_to_prost_struct, prost_handoff_struct_to_json, prost_struct_to_json,
 };
 
-pub(super) const HANDOFF_PROFILE: &str = "vllm.kv_transfer_params.v1";
 pub(super) const TRANSFER_BACKEND: &str = "nixl";
 const TARGET_DP_RANK: &str = "openengine-target-dp-rank";
 const PRIORITY: &str = "openengine-priority";
@@ -79,12 +78,6 @@ pub(super) async fn to_text_request(
         state.served_model_names(),
     )?;
     validate_role_and_handoff(&request, role, target_dp_rank, data_parallel_size)?;
-
-    if request.media_options.as_ref().is_some_and(|options| !options.fields.is_empty()) {
-        return Err(Status::invalid_argument(
-            "per-request media_options are not supported by the vLLM Rust frontend",
-        ));
-    }
 
     let mut prompt = match request.input.take() {
         Some(pb::generate_request::Input::Prompt(prompt)) => Prompt::Text(prompt),
@@ -224,12 +217,6 @@ fn validate_role_and_handoff(
                     "kv.session.session_id is required",
                 ));
             }
-            if session.handoff_profile != HANDOFF_PROFILE {
-                return Err(Status::invalid_argument(format!(
-                    "unsupported handoff profile `{}`; expected `{HANDOFF_PROFILE}`",
-                    session.handoff_profile
-                )));
-            }
             if session.transfer_backend != TRANSFER_BACKEND {
                 return Err(Status::invalid_argument(format!(
                     "unsupported transfer backend `{}`; expected `{TRANSFER_BACKEND}`",
@@ -245,6 +232,12 @@ fn validate_role_and_handoff(
                     "kv.session.attributes_struct must contain NIXL transfer parameters",
                 ));
             }
+            validate_nixl_handoff(
+                session
+                    .attributes_struct
+                    .as_ref()
+                    .expect("checked NIXL transfer attributes above"),
+            )?;
         }
         pb::EngineRole::Prefill => {
             if session.is_some() {
@@ -264,6 +257,65 @@ fn validate_role_and_handoff(
                     "aggregated requests must not contain a KV session",
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_nixl_handoff(attributes: &prost_types::Struct) -> Result<(), Status> {
+    use prost_types::value::Kind;
+
+    let required = [
+        "remote_block_ids",
+        "remote_engine_id",
+        "remote_request_id",
+        "remote_host",
+        "remote_port",
+        "remote_num_tokens",
+    ];
+    let missing = required
+        .iter()
+        .copied()
+        .filter(|key| !attributes.fields.contains_key(*key))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "NIXL transfer parameters are missing required fields: {}",
+            missing.join(", ")
+        )));
+    }
+    if !matches!(
+        attributes.fields.get("remote_block_ids").and_then(|value| value.kind.as_ref()),
+        Some(Kind::ListValue(_))
+    ) {
+        return Err(Status::invalid_argument(
+            "NIXL remote_block_ids must be an array",
+        ));
+    }
+    for key in ["remote_engine_id", "remote_request_id", "remote_host"] {
+        if !matches!(
+            attributes
+                .fields
+                .get(key)
+                .and_then(|value| value.kind.as_ref()),
+            Some(Kind::StringValue(value)) if !value.is_empty()
+        ) {
+            return Err(Status::invalid_argument(format!(
+                "NIXL {key} must be a non-empty string"
+            )));
+        }
+    }
+    for key in ["remote_port", "remote_num_tokens"] {
+        if !matches!(
+            attributes
+                .fields
+                .get(key)
+                .and_then(|value| value.kind.as_ref()),
+            Some(Kind::NumberValue(value)) if value.is_finite() && *value >= 0.0 && value.fract() == 0.0
+        ) {
+            return Err(Status::invalid_argument(format!(
+                "NIXL {key} must be a non-negative integer"
+            )));
         }
     }
     Ok(())
@@ -601,8 +653,6 @@ fn terminal_response(
                         endpoints: Vec::new(),
                         dp_rank: handoff_dp_rank,
                         attributes_struct: Some(attributes),
-                        handoff_profile: HANDOFF_PROFILE.to_string(),
-                        bootstrap: None,
                     }),
                 },
             )),
@@ -697,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_decode_requires_profiled_handoff() {
+    fn direct_decode_validates_nixl_backend_and_payload() {
         let error =
             validate_role_and_handoff(&decode_request(None), pb::EngineRole::Decode, None, 1)
                 .unwrap_err();
@@ -708,19 +758,49 @@ mod tests {
             transfer_backend: TRANSFER_BACKEND.to_string(),
             attributes_struct: Some(prost_types::Struct {
                 fields: [(
-                    "remote_port".to_string(),
+                    "remote_engine_id".to_string(),
                     prost_types::Value {
-                        kind: Some(Kind::NumberValue(1234.0)),
+                        kind: Some(Kind::StringValue("prefill".to_string())),
                     },
                 )]
                 .into(),
             }),
-            handoff_profile: "wrong.profile".to_string(),
             ..Default::default()
         }));
         let error =
             validate_role_and_handoff(&request, pb::EngineRole::Decode, None, 1).unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("remote_block_ids"));
+
+        let attributes = json_to_prost_struct(&serde_json::json!({
+            "do_remote_prefill": true,
+            "do_remote_decode": false,
+            "remote_block_ids": [[1, 2]],
+            "remote_engine_id": "prefill",
+            "remote_request_id": "request",
+            "remote_host": "127.0.0.1",
+            "remote_port": 1234,
+            "remote_num_tokens": 32,
+        }))
+        .expect("valid NIXL attributes");
+        let request = decode_request(Some(pb::KvSessionRef {
+            session_id: "session".to_string(),
+            transfer_backend: "wrong".to_string(),
+            attributes_struct: Some(attributes.clone()),
+            ..Default::default()
+        }));
+        let error =
+            validate_role_and_handoff(&request, pb::EngineRole::Decode, None, 1).unwrap_err();
+        assert!(error.message().contains("unsupported transfer backend"));
+
+        let request = decode_request(Some(pb::KvSessionRef {
+            session_id: "session".to_string(),
+            transfer_backend: TRANSFER_BACKEND.to_string(),
+            attributes_struct: Some(attributes),
+            ..Default::default()
+        }));
+        validate_role_and_handoff(&request, pb::EngineRole::Decode, None, 1)
+            .expect("valid NIXL handoff");
     }
 
     #[test]
@@ -762,7 +842,7 @@ mod tests {
     }
 
     #[test]
-    fn prefill_handoff_preserves_profile_and_large_integer() {
+    fn prefill_handoff_preserves_backend_and_large_integer() {
         let finished = Finished {
             usage: vllm_llm::TokenUsage {
                 prompt_token_count: 4,
@@ -793,7 +873,6 @@ mod tests {
             panic!("expected prefill ready")
         };
         let session = ready.kv_session.as_ref().unwrap();
-        assert_eq!(session.handoff_profile, HANDOFF_PROFILE);
         assert_eq!(session.transfer_backend, TRANSFER_BACKEND);
         assert_eq!(session.dp_rank, 3);
         let value = session

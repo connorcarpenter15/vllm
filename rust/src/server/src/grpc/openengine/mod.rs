@@ -9,6 +9,10 @@ mod convert;
 mod service_tests;
 mod struct_json;
 
+pub(crate) mod pb {
+    tonic::include_proto!("openengine.v1");
+}
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::pin::Pin;
@@ -17,7 +21,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::{Stream, StreamExt as _};
-use openengine_proto::openengine::v1 as pb;
 use thiserror_ext::AsReport as _;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -29,14 +32,16 @@ use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
 use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_text::{Prompt, SamplingParams, TextDecodeOptions, TextOutputStreamExt as _, TextRequest};
 
-use self::convert::{HANDOFF_PROFILE, TRANSFER_BACKEND};
+use self::convert::TRANSFER_BACKEND;
 use crate::lora::{ActivateLoraError, LoadExactLoraError, UnloadLoraError};
 use crate::state::AppState;
 
 pub(crate) use pb::control_server::ControlServer;
 pub(crate) use pb::inference_server::InferenceServer;
 
-const SCHEMA_RELEASE: &str = "a66ff6f73a65e262a7c3edd5ea6fd0d8701d402f";
+const SCHEMA_REVISION: u32 = 1;
+const MINIMUM_CLIENT_REVISION: u32 = 1;
+const SCHEMA_RELEASE: &str = env!("OPENENGINE_SCHEMA_RELEASE");
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const INFERENCE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -255,10 +260,7 @@ impl OpenEngineService {
             supports_remote_prefill: Some(enabled),
             supports_decode_pull: Some(enabled),
             supports_abort_cleanup: Some(enabled),
-            supports_drain: Some(enabled),
             schema_version: enabled.then_some(1),
-            handoff_profile: if enabled { HANDOFF_PROFILE } else { "" }.to_string(),
-            supports_client_bootstrap: Some(false),
         }
     }
 
@@ -289,8 +291,8 @@ impl OpenEngineService {
         }
         let Some(_work_guard) = self.state.try_admit_engine_work() else {
             return (
-                pb::HealthState::Draining,
-                "inference probe rejected while engine is draining".to_string(),
+                pb::HealthState::NotReady,
+                "inference probe rejected by engine admission".to_string(),
             );
         };
         let request = TextRequest {
@@ -447,8 +449,8 @@ impl pb::control_server::Control for OpenEngineService {
                 decode_context_parallel_size: Some(1),
             }),
             kv_connector: Some(self.kv_connector_info()),
-            schema_revision: openengine_proto::SCHEMA_REVISION,
-            minimum_client_revision: openengine_proto::MINIMUM_CLIENT_REVISION,
+            schema_revision: SCHEMA_REVISION,
+            minimum_client_revision: MINIMUM_CLIENT_REVISION,
             schema_release: SCHEMA_RELEASE.to_string(),
             capacity: Some(pb::DeploymentCapacity {
                 kv_block_size: Some(first.block_size.min(u64::from(u32::MAX)) as u32),
@@ -474,17 +476,6 @@ impl pb::control_server::Control for OpenEngineService {
         }
         let supports_image =
             self.state.chat.supported_modalities().contains(&vllm_chat::Modality::Image);
-        let aggregate_modalities = if supports_image && self.role == pb::EngineRole::Aggregated {
-            vec![pb::Modality::Image as i32]
-        } else {
-            Vec::new()
-        };
-        let prefill_decode_modalities = if supports_image && self.role != pb::EngineRole::Aggregated
-        {
-            vec![pb::Modality::Image as i32]
-        } else {
-            Vec::new()
-        };
         let max_context = self
             .state
             .engine_core_client()
@@ -507,10 +498,6 @@ impl pb::control_server::Control for OpenEngineService {
             max_context_length: Some(max_context),
             max_output_tokens: Some(max_context),
             tokenizer_modes: vec![self.state.tokenizer_mode().to_string()],
-            tokenizer: Some(pb::TokenizerInfo {
-                source: self.state.chat.model_id().to_string(),
-                mode: self.state.tokenizer_mode().to_string(),
-            }),
             supports_text_input: Some(true),
             supports_token_ids_input: Some(true),
             generation: Some(pb::GenerationCapabilities {
@@ -556,21 +543,6 @@ impl pb::control_server::Control for OpenEngineService {
                 .unwrap_or_default()
                 .to_string(),
             extra: None,
-            multimodal_capabilities: Some(pb::MultimodalCapabilities {
-                aggregate_modalities,
-                prefill_decode_modalities,
-                source_types: if supports_image {
-                    vec![
-                        pb::MediaSourceType::Url as i32,
-                        pb::MediaSourceType::DataUri as i32,
-                        pb::MediaSourceType::RawBytes as i32,
-                    ]
-                } else {
-                    Vec::new()
-                },
-                supports_per_request_media_options: Some(false),
-                routing_image_token_id: self.state.chat.routing_image_token_id(),
-            }),
         }))
     }
 
@@ -696,8 +668,6 @@ impl pb::control_server::Control for OpenEngineService {
         let engine_healthy = self.state.engine_core_client().is_healthy();
         let mut state = if !engine_healthy || !role_matches {
             pb::HealthState::NotReady
-        } else if self.state.engine_is_draining() {
-            pb::HealthState::Draining
         } else {
             pb::HealthState::Ready
         };
@@ -767,92 +737,6 @@ impl pb::control_server::Control for OpenEngineService {
             status: pb::AbortStatus::Aborted as i32,
             message: String::new(),
         }))
-    }
-
-    type DrainStream = ResponseStream<pb::DrainResponse>;
-
-    async fn drain(
-        &self,
-        request: Request<pb::DrainRequest>,
-    ) -> Result<Response<Self::DrainStream>, Status> {
-        let request = request.into_inner();
-        if request.stop_accepting_new_requests {
-            self.state.begin_engine_drain();
-        }
-        let state = self.state.clone();
-        let service_sessions = self.active_connector_sessions.clone();
-        let abort_cleanups = self.abort_cleanups.clone();
-        let service = self.clone();
-        let (tx, rx) = mpsc::channel(8);
-        tokio::spawn(async move {
-            let started = drain_update(
-                pb::DrainState::Started,
-                state.server_load(),
-                service_sessions.load(Ordering::SeqCst).saturating_add(abort_cleanups.pending()),
-                "drain started",
-            );
-            if tx.send(Ok(started)).await.is_err() {
-                return;
-            }
-            let deadline = request.deadline_ms.map(|millis| {
-                tokio::time::Instant::now() + Duration::from_millis(u64::from(millis))
-            });
-            let mut aborted_at_deadline = false;
-            loop {
-                let load = state.server_load();
-                let sessions = service_sessions.load(Ordering::SeqCst);
-                let pending = abort_cleanups.pending();
-                if load == 0 && sessions == 0 && pending == 0 {
-                    let _ = tx
-                        .send(Ok(drain_update(
-                            pb::DrainState::Complete,
-                            0,
-                            0,
-                            "drain complete",
-                        )))
-                        .await;
-                    return;
-                }
-                if !aborted_at_deadline
-                    && deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-                {
-                    if request.abort_after_deadline {
-                        if let Err(error) = service.abort_and_track(&[]).await {
-                            let _ = tx
-                                .send(Ok(drain_error(format!(
-                                    "failed to abort requests at drain deadline: {}",
-                                    error.to_report_string()
-                                ))))
-                                .await;
-                            return;
-                        }
-                        aborted_at_deadline = true;
-                        tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
-                        continue;
-                    }
-                    let _ = tx
-                        .send(Ok(drain_error(format!(
-                            "drain deadline elapsed with {load} request(s) in flight"
-                        ))))
-                        .await;
-                    return;
-                }
-                if tx
-                    .send(Ok(drain_update(
-                        pb::DrainState::InProgress,
-                        load,
-                        sessions.saturating_add(pending),
-                        "waiting for admitted requests",
-                    )))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-                tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
-            }
-        });
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
     async fn load_lora(
@@ -1030,33 +914,6 @@ fn validate_lora_source(source_path: &Path) -> Result<(), Status> {
         )));
     }
     Ok(())
-}
-
-fn drain_update(
-    state: pb::DrainState,
-    load: u64,
-    open_kv_sessions: u64,
-    message: &str,
-) -> pb::DrainResponse {
-    pb::DrainResponse {
-        event: Some(pb::drain_response::Event::State(state as i32)),
-        in_flight_requests: Some(load.min(u64::from(u32::MAX)) as u32),
-        open_kv_sessions: Some(open_kv_sessions.min(u64::from(u32::MAX)) as u32),
-        message: message.to_string(),
-    }
-}
-
-fn drain_error(message: String) -> pb::DrainResponse {
-    pb::DrainResponse {
-        event: Some(pb::drain_response::Event::Error(pb::EngineError {
-            code: pb::ErrorCode::Internal as i32,
-            message,
-            retryable: false,
-        })),
-        in_flight_requests: None,
-        open_kv_sessions: None,
-        message: String::new(),
-    }
 }
 
 fn activate_lora_status(error: ActivateLoraError) -> Status {

@@ -225,6 +225,7 @@ where
     // OpenEngine is a prototype loopback sibling of the existing HTTP and
     // native gRPC servers. It shares the same state and engine client; no
     // additional LLM instance is constructed.
+    #[cfg(feature = "openengine")]
     let openengine_setup = if let Some(openengine_port) = config.openengine_port {
         let openengine_host = config.openengine_host.as_str();
         let openengine_listener =
@@ -249,6 +250,12 @@ where
     } else {
         None
     };
+    #[cfg(not(feature = "openengine"))]
+    if config.openengine_port.is_some() {
+        anyhow::bail!(
+            "--openengine-port requires vllm-rs to be built with the `openengine` Cargo feature"
+        );
+    }
 
     let scheme = if tls_config.is_some() {
         "https"
@@ -364,6 +371,7 @@ where
         }
     };
 
+    #[cfg(feature = "openengine")]
     let openengine_fut = {
         let shutdown = server_shutdown.child_token();
         let server_shutdown = server_shutdown.clone();
@@ -385,6 +393,14 @@ where
             service.shutdown_background_tasks().await;
             server_shutdown.cancel();
             result
+        }
+    };
+    #[cfg(not(feature = "openengine"))]
+    let openengine_fut = {
+        let shutdown = server_shutdown.child_token();
+        async move {
+            shutdown.cancelled().await;
+            Ok::<(), anyhow::Error>(())
         }
     };
 

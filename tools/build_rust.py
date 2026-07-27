@@ -16,12 +16,17 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 
 
 def rust_extensions(*, optional: bool = False) -> list[RustExtension]:
+    server_features = ["native-tls-vendored"]
+    if os.environ.get("OPENENGINE_PROTO_ROOT") or os.environ.get(
+        "OPENENGINE_BSR_MODULE"
+    ):
+        server_features.append("openengine")
     return [
         RustExtension(
             target="vllm.vllm-rs",
             path="rust/src/cmd/Cargo.toml",
             args=["--bin", "vllm-rs"],
-            features=["native-tls-vendored"],
+            features=server_features,
             binding=Binding.Exec,
             optional=optional,
         ),

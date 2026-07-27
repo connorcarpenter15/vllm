@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+openengine = []
+
 [dependencies]
 anyhow.workspace = true
 asynk-strim-attr.workspace = true
@@ -19,7 +23,6 @@ itertools.workspace = true
 libc.workspace = true
 llm-multimodal.workspace = true
 openssl.workspace = true
-openengine-proto.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 rmpv.workspace = true

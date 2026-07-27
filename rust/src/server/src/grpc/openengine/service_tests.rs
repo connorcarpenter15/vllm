@@ -31,7 +31,7 @@ use zeromq::{DealerSocket, PushSocket, ZmqMessage};
 
 use super::pb::control_server::Control as _;
 use super::pb::inference_server::Inference as _;
-use super::{HANDOFF_PROFILE, OpenEngineService, TRANSFER_BACKEND, pb, used_kv_blocks};
+use super::{OpenEngineService, TRANSFER_BACKEND, pb, used_kv_blocks};
 use crate::state::AppState;
 
 type TestFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
@@ -423,7 +423,7 @@ async fn aggregate_generation_accepts_advertised_canonical_model_id() {
 }
 
 #[tokio::test]
-async fn discovery_reports_prefill_profile_tokenizer_aliases_and_kv_source() {
+async fn discovery_reports_prefill_model_aliases_and_kv_source() {
     let mut ready = default_ready_response();
     ready.kv_connector = Some("NixlConnector".to_string());
     ready.kv_role = Some("kv_producer".to_string());
@@ -441,12 +441,11 @@ async fn discovery_reports_prefill_profile_tokenizer_aliases_and_kv_source() {
         .await
         .expect("server info")
         .into_inner();
-    assert_eq!(server.schema_revision, 3);
+    assert_eq!(server.schema_revision, 1);
     assert_eq!(server.schema_release, super::SCHEMA_RELEASE);
     assert_eq!(server.engine_role, pb::EngineRole::Prefill as i32);
     assert_eq!(server.supported_models, vec!["canonical/test-model"]);
     let connector = server.kv_connector.expect("connector discovery");
-    assert_eq!(connector.handoff_profile, HANDOFF_PROFILE);
     assert_eq!(connector.transfer_backend, TRANSFER_BACKEND);
 
     let model = service
@@ -457,9 +456,6 @@ async fn discovery_reports_prefill_profile_tokenizer_aliases_and_kv_source() {
     assert_eq!(model.model_id, "canonical/test-model");
     assert_eq!(model.served_model_name, "served-model");
     assert_eq!(model.served_model_aliases, vec!["model-alias"]);
-    let tokenizer = model.tokenizer.expect("tokenizer");
-    assert_eq!(tokenizer.source, "canonical/test-model");
-    assert_eq!(tokenizer.mode, "auto");
     assert_eq!(model.tokenizer_modes, vec!["auto"]);
 
     let sources = service
@@ -656,38 +652,6 @@ async fn load_lora_rejects_invalid_peft_directories_before_registration() {
         loaded.adapter.expect("registered adapter").lora_name,
         "valid"
     );
-}
-
-#[tokio::test]
-async fn drain_completes_and_rejects_new_work_process_wide() {
-    let (service, _engine_task) = setup_service(default_ready_response(), false).await;
-    let updates: Vec<_> = service
-        .drain(Request::new(pb::DrainRequest {
-            stop_accepting_new_requests: true,
-            ..Default::default()
-        }))
-        .await
-        .expect("drain")
-        .into_inner()
-        .map(|response| response.expect("drain response"))
-        .collect()
-        .await;
-    assert!(matches!(
-        updates.last().and_then(|update| update.event.as_ref()),
-        Some(pb::drain_response::Event::State(state))
-            if *state == pb::DrainState::Complete as i32
-    ));
-    let error = match service.generate(Request::new(base_request())).await {
-        Ok(_) => panic!("draining server accepted new work"),
-        Err(error) => error,
-    };
-    assert_eq!(error.code(), tonic::Code::Unavailable);
-    let health = service
-        .health(Request::new(pb::HealthRequest::default()))
-        .await
-        .expect("health")
-        .into_inner();
-    assert_eq!(health.state, pb::HealthState::Draining as i32);
 }
 
 #[test]

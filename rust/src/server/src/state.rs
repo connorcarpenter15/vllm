@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use serde_json::Value;
@@ -15,10 +15,9 @@ use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_engine_core_client::runtime::BackgroundShutdownRuntime;
 
 use crate::config::{ApiServerOptions, CorsConfig};
-use crate::lora::{
-    ActivateLoraError, LoadExactLoraError, LoadLoraError, LoraLease, LoraManager,
-    LoraModelResolution, UnloadLoraError,
-};
+#[cfg(feature = "openengine")]
+use crate::lora::{ActivateLoraError, LoadExactLoraError, LoraLease};
+use crate::lora::{LoadLoraError, LoraManager, LoraModelResolution, UnloadLoraError};
 use crate::runtime::build_request_runtime;
 use crate::server_info::{ServerInfoConfigFormat, ServerInfoSnapshot};
 
@@ -47,8 +46,6 @@ pub struct AppState {
     api_key_hashes: Vec<ApiKeyHash>,
     /// Number of in-flight inference requests currently owned by this frontend.
     server_load: AtomicU64,
-    /// Whether process-wide admission of engine work has stopped.
-    engine_draining: AtomicBool,
     /// Dynamic LoRA adapter registry.
     lora_manager: LoraManager,
     /// Backend model path reported as `root` for base-model cards.
@@ -84,7 +81,6 @@ impl AppState {
             server_info: None,
             api_key_hashes: Vec::new(),
             server_load: AtomicU64::new(0),
-            engine_draining: AtomicBool::new(false),
             lora_manager: LoraManager::new(),
             model_path: None,
             tokenizer_mode: "auto".to_string(),
@@ -170,6 +166,7 @@ impl AppState {
         self.model_path.as_deref()
     }
 
+    #[cfg(feature = "openengine")]
     pub fn tokenizer_mode(&self) -> &str {
         &self.tokenizer_mode
     }
@@ -205,6 +202,7 @@ impl AppState {
     }
 
     /// Lazily register an adapter with an externally assigned stable ID.
+    #[cfg(feature = "openengine")]
     pub(crate) async fn register_lora_exact(
         &self,
         request: LoraRequest,
@@ -213,6 +211,7 @@ impl AppState {
     }
 
     /// Activate and lease one lazy OpenEngine adapter.
+    #[cfg(feature = "openengine")]
     pub(crate) async fn activate_lora(
         &self,
         lora_name: &str,
@@ -222,6 +221,7 @@ impl AppState {
 
     /// Remove an OpenEngine adapter from selection without promising GPU
     /// cache eviction.
+    #[cfg(feature = "openengine")]
     pub(crate) async fn logical_unload_lora(
         &self,
         lora_name: &str,
@@ -259,26 +259,9 @@ impl AppState {
         self.server_load.load(Ordering::SeqCst)
     }
 
-    /// Irreversibly stop admitting engine work for this process.
-    pub(crate) fn begin_engine_drain(&self) {
-        self.engine_draining.store(true, Ordering::SeqCst);
-    }
-
-    pub(crate) fn engine_is_draining(&self) -> bool {
-        self.engine_draining.load(Ordering::SeqCst)
-    }
-
-    /// Atomically admit one unit of engine work, accounting for a drain that
-    /// races admission.
+    /// Admit one unit of engine work and track it until its guard is dropped.
     pub(crate) fn try_admit_engine_work(self: &Arc<Self>) -> Option<EngineWorkGuard> {
-        if self.engine_is_draining() {
-            return None;
-        }
         self.increment_server_load();
-        if self.engine_is_draining() {
-            self.decrement_server_load();
-            return None;
-        }
         Some(EngineWorkGuard(self.clone()))
     }
 

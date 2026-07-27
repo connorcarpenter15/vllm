@@ -11,6 +11,7 @@ path = "src/main.rs"
 [features]
 default = []
 native-tls-vendored = ["dep:native-tls-vendored"]
+openengine = ["vllm-server/openengine"]
 
 [dependencies]
 anyhow.workspace = true

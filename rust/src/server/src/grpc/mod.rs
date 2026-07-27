@@ -5,6 +5,7 @@
 
 mod convert;
 mod health;
+#[cfg(feature = "openengine")]
 pub(crate) mod openengine;
 
 use std::pin::Pin;

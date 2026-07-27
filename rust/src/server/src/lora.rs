@@ -46,12 +46,14 @@ pub(crate) enum LoadLoraError {
 }
 
 #[derive(Debug)]
+#[cfg(feature = "openengine")]
 pub(crate) enum LoadExactLoraError {
     BaseModelName { lora_name: String },
     Conflict { existing: LoraRequest },
 }
 
 #[derive(Debug)]
+#[cfg(feature = "openengine")]
 pub(crate) enum ActivateLoraError {
     NotFound { lora_name: String },
     Engine(vllm_engine_core_client::Error),
@@ -169,6 +171,7 @@ impl LoraManager {
 
     /// Register an OpenEngine adapter with its caller-assigned stable ID.
     /// Engine workers load it only when a generation first selects it.
+    #[cfg(feature = "openengine")]
     pub async fn register_lora_exact(
         &self,
         base_model_names: &[String],
@@ -208,6 +211,7 @@ impl LoraManager {
 
     /// Select a registered adapter, lazily activate it, and hold an in-flight
     /// lease so logical unload cannot invalidate an admitted request.
+    #[cfg(feature = "openengine")]
     pub async fn activate_lora(
         &self,
         engine_core_client: &EngineCoreClient,
@@ -245,6 +249,7 @@ impl LoraManager {
 
     /// Logical OpenEngine unload. Removing the registry entry immediately
     /// rejects new selection; existing leases keep admitted requests alive.
+    #[cfg(feature = "openengine")]
     pub async fn logical_unload(&self, lora_name: &str) -> Result<LoraRequest, UnloadLoraError> {
         let _update = self.update_lock.lock().await;
         self.registry
@@ -302,6 +307,7 @@ impl LoraManager {
     }
 }
 
+#[cfg(feature = "openengine")]
 fn same_wire_identity(left: &LoraRequest, right: &LoraRequest) -> bool {
     left.lora_name == right.lora_name
         && left.lora_int_id == right.lora_int_id
@@ -342,7 +348,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "openengine"))]
 mod tests {
     use super::*;
 
