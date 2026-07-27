@@ -135,6 +135,7 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     Ok(Arc::new(
         AppState::new(served_model_names, chat)
             .with_model_path(config.model.clone())
+            .with_tokenizer_mode(config.tokenizer_loader_mode().to_string())
             .with_api_server_options(config.api_server_options)
             .with_server_info(ServerInfoSnapshot::from_config(config))
             .with_api_keys(config.api_keys.clone())
@@ -220,6 +221,41 @@ where
     } else {
         None
     };
+
+    // OpenEngine is a prototype loopback sibling of the existing HTTP and
+    // native gRPC servers. It shares the same state and engine client; no
+    // additional LLM instance is constructed.
+    #[cfg(feature = "openengine")]
+    let openengine_setup = if let Some(openengine_port) = config.openengine_port {
+        let openengine_host = config.openengine_host.as_str();
+        let openengine_listener =
+            TcpListener::bind((openengine_host, openengine_port)).await.with_context(|| {
+                format!("failed to bind OpenEngine listener on {openengine_host}:{openengine_port}")
+            })?;
+        let addr = openengine_listener.local_addr()?;
+        let openengine_listener = Listener::Tcp(openengine_listener);
+        let service =
+            grpc::openengine::OpenEngineService::new(state.clone(), config.openengine_host.clone())
+                .context("invalid OpenEngine engine topology")?;
+        let inference = grpc::openengine::InferenceServer::new(service.clone());
+        let control = grpc::openengine::ControlServer::new(service.clone());
+        let svc = TonicServer::builder()
+            .http2_keepalive_interval(Some(GRPC_KEEPALIVE_INTERVAL))
+            .http2_keepalive_timeout(Some(GRPC_KEEPALIVE_TIMEOUT))
+            .layer(middleware::request_runtime_layer(state.clone()))
+            .add_service(inference)
+            .add_service(control);
+        info!(%addr, "starting prototype OpenEngine server");
+        Some((openengine_listener, svc, service))
+    } else {
+        None
+    };
+    #[cfg(not(feature = "openengine"))]
+    if config.openengine_port.is_some() {
+        anyhow::bail!(
+            "--openengine-port requires vllm-rs to be built with the `openengine` Cargo feature"
+        );
+    }
 
     let scheme = if tls_config.is_some() {
         "https"
@@ -335,8 +371,41 @@ where
         }
     };
 
-    let (http_res, grpc_res) = tokio::join!(http_fut, grpc_fut);
-    http_res.and(grpc_res)?;
+    #[cfg(feature = "openengine")]
+    let openengine_fut = {
+        let shutdown = server_shutdown.child_token();
+        let server_shutdown = server_shutdown.clone();
+        let force_shutdown = force_shutdown.clone();
+        async move {
+            let Some((listener, svc, service)) = openengine_setup else {
+                shutdown.cancelled().await;
+                return Ok(());
+            };
+            let incoming = MaybeTlsListener::plain(listener);
+            let server = svc.serve_with_incoming_shutdown(incoming, shutdown.cancelled_owned());
+            let result = tokio::select! {
+                result = server => result.context("OpenEngine server failed"),
+                _ = force_shutdown.cancelled() => {
+                    warn!("OpenEngine graceful shutdown deadline elapsed; aborting server");
+                    Ok(())
+                }
+            };
+            service.shutdown_background_tasks().await;
+            server_shutdown.cancel();
+            result
+        }
+    };
+    #[cfg(not(feature = "openengine"))]
+    let openengine_fut = {
+        let shutdown = server_shutdown.child_token();
+        async move {
+            shutdown.cancelled().await;
+            Ok::<(), anyhow::Error>(())
+        }
+    };
+
+    let (http_res, grpc_res, openengine_res) = tokio::join!(http_fut, grpc_fut, openengine_fut);
+    http_res.and(grpc_res).and(openengine_res)?;
 
     let shutdown_deadline = shutdown_deadline
         .get()

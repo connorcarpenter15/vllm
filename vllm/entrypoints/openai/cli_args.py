@@ -228,6 +228,12 @@ class FrontendArgs(BaseFrontendArgs):
     """Host name."""
     port: int = 8000
     """Port number."""
+    openengine_host: str = "127.0.0.1"
+    """Prototype: host for the optional OpenEngine gRPC sibling server."""
+    openengine_port: int | None = None
+    """Prototype: port for the optional OpenEngine gRPC sibling server. The
+    server is disabled when this option is omitted and requires the Rust
+    frontend (``VLLM_USE_RUST_FRONTEND=1``)."""
     data_parallel_supervisor_port: int = 9256
     """HTTP port for aggregated health endpoints in multi-port external LB
     mode."""

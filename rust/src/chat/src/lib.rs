@@ -21,6 +21,7 @@ pub use event::{
     AssistantToolCall, ChatEvent,
 };
 use futures::{StreamExt, TryStreamExt as _};
+pub use llm_multimodal::{MediaContentPart, Modality};
 pub use output::{
     ChatOutputProcessor, DefaultChatOutputProcessor, DynChatOutputProcessor,
     HarmonyChatOutputProcessor,
@@ -40,6 +41,7 @@ pub use request::{
     ChatToolChoice, GenerationPromptMode, ReasoningEffort, SamplingParams,
 };
 pub use stream::{ChatEventStream, ChatEventStreamTrait, CollectedAssistantMessage};
+pub use vllm_engine_core_client::protocol::multimodal::MmFeatures;
 pub use vllm_llm::FinishReason;
 
 mod backend;
@@ -169,6 +171,60 @@ impl ChatLlm {
     /// calls.
     pub fn engine_core_client(&self) -> &EngineCoreClient {
         self.text.engine_core_client()
+    }
+
+    /// Modalities backed by a resolved frontend input processor.
+    pub fn supported_modalities(&self) -> Vec<Modality> {
+        self.backend
+            .multimodal_model_info()
+            .map_or_else(Vec::new, |info| info.supported_modalities())
+    }
+
+    /// Image placeholder token used by media-aware KV routing, when stable.
+    pub fn routing_image_token_id(&self) -> Option<u32> {
+        self.backend
+            .multimodal_model_info()
+            .and_then(|info| info.routing_image_token_id())
+    }
+
+    /// Effective tool-call parser name for this model, if enabled.
+    pub fn tool_call_parser_name(&self) -> Option<&str> {
+        match &self.tool_call_parser {
+            ParserSelection::Auto => {
+                ToolParserFactory::global().resolve_name_for_model(self.model_id())
+            }
+            ParserSelection::None => None,
+            ParserSelection::Explicit(name) => Some(name),
+        }
+    }
+
+    /// Effective reasoning parser name for this model, if enabled.
+    pub fn reasoning_parser_name(&self) -> Option<&str> {
+        match &self.reasoning_parser {
+            ParserSelection::Auto => {
+                ReasoningParserFactory::global().resolve_name_for_model(self.model_id())
+            }
+            ParserSelection::None => None,
+            ParserSelection::Explicit(name) => Some(name),
+        }
+    }
+
+    /// Fetch and preprocess ordered media for an already-tokenized prompt.
+    pub async fn prepare_media(
+        &self,
+        media: Vec<MediaContentPart>,
+        token_ids: &mut Vec<u32>,
+    ) -> Result<Option<MmFeatures>> {
+        if media.is_empty() {
+            return Ok(None);
+        }
+        let info = self
+            .backend
+            .multimodal_model_info()
+            .ok_or(Error::UnsupportedMultimodalRenderer)?;
+        Ok(Some(
+            info.prepare_multimodal(media, token_ids, self.model_dtype).await?,
+        ))
     }
 
     /// Render, tokenize, and submit one chat request.

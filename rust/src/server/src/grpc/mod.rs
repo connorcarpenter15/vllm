@@ -5,6 +5,8 @@
 
 mod convert;
 mod health;
+#[cfg(feature = "openengine")]
+pub(crate) mod openengine;
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -54,6 +56,10 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
         &self,
         request: Request<pb::GenerateRequest>,
     ) -> Result<Response<pb::GenerateResponse>, Status> {
+        let _guard = self
+            .state
+            .try_admit_engine_work()
+            .ok_or_else(|| Status::unavailable("engine is draining"))?;
         let proto_req = request.into_inner();
         let response_opts = ResponseOpts::from_proto(proto_req.response.as_ref());
         let text_request =
@@ -100,6 +106,10 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
         &self,
         request: Request<pb::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStreamStream>, Status> {
+        let guard = self
+            .state
+            .try_admit_engine_work()
+            .ok_or_else(|| Status::unavailable("engine is draining"))?;
         let proto_req = request.into_inner();
         let response_opts = ResponseOpts::from_proto(proto_req.response.as_ref());
         let text_request =
@@ -114,6 +124,7 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
         let (tx, rx) = mpsc::channel(32);
 
         tokio::spawn(async move {
+            let _guard = guard;
             futures::pin_mut!(stream);
             while let Some(event) = stream.next().await {
                 let response = match event {

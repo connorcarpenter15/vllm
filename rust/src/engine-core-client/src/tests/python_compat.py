@@ -363,8 +363,25 @@ class EngineCoreReadyResponse:
     vllm_version: str
     world_size: int
     data_parallel_size: int
+    tensor_parallel_size: int = 1
+    pipeline_parallel_size: int = 1
+    data_parallel_rank: int = 0
+    max_num_seqs: int = 0
+    max_num_batched_tokens: int = 0
+    supports_lora: bool = False
+    max_loras: int = 0
     kv_cache_size_tokens: int | None = None
     kv_cache_max_concurrency: float | None = None
+    kv_connector: str | None = None
+    kv_role: str | None = None
+    kv_engine_id: str | None = None
+    kv_events_publisher: str | None = None
+    kv_events_endpoint: str | None = None
+    kv_events_replay_endpoint: str | None = None
+    kv_events_topic: str | None = None
+    kv_events_buffer_steps: int = 0
+    kv_events_hwm: int = 0
+    kv_events_max_queue_size: int = 0
 
 
 ready_response = EngineCoreReadyResponse(

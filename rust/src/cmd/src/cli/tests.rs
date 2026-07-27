@@ -63,6 +63,8 @@ fn serve_args_forward_python_flags_with_separator() {
                         ),
                         max_logprobs: None,
                         grpc_port: None,
+                        openengine_host: "127.0.0.1",
+                        openengine_port: None,
                         shutdown_timeout: 0,
                         http_timeout_keep_alive: None,
                         chat_template: None,
@@ -391,6 +393,25 @@ fn serve_args_accept_explicit_deepseek_v32_renderer() {
         panic!("expected serve args");
     };
     assert_eq!(args.runtime.renderer, RendererSelection::DeepSeekV32);
+}
+
+#[test]
+fn explicit_hf_renderer_does_not_change_tokenizer_loader_discovery() {
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "Qwen/Qwen3-0.6B",
+        "--tokenizer-mode",
+        "hf",
+    ])
+    .unwrap();
+
+    let Command::Serve(args) = cli.command else {
+        panic!("expected serve args");
+    };
+    let config = args.to_frontend_config("tcp://127.0.0.1:62100".to_string());
+    assert_eq!(config.renderer, RendererSelection::Hf);
+    assert_eq!(config.tokenizer_loader_mode(), "auto");
 }
 
 #[test]
@@ -759,6 +780,8 @@ fn frontend_args_accept_json() {
                         max_model_len: None,
                         max_logprobs: None,
                         grpc_port: None,
+                        openengine_host: "127.0.0.1",
+                        openengine_port: None,
                         shutdown_timeout: 0,
                         http_timeout_keep_alive: None,
                         chat_template: None,
@@ -1281,6 +1304,8 @@ fn serve_args_accept_handshake_aliases() {
                         max_model_len: None,
                         max_logprobs: None,
                         grpc_port: None,
+                        openengine_host: "127.0.0.1",
+                        openengine_port: None,
                         shutdown_timeout: 0,
                         http_timeout_keep_alive: None,
                         chat_template: None,
@@ -1450,6 +1475,8 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
             api_keys: [],
             disable_log_stats: false,
             grpc_port: None,
+            openengine_host: "127.0.0.1",
+            openengine_port: None,
             shutdown_timeout: 0ns,
             keep_alive_timeout: 5s,
             profiler: None,
@@ -1534,6 +1561,8 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
             api_keys: [],
             disable_log_stats: false,
             grpc_port: None,
+            openengine_host: "127.0.0.1",
+            openengine_port: None,
             shutdown_timeout: 0ns,
             keep_alive_timeout: 5s,
             profiler: None,
@@ -1636,6 +1665,8 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
             api_keys: [],
             disable_log_stats: false,
             grpc_port: None,
+            openengine_host: "127.0.0.1",
+            openengine_port: None,
             shutdown_timeout: 0ns,
             keep_alive_timeout: 5s,
             profiler: None,

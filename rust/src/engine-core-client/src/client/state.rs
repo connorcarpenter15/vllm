@@ -8,6 +8,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::trace;
 
 use crate::EngineId;
+use crate::client::EngineLoad;
 use crate::client::stream::EngineCoreStreamOutput;
 use crate::error::{Error, Result};
 use crate::protocol::output::{EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput};
@@ -49,12 +50,14 @@ enum LoraPhase {
 ///
 /// These counters come from `scheduler_stats` on the normal engine output path
 /// and are the preferred routing signal once available.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct EngineLoadSnapshot {
     /// Requests still counted on the scheduler's waiting side.
     waiting: usize,
     /// Requests currently counted on the scheduler's running side.
     running: usize,
+    /// Fraction of GPU KV blocks occupied by this engine.
+    kv_cache_usage: f64,
 }
 
 #[derive(Debug, Default)]
@@ -67,6 +70,8 @@ struct EngineRoutingState {
     inflight: usize,
     /// The latest real scheduler snapshot received from this engine, if any.
     last_scheduler_stats: Option<EngineLoadSnapshot>,
+    /// Monotonic count of scheduler snapshots observed for this engine.
+    update_generation: u64,
 }
 
 impl EngineRoutingState {
@@ -90,6 +95,7 @@ impl EngineRoutingState {
     /// Replace the local routing view with a fresh real scheduler snapshot.
     fn apply_scheduler_counts(&mut self, next: EngineLoadSnapshot) {
         self.last_scheduler_stats = Some(next);
+        self.update_generation = self.update_generation.saturating_add(1);
     }
 }
 
@@ -186,9 +192,19 @@ impl RequestRegistry {
     }
 
     /// Filter the given request IDs to the subset that are still tracked as
-    /// active and can be aborted, grouped by engine.
+    /// active and can be aborted, grouped by engine. An empty list selects all
+    /// active requests.
     pub fn abortable_request_ids(&self, request_ids: &[String]) -> BTreeMap<EngineId, Vec<String>> {
         let mut by_engine = BTreeMap::new();
+        if request_ids.is_empty() {
+            for (request_id, tracked) in &self.requests {
+                by_engine
+                    .entry(tracked.engine_id.clone())
+                    .or_insert_with(Vec::new)
+                    .push(request_id.clone());
+            }
+            return by_engine;
+        }
         for request_id in request_ids {
             let Some(tracked) = self.requests.get(request_id.as_str()) else {
                 continue;
@@ -283,10 +299,38 @@ impl RequestRegistry {
         self.apply_scheduler_counts(
             engine_index,
             EngineLoadSnapshot {
-                waiting: stats.num_waiting_reqs as usize,
+                waiting: stats.num_waiting_reqs.saturating_add(stats.num_skipped_waiting_reqs)
+                    as usize,
                 running: stats.num_running_reqs as usize,
+                kv_cache_usage: stats.kv_cache_usage,
             },
         )
+    }
+
+    /// Snapshot the latest scheduler counters, falling back to frontend
+    /// admission counts until the first scheduler update arrives.
+    pub fn engine_loads(&self) -> Vec<EngineLoad> {
+        self.routing_per_engine
+            .iter()
+            .map(|(engine_id, state)| {
+                let (running, queued, kv_cache_usage) = match state.last_scheduler_stats {
+                    Some(stats) => (
+                        stats.running as u64,
+                        stats.waiting as u64,
+                        Some(stats.kv_cache_usage),
+                    ),
+                    None => (state.inflight as u64, 0, None),
+                };
+                EngineLoad {
+                    engine_index: engine_id.engine_index().unwrap_or_default(),
+                    running_requests: running,
+                    queued_requests: queued,
+                    frontend_inflight: state.inflight as u64,
+                    kv_cache_usage,
+                    update_generation: state.update_generation,
+                }
+            })
+            .collect()
     }
 
     /// Mark the registry as closed, detach and return all tracked senders.
@@ -706,6 +750,14 @@ mod tests {
             &vec!["req-1".to_string(), "req-3".to_string()]
         );
         assert_eq!(grouped.get(&engine_1).unwrap(), &vec!["req-2".to_string()]);
+
+        let mut all = registry.abortable_request_ids(&[]);
+        all.values_mut().for_each(|ids| ids.sort());
+        assert_eq!(
+            all.get(&engine_0).unwrap(),
+            &vec!["req-1".to_string(), "req-3".to_string()]
+        );
+        assert_eq!(all.get(&engine_1).unwrap(), &vec!["req-2".to_string()]);
     }
 
     #[test]
@@ -731,6 +783,7 @@ mod tests {
         let state = EngineRoutingState {
             inflight: 3,
             last_scheduler_stats: None,
+            update_generation: 0,
         };
 
         assert_eq!(state.routing_score(), 3);
@@ -743,7 +796,9 @@ mod tests {
             last_scheduler_stats: Some(EngineLoadSnapshot {
                 waiting: 0,
                 running: 2,
+                kv_cache_usage: 0.25,
             }),
+            update_generation: 1,
         };
 
         assert_eq!(state.routing_score(), 7);
@@ -756,7 +811,9 @@ mod tests {
             last_scheduler_stats: Some(EngineLoadSnapshot {
                 waiting: 3,
                 running: 2,
+                kv_cache_usage: 0.5,
             }),
+            update_generation: 1,
         };
 
         assert_eq!(state.routing_score(), 14);
@@ -775,19 +832,31 @@ mod tests {
             0,
             EngineLoadSnapshot {
                 waiting: 3,
-                running: 2
+                running: 2,
+                kv_cache_usage: 0.75,
             }
         ));
         assert!(registry.apply_scheduler_counts(
             1,
             EngineLoadSnapshot {
                 waiting: 0,
-                running: 1
+                running: 1,
+                kv_cache_usage: 0.125,
             }
         ));
 
         let (chosen, _) = registry.register("req-stats".to_string(), None, None).unwrap();
         assert_eq!(chosen, engine_1);
+
+        let loads = registry.engine_loads();
+        assert_eq!(loads.len(), 2);
+        assert_eq!(loads[0].engine_index, 0);
+        assert_eq!(loads[0].running_requests, 2);
+        assert_eq!(loads[0].queued_requests, 3);
+        assert_eq!(loads[0].kv_cache_usage, Some(0.75));
+        assert_eq!(loads[1].engine_index, 1);
+        assert_eq!(loads[1].frontend_inflight, 1);
+        assert_eq!(loads[1].kv_cache_usage, Some(0.125));
     }
 
     #[test]

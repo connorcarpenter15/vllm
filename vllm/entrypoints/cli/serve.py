@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import os
 import signal
 import time
 
@@ -149,6 +150,25 @@ class ServeSubcommand(CLISubcommand):
 
     def validate(self, args: argparse.Namespace) -> None:
         validate_parsed_serve_args(args)
+        if args.openengine_port is not None and getattr(args, "grpc", False):
+            raise ValueError(
+                "--openengine-port cannot be combined with dedicated --grpc mode"
+            )
+        if args.openengine_port is not None and not envs.VLLM_RUST_FRONTEND_PATH:
+            raise ValueError(
+                "--openengine-port requires the Rust frontend; set "
+                "VLLM_USE_RUST_FRONTEND=1"
+            )
+        if args.openengine_port is not None and "PYTHONHASHSEED" not in os.environ:
+            # vLLM's first KV block hash is chained from NONE_HASH. A random
+            # NONE_HASH makes identical prefixes diverge across engine
+            # processes, so advertised KV events cannot drive replica routing.
+            # This runs before EngineCore construction; child engines inherit
+            # the seed and init_none_hash() derives the same root everywhere.
+            os.environ["PYTHONHASHSEED"] = "0"
+            logger.info(
+                "Defaulting PYTHONHASHSEED=0 for reproducible OpenEngine KV events"
+            )
 
     def subparser_init(
         self, subparsers: argparse._SubParsersAction

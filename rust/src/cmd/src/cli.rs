@@ -163,6 +163,15 @@ pub struct SharedRuntimeArgs {
     #[arg(long)]
     #[serde(default)]
     pub grpc_port: Option<u16>,
+    /// Prototype: host for the optional OpenEngine gRPC sibling server.
+    #[arg(long, default_value = "127.0.0.1")]
+    #[serde(default = "default_openengine_host")]
+    pub openengine_host: String,
+    /// Prototype: port for the optional OpenEngine gRPC sibling server. When
+    /// unset, the server is disabled.
+    #[arg(long)]
+    #[serde(default)]
+    pub openengine_port: Option<u16>,
     /// Maximum time to wait for active requests to drain during shutdown.
     #[arg(long, default_value_t = 0)]
     #[serde(default)]
@@ -412,6 +421,8 @@ impl SharedRuntimeArgs {
             api_keys: self.api_key,
             disable_log_stats: self.disable_log_stats,
             grpc_port: self.grpc_port,
+            openengine_host: self.openengine_host,
+            openengine_port: self.openengine_port,
             shutdown_timeout,
             keep_alive_timeout,
             profiler,
@@ -464,6 +475,8 @@ impl SharedRuntimeArgs {
             api_keys: self.api_key,
             disable_log_stats: self.disable_log_stats,
             grpc_port: self.grpc_port,
+            openengine_host: self.openengine_host,
+            openengine_port: self.openengine_port,
             shutdown_timeout,
             keep_alive_timeout,
             profiler,
@@ -507,6 +520,10 @@ impl SharedRuntimeArgs {
 
 fn default_engine_ready_timeout_secs() -> u64 {
     600
+}
+
+fn default_openengine_host() -> String {
+    "127.0.0.1".to_string()
 }
 
 fn default_cors_wildcard() -> JsonStringList {

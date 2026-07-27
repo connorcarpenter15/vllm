@@ -472,6 +472,26 @@ impl MultimodalModelInfo {
             Modality::ImageEmbeds => None,
         }
     }
+
+    /// Return each modality with a fully resolved processor lane.
+    pub fn supported_modalities(&self) -> Vec<Modality> {
+        let mut modalities = Vec::with_capacity(3);
+        if self.image.is_some() {
+            modalities.push(Modality::Image);
+        }
+        if self.video.is_some() {
+            modalities.push(Modality::Video);
+        }
+        if self.audio.is_some() {
+            modalities.push(Modality::Audio);
+        }
+        modalities
+    }
+
+    /// Stable image placeholder marker used by the prefix-cache key.
+    pub fn routing_image_token_id(&self) -> Option<u32> {
+        self.image.as_ref().map(|image| image.placeholder.marker_token_id)
+    }
 }
 
 /// Finalize a rendered chat prompt into text-generation input.
@@ -574,7 +594,7 @@ impl MultimodalModelInfo {
     /// `prompt_token_ids` is mutated in place because placeholder expansion
     /// changes both the final prompt and the offsets recorded in
     /// `PlaceholderRange`.
-    async fn prepare_multimodal(
+    pub(crate) async fn prepare_multimodal(
         &self,
         media_parts: Vec<MediaContentPart>,
         prompt_token_ids: &mut Vec<u32>,

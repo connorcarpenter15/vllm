@@ -78,6 +78,8 @@ async fn main() -> Result<()> {
         api_keys: Vec::new(),
         disable_log_stats: false,
         grpc_port: None,
+        openengine_host: "127.0.0.1".to_string(),
+        openengine_port: None,
         shutdown_timeout: Duration::ZERO,
         keep_alive_timeout: Duration::from_secs(5),
         profiler: None,

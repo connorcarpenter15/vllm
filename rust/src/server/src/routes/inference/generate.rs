@@ -46,7 +46,7 @@ pub async fn generate(
     ValidatedJson(body): ValidatedJson<GenerateRequest>,
 ) -> Response {
     let request_context = resolve_request_context(&headers, body.request_id.as_deref());
-    let lora_resolution = state.resolve_model_with_loras(body.model.as_deref()).await;
+    let mut lora_resolution = state.resolve_model_with_loras(body.model.as_deref()).await;
     let prepared = match prepare_generate_request(body, &lora_resolution, request_context) {
         Ok(prepared) => prepared,
         Err(error) => return error.into_response(),
@@ -72,6 +72,7 @@ pub async fn generate(
                 .into_response();
         }
     };
+    let raw_stream = crate::lora::hold_lora_lease(raw_stream, lora_resolution.lease.take());
 
     if stream {
         let chunk_stream = generate_chunk_stream(

@@ -206,6 +206,11 @@ pub struct Config {
     /// TCP port for the gRPC Generate service. When `None`, no gRPC server is
     /// started.
     pub grpc_port: Option<u16>,
+    /// Host for the prototype OpenEngine sibling server.
+    pub openengine_host: String,
+    /// TCP port for the prototype OpenEngine sibling server. When `None`, no
+    /// OpenEngine server is started.
+    pub openengine_port: Option<u16>,
     /// Maximum time to wait for active HTTP/gRPC requests to drain on shutdown.
     pub shutdown_timeout: Duration,
     /// Maximum idle time on a keep-alive HTTP connection before the server
@@ -217,6 +222,15 @@ pub struct Config {
 }
 
 impl Config {
+    /// Tokenizer loader mode used by the Rust frontend.
+    ///
+    /// `renderer` selects chat rendering only. The tokenizer itself is loaded
+    /// through the automatic Hugging Face-compatible path until a separate
+    /// loader-mode option is introduced.
+    pub fn tokenizer_loader_mode(&self) -> &'static str {
+        "auto"
+    }
+
     /// Validate frontend configuration that can be checked before engine
     /// startup.
     pub fn validate(&self) -> Result<()> {

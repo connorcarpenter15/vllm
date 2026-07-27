@@ -10,6 +10,16 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.hashing import _xxhash
+from vllm.v1.engine.core import select_kv_event_block_size
+
+
+def test_kv_event_block_size_uses_main_attention_granularity():
+    metadata = [
+        {"kind": "mamba", "block_size": 1},
+        {"kind": "full_attention", "block_size": 128},
+    ]
+    assert select_kv_event_block_size(metadata, 16) == 128
+    assert select_kv_event_block_size([], 16) == 16
 
 
 def test_prefix_caching_from_cli():

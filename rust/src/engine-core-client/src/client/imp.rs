@@ -16,7 +16,7 @@ use zeromq::RouterSendHalf;
 
 use crate::client::state::{OutputReceiver, RequestRegistry, UtilityReceiver, UtilityRegistry};
 use crate::client::stream::EngineCoreStreamOutput;
-use crate::client::{AbortCause, AbortRequest};
+use crate::client::{AbortCause, AbortRequest, EngineLoad};
 use crate::error::{client_closed, dispatcher_closed, unexpected_dispatcher_output};
 use crate::metrics::{LoraInfoExporter, SchedulerStatsRecorder};
 use crate::protocol::encode_msgpack;
@@ -159,6 +159,11 @@ impl ClientInner {
     /// client.
     pub fn apply_scheduler_stats(&self, engine_index: u32, stats: &SchedulerStats) -> bool {
         self.request_reg.lock().apply_scheduler_stats(engine_index, stats)
+    }
+
+    /// Snapshot scheduler and frontend-local load for every engine rank.
+    pub fn engine_loads(&self) -> Vec<EngineLoad> {
+        self.request_reg.lock().engine_loads()
     }
 
     /// Snapshot the adapter names of tracked LoRA requests as

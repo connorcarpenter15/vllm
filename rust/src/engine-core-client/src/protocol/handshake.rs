@@ -56,6 +56,61 @@ pub struct EngineCoreReadyResponse {
     pub kv_cache_size_tokens: Option<u64>,
     /// Maximum achievable request concurrency given the KV cache, if reported.
     pub kv_cache_max_concurrency: Option<f64>,
+    /// Tensor-parallel size of this engine.
+    #[serde(default = "one_u32")]
+    pub tensor_parallel_size: u32,
+    /// Pipeline-parallel size of this engine.
+    #[serde(default = "one_u32")]
+    pub pipeline_parallel_size: u32,
+    /// This engine's data-parallel rank.
+    #[serde(default)]
+    pub data_parallel_rank: u32,
+    /// Scheduler cap on concurrently running sequences.
+    #[serde(default)]
+    pub max_num_seqs: u64,
+    /// Scheduler cap on batched tokens per step.
+    #[serde(default)]
+    pub max_num_batched_tokens: u64,
+    /// Configured KV connector name, if any.
+    #[serde(default)]
+    pub kv_connector: Option<String>,
+    /// KV transfer role (`kv_producer`, `kv_consumer`, or `kv_both`).
+    #[serde(default)]
+    pub kv_role: Option<String>,
+    /// KV connector engine identifier.
+    #[serde(default)]
+    pub kv_engine_id: Option<String>,
+    /// KV-event publisher backend (`null` or `zmq`).
+    #[serde(default)]
+    pub kv_events_publisher: Option<String>,
+    /// ZMQ endpoint used by the KV-event publisher.
+    #[serde(default)]
+    pub kv_events_endpoint: Option<String>,
+    /// Optional ZMQ replay endpoint used by the KV-event publisher.
+    #[serde(default)]
+    pub kv_events_replay_endpoint: Option<String>,
+    /// Topic used by the KV-event publisher.
+    #[serde(default)]
+    pub kv_events_topic: Option<String>,
+    /// Number of event batches retained for replay.
+    #[serde(default)]
+    pub kv_events_buffer_steps: u64,
+    /// Publisher high-water mark.
+    #[serde(default)]
+    pub kv_events_hwm: u64,
+    /// Maximum publisher queue size.
+    #[serde(default)]
+    pub kv_events_max_queue_size: u64,
+    /// Whether dynamic LoRA was enabled at engine startup.
+    #[serde(default)]
+    pub supports_lora: bool,
+    /// Maximum number of active LoRA adapters.
+    #[serde(default)]
+    pub max_loras: u32,
+}
+
+fn one_u32() -> u32 {
+    1
 }
 
 /// Frontend-owned ZMQ addresses that are sent to the engine during startup

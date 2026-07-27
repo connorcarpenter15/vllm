@@ -15,6 +15,8 @@ use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_engine_core_client::runtime::BackgroundShutdownRuntime;
 
 use crate::config::{ApiServerOptions, CorsConfig};
+#[cfg(feature = "openengine")]
+use crate::lora::{ActivateLoraError, LoadExactLoraError, LoraLease};
 use crate::lora::{LoadLoraError, LoraManager, LoraModelResolution, UnloadLoraError};
 use crate::runtime::build_request_runtime;
 use crate::server_info::{ServerInfoConfigFormat, ServerInfoSnapshot};
@@ -48,6 +50,8 @@ pub struct AppState {
     lora_manager: LoraManager,
     /// Backend model path reported as `root` for base-model cards.
     model_path: Option<String>,
+    /// Active tokenizer loading/rendering mode advertised through OpenEngine.
+    tokenizer_mode: String,
     /// Lazily initialized runtime for heavyweight request paths.
     request_runtime: OnceLock<BackgroundShutdownRuntime>,
     /// Profiler mode that registers `/start_profile` and `/stop_profile`
@@ -79,6 +83,7 @@ impl AppState {
             server_load: AtomicU64::new(0),
             lora_manager: LoraManager::new(),
             model_path: None,
+            tokenizer_mode: "auto".to_string(),
             request_runtime: OnceLock::new(),
             profiler: None,
         }
@@ -99,6 +104,11 @@ impl AppState {
     /// Set the backend model path reported as `root` for base-model cards.
     pub fn with_model_path(mut self, model_path: String) -> Self {
         self.model_path = Some(model_path);
+        self
+    }
+
+    pub fn with_tokenizer_mode(mut self, tokenizer_mode: String) -> Self {
+        self.tokenizer_mode = tokenizer_mode;
         self
     }
 
@@ -156,6 +166,11 @@ impl AppState {
         self.model_path.as_deref()
     }
 
+    #[cfg(feature = "openengine")]
+    pub fn tokenizer_mode(&self) -> &str {
+        &self.tokenizer_mode
+    }
+
     /// Snapshot the loaded LoRA adapters in load order, for `/v1/models` cards.
     pub async fn served_lora_requests(&self) -> Vec<LoraRequest> {
         self.lora_manager.served_lora_requests().await
@@ -186,6 +201,34 @@ impl AppState {
             .await
     }
 
+    /// Lazily register an adapter with an externally assigned stable ID.
+    #[cfg(feature = "openengine")]
+    pub(crate) async fn register_lora_exact(
+        &self,
+        request: LoraRequest,
+    ) -> Result<(LoraRequest, bool), LoadExactLoraError> {
+        self.lora_manager.register_lora_exact(&self.served_model_names, request).await
+    }
+
+    /// Activate and lease one lazy OpenEngine adapter.
+    #[cfg(feature = "openengine")]
+    pub(crate) async fn activate_lora(
+        &self,
+        lora_name: &str,
+    ) -> Result<(LoraRequest, LoraLease), ActivateLoraError> {
+        self.lora_manager.activate_lora(self.engine_core_client(), lora_name).await
+    }
+
+    /// Remove an OpenEngine adapter from selection without promising GPU
+    /// cache eviction.
+    #[cfg(feature = "openengine")]
+    pub(crate) async fn logical_unload_lora(
+        &self,
+        lora_name: &str,
+    ) -> Result<LoraRequest, UnloadLoraError> {
+        self.lora_manager.logical_unload(lora_name).await
+    }
+
     /// Remove one dynamic LoRA adapter from the engine and public model
     /// registry.
     pub async fn unload_lora(
@@ -213,19 +256,25 @@ impl AppState {
     /// Return the current in-flight inference request count for the `/load`
     /// endpoint.
     pub fn server_load(&self) -> u64 {
-        self.server_load.load(Ordering::Relaxed)
+        self.server_load.load(Ordering::SeqCst)
+    }
+
+    /// Admit one unit of engine work and track it until its guard is dropped.
+    pub(crate) fn try_admit_engine_work(self: &Arc<Self>) -> Option<EngineWorkGuard> {
+        self.increment_server_load();
+        Some(EngineWorkGuard(self.clone()))
     }
 
     /// Increment the in-flight inference request count, called by the load
     /// tracking middleware.
     pub(crate) fn increment_server_load(&self) {
-        self.server_load.fetch_add(1, Ordering::Relaxed);
+        self.server_load.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Decrement the in-flight inference request count, called by the load
     /// tracking middleware.
     pub(crate) fn decrement_server_load(&self) {
-        self.server_load.fetch_sub(1, Ordering::Relaxed);
+        self.server_load.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Wait until all request-owned references are dropped, then shut down the
@@ -261,5 +310,14 @@ impl AppState {
             ))
             .await;
         }
+    }
+}
+
+/// Owns one admitted unit of engine work until its request or stream ends.
+pub(crate) struct EngineWorkGuard(Arc<AppState>);
+
+impl Drop for EngineWorkGuard {
+    fn drop(&mut self) {
+        self.0.decrement_server_load();
     }
 }
