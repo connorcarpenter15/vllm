@@ -122,7 +122,7 @@ pub(super) fn kv_event_source(response: &EngineCoreReadyResponse) -> Option<pb::
 
     Some(pb::KvEventSource {
         transport: "zmq".to_string(),
-        endpoint_addr: Some(kv_endpoint_from_zmq(&config.endpoint)?),
+        endpoint: config.endpoint.clone(),
         topic: config.topic.clone(),
         replay_endpoint: config.replay_endpoint.clone().unwrap_or_default(),
         data_parallel_rank: Some(response.data_parallel_rank),
@@ -131,21 +131,5 @@ pub(super) fn kv_event_source(response: &EngineCoreReadyResponse) -> Option<pb::
         buffer_steps: config.buffer_steps,
         hwm: config.hwm,
         max_queue_size: config.max_queue_size,
-    })
-}
-
-fn kv_endpoint_from_zmq(endpoint: &str) -> Option<pb::KvEventEndpoint> {
-    let rest = endpoint.strip_prefix("tcp://").unwrap_or(endpoint);
-    let (host, port) = rest.rsplit_once(':')?;
-    let port = port.parse().ok()?;
-    let host = host.trim_matches(|character| character == '[' || character == ']');
-    let host = match host {
-        "*" | "0.0.0.0" | "::" | "" => String::new(),
-        concrete => concrete.to_string(),
-    };
-    Some(pb::KvEventEndpoint {
-        host,
-        port,
-        protocol: "tcp".to_string(),
     })
 }
