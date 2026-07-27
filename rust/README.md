@@ -76,7 +76,7 @@ To build the `vllm-rs` in isolation:
 
 ### OpenEngine
 
-The optional OpenEngine sibling server generates its Rust bindings directly from the canonical schema. Local development points at an OpenEngine checkout at commit `57cd5033554cd22ab9645ae6c17f34d7fa9f5bb0`:
+The optional OpenEngine sibling server generates its Rust bindings directly from the canonical schema. Local development points at a clean OpenEngine checkout at commit `57cd5033554cd22ab9645ae6c17f34d7fa9f5bb0`; the build verifies both conditions:
 
 ```bash
 OPENENGINE_PROTO_ROOT=/path/to/openengine/proto \
@@ -89,6 +89,8 @@ Release builds should instead export an immutable BSR module commit. `OPENENGINE
 OPENENGINE_BSR_MODULE=buf.build/openengine/openengine:<commit> \
   cargo build -p vllm-cmd --features openengine
 ```
+
+For a metadata-free schema directory, set `OPENENGINE_PROTO_ROOT` together with `OPENENGINE_SCHEMA_RELEASE`, using the exact 32-character lowercase BSR commit or 40-character lowercase source commit represented by those files.
 
 The OpenEngine feature is disabled by default, so normal Rust frontend builds do not require the schema or Buf.
 `./build_rust.sh` enables the feature automatically when either schema environment variable is set.
