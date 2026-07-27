@@ -62,10 +62,8 @@ message GetKvEventSourcesResponse { repeated KvEventSource sources = 1; }
 
 message KvEventSource {
   string transport = 1;
-  // A wildcard host means use the Control service host.
   string endpoint = 2;
   string topic = 3;
-  // A wildcard host means use the Control service host.
   string replay_endpoint = 4;
   optional uint32 data_parallel_rank = 5;
   string encoding = 6;
