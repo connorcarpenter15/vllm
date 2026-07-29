@@ -56,6 +56,9 @@ pub struct EngineCoreReadyResponse {
     pub kv_cache_size_tokens: Option<u64>,
     /// Maximum achievable request concurrency given the KV cache, if reported.
     pub kv_cache_max_concurrency: Option<f64>,
+    /// KV transfer role (`kv_producer`, `kv_consumer`, or `kv_both`), if configured.
+    #[serde(default)]
+    pub kv_role: Option<String>,
 }
 
 /// Frontend-owned ZMQ addresses that are sent to the engine during startup

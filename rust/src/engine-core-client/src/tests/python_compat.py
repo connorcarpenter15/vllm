@@ -365,6 +365,7 @@ class EngineCoreReadyResponse:
     data_parallel_size: int
     kv_cache_size_tokens: int | None = None
     kv_cache_max_concurrency: float | None = None
+    kv_role: str | None = None
 
 
 ready_response = EngineCoreReadyResponse(
@@ -376,6 +377,7 @@ ready_response = EngineCoreReadyResponse(
     vllm_version="0.0.0",
     data_parallel_size=1,
     world_size=1,
+    kv_role="kv_consumer",
 )
 
 print(msgspec.msgpack.encode(request).hex())
