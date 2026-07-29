@@ -83,6 +83,13 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MediaErrorKind {
+    InvalidInput,
+    Unavailable,
+    Internal,
+}
+
 impl Error {
     /// Whether this error represents invalid user request parameters.
     pub fn is_request_validation_error(&self) -> bool {
@@ -92,60 +99,71 @@ impl Error {
             Self::UnsupportedMultimodalRenderer
             | Self::UnsupportedMultimodalContent(_)
             | Self::UnsupportedModality { .. } => true,
-            Self::MediaConnector(error) => media_connector_is_request_validation_error(error),
-            Self::MediaTracker(error) => multimodal_is_request_validation_error(error),
-
-            _ => false,
+            _ => self.media_error_kind() == Some(MediaErrorKind::InvalidInput),
         }
     }
 
     /// Whether this error represents a transient media-access failure.
     pub fn is_unavailable_error(&self) -> bool {
-        match self {
-            Self::MediaConnector(error) => media_connector_is_unavailable(error),
-            Self::MediaTracker(error) => multimodal_is_unavailable(error),
-            _ => false,
-        }
+        self.media_error_kind() == Some(MediaErrorKind::Unavailable)
     }
 
     /// A diagnostic suitable for server logs that does not expose media URLs
     /// or payloads.
     pub fn media_diagnostic(&self) -> String {
+        use llm_multimodal::MultiModalError;
+
         match self {
             Self::MediaConnector(error) => media_connector_diagnostic(error),
-            Self::MediaTracker(error) => multimodal_diagnostic(error),
+            Self::MediaTracker(MultiModalError::Media(error)) => media_connector_diagnostic(error),
+            Self::MediaTracker(MultiModalError::UnsupportedContent(kind)) => {
+                format!("unsupported multimodal content: {kind}")
+            }
+            Self::MediaTracker(MultiModalError::Join(error)) => {
+                format!("multimodal task failed: {error}")
+            }
+            Self::MediaTracker(MultiModalError::Validation(_)) => {
+                "multimodal validation failed".to_string()
+            }
             _ => self.to_report_string(),
+        }
+    }
+
+    fn media_error_kind(&self) -> Option<MediaErrorKind> {
+        use llm_multimodal::MultiModalError;
+
+        match self {
+            Self::MediaConnector(error) | Self::MediaTracker(MultiModalError::Media(error)) => {
+                Some(media_connector_error_kind(error))
+            }
+            Self::MediaTracker(
+                MultiModalError::UnsupportedContent(_) | MultiModalError::Validation(_),
+            ) => Some(MediaErrorKind::InvalidInput),
+            Self::MediaTracker(MultiModalError::Join(_)) => Some(MediaErrorKind::Internal),
+            _ => None,
         }
     }
 }
 
-fn media_connector_is_request_validation_error(
-    error: &llm_multimodal::MediaConnectorError,
-) -> bool {
+fn media_connector_error_kind(error: &llm_multimodal::MediaConnectorError) -> MediaErrorKind {
     use llm_multimodal::MediaConnectorError;
 
-    matches!(
-        error,
+    match error {
         MediaConnectorError::UnsupportedScheme(_)
-            | MediaConnectorError::InvalidUrl(_)
-            | MediaConnectorError::DisallowedDomain(_)
-            | MediaConnectorError::DisallowedLocalPath(_)
-            | MediaConnectorError::Base64Decode(_)
-            | MediaConnectorError::DataUrl(_)
-            | MediaConnectorError::PayloadTooLarge { .. }
-            | MediaConnectorError::Image(_)
-            | MediaConnectorError::AudioDecode(_)
-            | MediaConnectorError::VideoDecode(_)
-    )
-}
-
-fn media_connector_is_unavailable(error: &llm_multimodal::MediaConnectorError) -> bool {
-    use llm_multimodal::MediaConnectorError;
-
-    matches!(
-        error,
-        MediaConnectorError::Http(_) | MediaConnectorError::Io(_) | MediaConnectorError::Timeout(_)
-    )
+        | MediaConnectorError::InvalidUrl(_)
+        | MediaConnectorError::DisallowedDomain(_)
+        | MediaConnectorError::DisallowedLocalPath(_)
+        | MediaConnectorError::Base64Decode(_)
+        | MediaConnectorError::DataUrl(_)
+        | MediaConnectorError::PayloadTooLarge { .. }
+        | MediaConnectorError::Image(_)
+        | MediaConnectorError::AudioDecode(_)
+        | MediaConnectorError::VideoDecode(_) => MediaErrorKind::InvalidInput,
+        MediaConnectorError::Http(_)
+        | MediaConnectorError::Io(_)
+        | MediaConnectorError::Timeout(_) => MediaErrorKind::Unavailable,
+        MediaConnectorError::Blocking(_) => MediaErrorKind::Internal,
+    }
 }
 
 fn media_connector_diagnostic(error: &llm_multimodal::MediaConnectorError) -> String {
@@ -185,40 +203,6 @@ fn media_connector_diagnostic(error: &llm_multimodal::MediaConnectorError) -> St
         MediaConnectorError::Timeout(duration) => {
             format!("media fetch timed out after {duration:?}")
         }
-    }
-}
-
-fn multimodal_is_request_validation_error(error: &llm_multimodal::MultiModalError) -> bool {
-    use llm_multimodal::MultiModalError;
-
-    match error {
-        MultiModalError::Media(error) => media_connector_is_request_validation_error(error),
-        MultiModalError::UnsupportedContent(_) | MultiModalError::Validation(_) => true,
-        MultiModalError::Join(_) => false,
-    }
-}
-
-fn multimodal_is_unavailable(error: &llm_multimodal::MultiModalError) -> bool {
-    use llm_multimodal::MultiModalError;
-
-    match error {
-        MultiModalError::Media(error) => media_connector_is_unavailable(error),
-        MultiModalError::UnsupportedContent(_)
-        | MultiModalError::Join(_)
-        | MultiModalError::Validation(_) => false,
-    }
-}
-
-fn multimodal_diagnostic(error: &llm_multimodal::MultiModalError) -> String {
-    use llm_multimodal::MultiModalError;
-
-    match error {
-        MultiModalError::Media(error) => media_connector_diagnostic(error),
-        MultiModalError::UnsupportedContent(kind) => {
-            format!("unsupported multimodal content: {kind}")
-        }
-        MultiModalError::Join(error) => format!("multimodal task failed: {error}"),
-        MultiModalError::Validation(_) => "multimodal validation failed".to_string(),
     }
 }
 
