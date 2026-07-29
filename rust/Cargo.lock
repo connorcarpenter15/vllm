@@ -5752,6 +5752,7 @@ dependencies = [
  "tracing",
  "tracing-futures",
  "tracing-subscriber",
+ "url",
  "uuid",
  "validator",
  "vllm-chat",

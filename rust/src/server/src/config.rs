@@ -16,7 +16,6 @@ use vllm_engine_core_client::{CoordinatorMode as EngineCoreCoordinatorMode, Tran
 /// Default keep-alive idle timeout (seconds); also the head-read bound
 /// when keep-alive is disabled (`0`).
 pub const DEFAULT_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// How the HTTP server obtains its listening socket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum HttpListenerMode {
@@ -203,7 +202,7 @@ pub struct Config {
     /// When `true`, suppress periodic stats logging (throughput, queue depth,
     /// cache usage).
     pub disable_log_stats: bool,
-    /// TCP port for the gRPC Generate service. When `None`, no gRPC server is
+    /// TCP port for the gRPC Inference service. When `None`, no gRPC server is
     /// started.
     pub grpc_port: Option<u16>,
     /// Maximum time to wait for active HTTP/gRPC requests to drain on shutdown.
@@ -233,7 +232,6 @@ impl Config {
                 max_logprobs
             );
         }
-
         Ok(())
     }
 

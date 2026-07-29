@@ -218,8 +218,8 @@ enum Modality {
 message MediaItem {
   Modality modality = 1;
   oneof source {
-    string url = 2;
-    string data_uri = 3;
+    string url = 2;       // http:// or https://
+    string data_uri = 3;  // data:
     bytes raw_bytes = 4;
   }
   string mime_type = 5;
