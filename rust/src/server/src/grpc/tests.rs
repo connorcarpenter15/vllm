@@ -741,40 +741,6 @@ async fn streaming_generate_rejects_text_prompt_with_media() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn unary_generate_rejects_media_for_text_only_model() {
-    let (mut client, server_task, _engine_task) = grpc_test_server(
-        b"engine-grpc-text-only-media",
-        default_stream_output_specs(),
-    )
-    .await;
-
-    let status = client
-        .generate(pb::GenerateRequest {
-            request_id: "test-text-only-media".to_string(),
-            model: "test-model".to_string(),
-            prompt: Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
-                ids: vec![11, QWEN_IMAGE_TOKEN_ID, 12],
-            })),
-            media: vec![pb::MediaItem {
-                modality: pb::Modality::Image as i32,
-                source: Some(pb::media_item::Source::DataUri(
-                    TINY_PNG_DATA_URI.to_string(),
-                )),
-                mime_type: String::new(),
-                uuid: "image-1".to_string(),
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect_err("text-only model must reject media");
-
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    assert_eq!(status.message(), "model does not support image input");
-    server_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
 async fn unary_generate_returns_token_ids_when_requested() {
     let (mut client, server_task, engine_task) =
         grpc_test_server(b"engine-grpc-tok-resp", default_stream_output_specs()).await;

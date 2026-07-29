@@ -90,8 +90,8 @@ impl InferenceServiceImpl {
                 let mm_features =
                     self.state.chat.prepare_media(media, &mut token_ids).await.map_err(
                         |error| {
-                            let status = chat_error_to_status(&error);
-                            let detail = error.media_diagnostic();
+                            let detail = error.to_report_string();
+                            let status = Status::internal(detail.clone());
                             (status, detail)
                         },
                     )?;
@@ -278,18 +278,6 @@ fn text_error_to_status(error: vllm_text::Error) -> Status {
         Status::invalid_argument(message)
     } else {
         Status::internal(message)
-    }
-}
-
-fn chat_error_to_status(error: &vllm_chat::Error) -> Status {
-    if matches!(error, vllm_chat::Error::UnsupportedMultimodalRenderer) {
-        Status::invalid_argument("model does not support image input")
-    } else if error.is_request_validation_error() {
-        Status::invalid_argument("invalid image input")
-    } else if error.is_unavailable_error() {
-        Status::unavailable("image input is temporarily unavailable")
-    } else {
-        Status::internal("image preprocessing failed")
     }
 }
 
