@@ -449,6 +449,16 @@ impl EngineCoreClient {
             .data_parallel_size
     }
 
+    /// Return the configured KV transfer role, if any.
+    pub fn kv_role(&self) -> Option<&str> {
+        self.engines
+            .first()
+            .expect("engine core client requires at least one engine")
+            .ready_response
+            .kv_role
+            .as_deref()
+    }
+
     /// Get the model name associated with this client used for metrics
     /// labeling.
     pub fn model_name(&self) -> &str {

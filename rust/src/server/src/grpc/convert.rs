@@ -15,6 +15,23 @@ use vllm_text::{
 
 use super::pb;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvRole {
+    Aggregated,
+    Prefill,
+    Decode,
+}
+
+impl From<Option<&str>> for KvRole {
+    fn from(role: Option<&str>) -> Self {
+        match role {
+            Some("kv_producer") => Self::Prefill,
+            Some("kv_consumer") => Self::Decode,
+            _ => Self::Aggregated,
+        }
+    }
+}
+
 // ========================================================================================
 // Request conversion
 // ========================================================================================
@@ -28,6 +45,7 @@ pub fn to_text_request(
     req: pb::GenerateRequest,
     stream: bool,
     served_model_names: &[String],
+    kv_role: KvRole,
 ) -> Result<TextRequest, Status> {
     if !req.model.is_empty() && !served_model_names.iter().any(|n| n == &req.model) {
         return Err(Status::not_found(format!(
@@ -60,6 +78,16 @@ pub fn to_text_request(
     let response = req.response.as_ref();
     let kv = req.kv.as_ref();
 
+    if kv_role == KvRole::Decode
+        && kv
+            .and_then(|params| params.kv_transfer_params.as_ref())
+            .is_none_or(|params| params.fields.is_empty())
+    {
+        return Err(Status::invalid_argument(
+            "kv.kv_transfer_params is required for decode requests",
+        ));
+    }
+
     let mut sampling_params =
         build_sampling_params(req.temperature, sampling, decoding, stopping, response)?;
 
@@ -80,6 +108,20 @@ pub fn to_text_request(
         if kv.bypass_prefix_cache {
             sampling_params.skip_reading_prefix_cache = Some(true);
         }
+    }
+
+    if kv_role == KvRole::Prefill {
+        sampling_params
+            .vllm_xargs
+            .get_or_insert_with(Default::default)
+            .entry("kv_transfer_params".to_string())
+            .or_insert_with(|| serde_json::Value::Object(Default::default()))
+            .as_object_mut()
+            .expect("protobuf Struct converts to a JSON object")
+            .insert(
+                "do_remote_decode".to_string(),
+                serde_json::Value::Bool(true),
+            );
     }
 
     let decode_options = TextDecodeOptions {
@@ -503,7 +545,7 @@ mod tests {
     use vllm_text::{FinishReason, Finished, Prompt};
 
     use super::pb::finish_info::{FinishReason as PbFinishReason, StopReason as PbStopReason};
-    use super::{ResponseOpts, pb, to_finish_info, to_sequence_output, to_text_request};
+    use super::{KvRole, ResponseOpts, pb, to_finish_info, to_sequence_output, to_text_request};
 
     fn base_request() -> pb::GenerateRequest {
         pb::GenerateRequest {
@@ -520,14 +562,20 @@ mod tests {
             temperature: Some(0.7),
             ..base_request()
         };
-        let text = to_text_request(req, false, &["test-model".to_string()]).expect("convert ok");
+        let text = to_text_request(req, false, &["test-model".to_string()], KvRole::Aggregated)
+            .expect("convert ok");
         assert_eq!(text.sampling_params.temperature, Some(0.7));
     }
 
     #[test]
     fn unset_temperature_defaults_to_greedy() {
-        let text = to_text_request(base_request(), false, &["test-model".to_string()])
-            .expect("convert ok");
+        let text = to_text_request(
+            base_request(),
+            false,
+            &["test-model".to_string()],
+            KvRole::Aggregated,
+        )
+        .expect("convert ok");
         // The gRPC API defaults to greedy (0.0) when temperature is not specified.
         assert_eq!(text.sampling_params.temperature, Some(0.0));
     }
@@ -541,7 +589,8 @@ mod tests {
             }),
             ..base_request()
         };
-        let text = to_text_request(req, false, &["test-model".to_string()]).expect("convert ok");
+        let text = to_text_request(req, false, &["test-model".to_string()], KvRole::Aggregated)
+            .expect("convert ok");
         assert_eq!(text.sampling_params.seed, None);
     }
 
@@ -554,7 +603,8 @@ mod tests {
             }),
             ..base_request()
         };
-        let text = to_text_request(req, false, &["test-model".to_string()]).expect("convert ok");
+        let text = to_text_request(req, false, &["test-model".to_string()], KvRole::Aggregated)
+            .expect("convert ok");
         assert_eq!(text.sampling_params.seed, Some(0));
     }
 
@@ -567,7 +617,8 @@ mod tests {
             }),
             ..base_request()
         };
-        let text = to_text_request(req, false, &["test-model".to_string()]).expect("convert ok");
+        let text = to_text_request(req, false, &["test-model".to_string()], KvRole::Aggregated)
+            .expect("convert ok");
         assert_eq!(text.sampling_params.skip_reading_prefix_cache, Some(true));
     }
 
@@ -580,10 +631,40 @@ mod tests {
             }),
             ..base_request()
         };
-        let text = to_text_request(req, false, &["test-model".to_string()]).expect("convert ok");
+        let text = to_text_request(req, false, &["test-model".to_string()], KvRole::Aggregated)
+            .expect("convert ok");
         assert_eq!(text.sampling_params.skip_reading_prefix_cache, None);
         // Prompt conversion still succeeds and reaches the expected variant.
         assert!(matches!(text.prompt, Prompt::Text(s) if s == "hi"));
+    }
+
+    #[test]
+    fn decode_requires_kv_transfer_params() {
+        let error = to_text_request(
+            base_request(),
+            false,
+            &["test-model".to_string()],
+            KvRole::Decode,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn prefill_requests_remote_decode() {
+        let text = to_text_request(
+            base_request(),
+            false,
+            &["test-model".to_string()],
+            KvRole::Prefill,
+        )
+        .expect("convert prefill request");
+
+        assert_eq!(
+            text.sampling_params.vllm_xargs.as_ref().unwrap()["kv_transfer_params"]["do_remote_decode"],
+            serde_json::Value::Bool(true)
+        );
     }
 
     fn finished(reason: FinishReason) -> Finished {

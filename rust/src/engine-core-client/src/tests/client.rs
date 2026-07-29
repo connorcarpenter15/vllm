@@ -2597,6 +2597,9 @@ fn python_msgpack_fixtures_match_rust_encoding() {
         rust_ready_keys, python_ready_keys,
         "EngineCoreReadyResponse drifted from the Python dataclass",
     );
+    let python_ready: crate::protocol::handshake::EngineCoreReadyResponse =
+        rmp_serde::from_slice(&hex::decode(ready_response_hex).unwrap()).unwrap();
+    assert_eq!(python_ready.kv_role.as_deref(), Some("kv_consumer"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

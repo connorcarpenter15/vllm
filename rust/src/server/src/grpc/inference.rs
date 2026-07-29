@@ -12,7 +12,7 @@ use tonic::{Request, Response, Status};
 use tracing::info;
 use vllm_text::{DecodedTextEvent, TextOutputStreamExt as _};
 
-use super::convert::{self, ResponseOpts};
+use super::convert::{self, KvRole, ResponseOpts};
 use super::{InferenceServer, pb};
 use crate::state::AppState;
 
@@ -41,8 +41,12 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
     ) -> Result<Response<pb::GenerateResponse>, Status> {
         let proto_req = request.into_inner();
         let response_opts = ResponseOpts::from_proto(proto_req.response.as_ref());
-        let text_request =
-            convert::to_text_request(proto_req, false, self.state.served_model_names())?;
+        let text_request = convert::to_text_request(
+            proto_req,
+            false,
+            self.state.served_model_names(),
+            KvRole::from(self.state.engine_core_client().kv_role()),
+        )?;
 
         let request_id = text_request.request_id.clone();
         info!(%request_id, "grpc generate (unary)");
@@ -87,8 +91,12 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
     ) -> Result<Response<Self::GenerateStreamStream>, Status> {
         let proto_req = request.into_inner();
         let response_opts = ResponseOpts::from_proto(proto_req.response.as_ref());
-        let text_request =
-            convert::to_text_request(proto_req, true, self.state.served_model_names())?;
+        let text_request = convert::to_text_request(
+            proto_req,
+            true,
+            self.state.served_model_names(),
+            KvRole::from(self.state.engine_core_client().kv_role()),
+        )?;
 
         let request_id = text_request.request_id.clone();
         info!(%request_id, "grpc generate (stream)");
