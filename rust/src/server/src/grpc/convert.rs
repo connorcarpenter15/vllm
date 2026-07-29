@@ -608,7 +608,7 @@ mod tests {
                     )),
                     ..Default::default()
                 },
-                "media[0].modality is required",
+                "media[1].modality is required",
             ),
             (
                 pb::MediaItem {
@@ -618,7 +618,7 @@ mod tests {
                     )),
                     ..Default::default()
                 },
-                "media[0].url must use the http or https scheme",
+                "media[1].url must use the http or https scheme",
             ),
             (
                 pb::MediaItem {
@@ -628,12 +628,18 @@ mod tests {
                     )),
                     ..Default::default()
                 },
-                "media[0].data_uri must use the data scheme",
+                "media[1].data_uri must use the data scheme",
             ),
         ];
 
         for (media, expected_message) in cases {
-            let error = media_parts_from_request(vec![media]).expect_err("reject invalid media");
+            let valid_media = pb::MediaItem {
+                modality: pb::Modality::Image as i32,
+                source: Some(pb::media_item::Source::RawBytes(vec![1])),
+                ..Default::default()
+            };
+            let error = media_parts_from_request(vec![valid_media, media])
+                .expect_err("reject invalid media");
             assert_eq!(error.code(), tonic::Code::InvalidArgument);
             assert_eq!(error.message(), expected_message);
         }

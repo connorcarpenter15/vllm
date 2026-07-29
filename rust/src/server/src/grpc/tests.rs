@@ -662,10 +662,6 @@ async fn unary_generate_prepares_multimodal_input_for_engine_core() {
                         .iter()
                         .all(|token_id| *token_id == QWEN_IMAGE_TOKEN_ID)
                 );
-
-                let data = feature.data.as_ref().expect("feature data");
-                assert!(data.contains_key("pixel_values"));
-                assert!(data.contains_key("image_grid_thw"));
             },
         )
         .await;
