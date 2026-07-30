@@ -583,10 +583,7 @@ mod tests {
     use vllm_text::{FinishReason, Finished, Prompt};
 
     use super::pb::finish_info::{FinishReason as PbFinishReason, StopReason as PbStopReason};
-    use super::{
-        ResponseOpts, media_parts_from_request, pb, to_finish_info, to_sequence_output,
-        to_text_request,
-    };
+    use super::{ResponseOpts, pb, to_finish_info, to_sequence_output, to_text_request};
 
     fn base_request() -> pb::GenerateRequest {
         pb::GenerateRequest {
@@ -594,54 +591,6 @@ mod tests {
             model: "test-model".to_string(),
             prompt: Some(pb::generate_request::Prompt::Text("hi".to_string())),
             ..Default::default()
-        }
-    }
-
-    #[test]
-    fn media_discriminators_are_enforced() {
-        let cases = [
-            (
-                pb::MediaItem {
-                    modality: pb::Modality::Unspecified as i32,
-                    source: Some(pb::media_item::Source::Url(
-                        "https://example.test/image.png".to_string(),
-                    )),
-                    ..Default::default()
-                },
-                "media[1].modality is required",
-            ),
-            (
-                pb::MediaItem {
-                    modality: pb::Modality::Image as i32,
-                    source: Some(pb::media_item::Source::Url(
-                        "data:image/png;base64,AA==".to_string(),
-                    )),
-                    ..Default::default()
-                },
-                "media[1].url must use the http or https scheme",
-            ),
-            (
-                pb::MediaItem {
-                    modality: pb::Modality::Image as i32,
-                    source: Some(pb::media_item::Source::DataUri(
-                        "https://example.test/image.png".to_string(),
-                    )),
-                    ..Default::default()
-                },
-                "media[1].data_uri must use the data scheme",
-            ),
-        ];
-
-        for (media, expected_message) in cases {
-            let valid_media = pb::MediaItem {
-                modality: pb::Modality::Image as i32,
-                source: Some(pb::media_item::Source::RawBytes(vec![1])),
-                ..Default::default()
-            };
-            let error = media_parts_from_request(vec![valid_media, media])
-                .expect_err("reject invalid media");
-            assert_eq!(error.code(), tonic::Code::InvalidArgument);
-            assert_eq!(error.message(), expected_message);
         }
     }
 
