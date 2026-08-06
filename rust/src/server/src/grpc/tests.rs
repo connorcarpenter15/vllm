@@ -32,16 +32,14 @@ use vllm_engine_core_client::mock_engine::{
     default_ready_response,
 };
 use vllm_engine_core_client::protocol::decode_value;
-use vllm_engine_core_client::protocol::handshake::KvEventsConfig;
+use vllm_engine_core_client::protocol::handshake::{EngineCoreReadyResponse, KvEventsConfig};
 use vllm_engine_core_client::protocol::output::{
     EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
     UtilityCallOutput,
 };
 use vllm_engine_core_client::protocol::request::EngineCoreRequest;
 use vllm_engine_core_client::protocol::utility::{UtilityOutput, UtilityResultEnvelope};
-use vllm_engine_core_client::test_utils::{
-    IpcNamespace, spawn_mock_engine_task, spawn_mock_engine_task_with_ready,
-};
+use vllm_engine_core_client::test_utils::{IpcNamespace, spawn_mock_engine_task_with_ready};
 use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig, EngineId, TransportMode};
 use vllm_llm::Llm;
 use vllm_text::tokenizer::DynTokenizer;
@@ -165,39 +163,6 @@ async fn send_outputs(push: &mut PushSocket, outputs: EngineCoreOutputs) {
 
 async fn recv_engine_message(dealer: &mut DealerSocket) -> Vec<bytes::Bytes> {
     dealer.recv().await.expect("recv engine message").into_vec()
-}
-
-async fn recv_utility_call(dealer: &mut DealerSocket) -> (u64, String, Value) {
-    let frames = recv_engine_message(dealer).await;
-    assert_eq!(frames[0].as_ref(), &[0x03]);
-    let payload = decode_value(&frames[1]).expect("decode utility payload");
-    let fields = payload.as_array().expect("utility payload array");
-    (
-        fields[1].as_u64().expect("utility call id"),
-        fields[2].as_str().expect("utility method").to_owned(),
-        fields[3].clone(),
-    )
-}
-
-async fn send_utility_result<T>(push: &mut PushSocket, call_id: u64, result: T)
-where
-    T: serde::Serialize,
-{
-    send_outputs(
-        push,
-        UtilityCallOutput {
-            output: UtilityOutput {
-                call_id: call_id.into(),
-                failure_message: None,
-                result: Some(UtilityResultEnvelope::without_type_info(
-                    rmpv::ext::to_value(result).expect("encode utility result"),
-                )),
-            },
-            ..Default::default()
-        }
-        .into(),
-    )
-    .await;
 }
 
 #[derive(Clone, Debug)]
@@ -338,13 +303,10 @@ async fn setup_grpc_service_with_backend<F>(
 where
     F: FnOnce(&EngineCoreRequest) + Send + 'static,
 {
-    let ipc = IpcNamespace::new().expect("create ipc namespace");
-    let handshake_address = ipc.handshake_endpoint();
-    let engine_id = engine_id.into();
-
-    let engine_task = MockEngineTask::new(spawn_mock_engine_task(
-        handshake_address.clone(),
-        engine_id.clone(),
+    setup_grpc_service_with_engine_script(
+        engine_id,
+        default_ready_response(),
+        backend,
         move |dealer, push| {
             boxed_test_future(async move {
                 let add = recv_engine_message(dealer).await;
@@ -358,6 +320,33 @@ where
                 .await;
             })
         },
+    )
+    .await
+}
+
+async fn setup_grpc_service_with_engine_script<F>(
+    engine_id: impl Into<EngineId>,
+    ready: EngineCoreReadyResponse,
+    backend: Arc<dyn ChatTextBackend>,
+    script: F,
+) -> (
+    InferenceServer<InferenceServiceImpl>,
+    ControlServer<ControlServiceImpl>,
+    tokio::sync::watch::Receiver<bool>,
+    MockEngineTask,
+)
+where
+    F: for<'a> FnOnce(&'a mut DealerSocket, &'a mut PushSocket) -> TestFuture<'a> + Send + 'static,
+{
+    let ipc = IpcNamespace::new().expect("create ipc namespace");
+    let handshake_address = ipc.handshake_endpoint();
+    let engine_id = engine_id.into();
+
+    let engine_task = MockEngineTask::new(spawn_mock_engine_task_with_ready(
+        handshake_address.clone(),
+        engine_id.clone(),
+        ready,
+        script,
     ));
 
     let client = EngineCoreClient::connect(
@@ -379,44 +368,6 @@ where
             .max_decoding_message_size(crate::DEFAULT_REQUEST_BODY_LIMIT_BYTES),
         ControlServer::new(ControlServiceImpl::new(state)),
         engine_health,
-        engine_task,
-    )
-}
-
-async fn setup_control_service_with_engine_script<F>(
-    ready: vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse,
-    script: F,
-) -> (ControlServiceImpl, MockEngineTask)
-where
-    F: for<'a> FnOnce(&'a mut DealerSocket, &'a mut PushSocket) -> TestFuture<'a> + Send + 'static,
-{
-    let ipc = IpcNamespace::new().expect("create ipc namespace");
-    let handshake_address = ipc.handshake_endpoint();
-    let engine_task = MockEngineTask::new(spawn_mock_engine_task_with_ready(
-        handshake_address.clone(),
-        b"engine-grpc-rl".to_vec(),
-        ready,
-        script,
-    ));
-    let client = EngineCoreClient::connect(
-        EngineCoreClientConfig::new_single(handshake_address)
-            .with_model_name("test-model")
-            .with_local_input_output_addresses(
-                Some(ipc.input_endpoint()),
-                Some(ipc.output_endpoint()),
-            ),
-    )
-    .await
-    .expect("connect client");
-    let chat = ChatLlm::from_shared_backend(
-        Llm::new(client),
-        Arc::new(FakeTextBackend) as Arc<dyn ChatTextBackend>,
-    );
-    (
-        ControlServiceImpl::new(Arc::new(AppState::new(
-            vec!["test-model".to_string()],
-            chat,
-        ))),
         engine_task,
     )
 }
@@ -1591,27 +1542,57 @@ async fn control_reports_server_and_model_info() {
 async fn control_rejects_weight_update_while_serving() {
     let mut ready = default_ready_response();
     ready.weight_transfer_backend = Some("nccl".to_string());
-    let (service, engine_task) = setup_control_service_with_engine_script(ready, |dealer, push| {
-        boxed_test_future(async move {
-            let (call_id, method, args) = recv_utility_call(dealer).await;
-            assert_eq!(method, "is_scheduler_paused");
-            assert_eq!(args, Value::Array(Vec::new()));
-            send_utility_result(push, call_id, false).await;
-        })
-    })
+    let (inference_service, control_service, engine_health, engine_task) =
+        setup_grpc_service_with_engine_script(
+            b"engine-grpc-rl".to_vec(),
+            ready,
+            Arc::new(FakeTextBackend),
+            |dealer, push| {
+                boxed_test_future(async move {
+                    let frames = recv_engine_message(dealer).await;
+                    assert_eq!(frames[0].as_ref(), &[0x03]);
+                    let payload = decode_value(&frames[1]).expect("decode utility payload");
+                    let fields = payload.as_array().expect("utility payload array");
+                    let call_id = fields[1].as_u64().expect("utility call id");
+                    assert_eq!(fields[2].as_str(), Some("is_scheduler_paused"));
+                    assert_eq!(fields[3], Value::Array(Vec::new()));
+                    send_outputs(
+                        push,
+                        UtilityCallOutput {
+                            output: UtilityOutput {
+                                call_id: call_id.into(),
+                                failure_message: None,
+                                result: Some(UtilityResultEnvelope::without_type_info(
+                                    Value::Boolean(false),
+                                )),
+                            },
+                            ..Default::default()
+                        }
+                        .into(),
+                    )
+                    .await;
+                })
+            },
+        )
+        .await;
+    let (channel, server_task) = start_grpc_test_server(
+        inference_service,
+        control_service,
+        engine_health,
+        tokio_util::sync::CancellationToken::new(),
+    )
     .await;
 
-    let error = pb::control_server::Control::update_weights(
-        &service,
-        tonic::Request::new(pb::UpdateWeightsRequest {
+    let error = ControlClient::new(channel)
+        .update_weights(pb::UpdateWeightsRequest {
             update_info_json: br#"{"names":["model.weight"]}"#.to_vec(),
-        }),
-    )
-    .await
-    .expect_err("unpaused weight update should fail");
+        })
+        .await
+        .expect_err("unpaused weight update should fail");
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
 
     engine_task.await.expect("mock engine task");
+    server_task.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
