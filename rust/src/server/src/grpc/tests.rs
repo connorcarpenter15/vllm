@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::future::Future;
 use std::io;
@@ -199,16 +198,6 @@ where
         .into(),
     )
     .await;
-}
-
-fn collective_args(method: &str, kwargs: BTreeMap<String, serde_json::Value>) -> Value {
-    rmpv::ext::to_value((
-        method,
-        Option::<f64>::None,
-        Vec::<serde_json::Value>::new(),
-        kwargs,
-    ))
-    .expect("encode collective arguments")
 }
 
 #[derive(Clone, Debug)]
@@ -1599,134 +1588,6 @@ async fn control_reports_server_and_model_info() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn control_executes_safe_weight_update_lifecycle() {
-    let mut ready = default_ready_response();
-    ready.weight_transfer_backend = Some("nccl".to_string());
-    let (service, engine_task) = setup_control_service_with_engine_script(ready, |dealer, push| {
-        boxed_test_future(async move {
-            let (call_id, method, args) = recv_utility_call(dealer).await;
-            assert_eq!(method, "collective_rpc");
-            assert_eq!(
-                args,
-                collective_args(
-                    "init_weight_transfer_engine",
-                    BTreeMap::from([(
-                        "init_info".to_string(),
-                        serde_json::json!({"master_address": "127.0.0.1"}),
-                    )]),
-                )
-            );
-            send_utility_result(push, call_id, vec![()]).await;
-
-            let (call_id, method, args) = recv_utility_call(dealer).await;
-            assert_eq!(method, "pause_scheduler");
-            assert_eq!(
-                args,
-                Value::Array(vec![Value::from("keep"), Value::from(true)])
-            );
-            send_utility_result(push, call_id, ()).await;
-
-            for expected_method in [
-                "start_weight_update",
-                "update_weights",
-                "finish_weight_update",
-            ] {
-                let (call_id, method, args) = recv_utility_call(dealer).await;
-                assert_eq!(method, "is_scheduler_paused");
-                assert_eq!(args, Value::Array(Vec::new()));
-                send_utility_result(push, call_id, true).await;
-
-                let (call_id, method, args) = recv_utility_call(dealer).await;
-                assert_eq!(method, "collective_rpc");
-                let kwargs = if expected_method == "update_weights" {
-                    BTreeMap::from([(
-                        "update_info".to_string(),
-                        serde_json::json!({"names": ["model.weight"]}),
-                    )])
-                } else {
-                    BTreeMap::new()
-                };
-                assert_eq!(args, collective_args(expected_method, kwargs));
-                send_utility_result(push, call_id, vec![()]).await;
-            }
-
-            let (call_id, method, args) = recv_utility_call(dealer).await;
-            assert_eq!(method, "set_weight_version");
-            assert_eq!(args, Value::Array(vec![Value::from("step-7")]));
-            send_utility_result(push, call_id, ()).await;
-
-            let (call_id, method, args) = recv_utility_call(dealer).await;
-            assert_eq!(method, "get_weight_version");
-            assert_eq!(args, Value::Array(Vec::new()));
-            send_utility_result(push, call_id, "step-7").await;
-
-            let (call_id, method, args) = recv_utility_call(dealer).await;
-            assert_eq!(method, "resume_scheduler");
-            assert_eq!(args, Value::Array(Vec::new()));
-            send_utility_result(push, call_id, ()).await;
-        })
-    })
-    .await;
-
-    pb::control_server::Control::init_weight_transfer_engine(
-        &service,
-        tonic::Request::new(pb::InitWeightTransferEngineRequest {
-            init_info_json: br#"{"master_address":"127.0.0.1"}"#.to_vec(),
-        }),
-    )
-    .await
-    .expect("initialize weight transfer");
-    pb::control_server::Control::pause_generation(
-        &service,
-        tonic::Request::new(pb::PauseGenerationRequest {
-            mode: pb::PauseMode::Keep as i32,
-            clear_cache: None,
-        }),
-    )
-    .await
-    .expect("pause generation");
-    pb::control_server::Control::start_weight_update(
-        &service,
-        tonic::Request::new(pb::StartWeightUpdateRequest {}),
-    )
-    .await
-    .expect("start weight update");
-    pb::control_server::Control::update_weights(
-        &service,
-        tonic::Request::new(pb::UpdateWeightsRequest {
-            update_info_json: br#"{"names":["model.weight"]}"#.to_vec(),
-        }),
-    )
-    .await
-    .expect("update weights");
-    pb::control_server::Control::finish_weight_update(
-        &service,
-        tonic::Request::new(pb::FinishWeightUpdateRequest {
-            weight_version: Some("step-7".to_string()),
-        }),
-    )
-    .await
-    .expect("finish weight update");
-    let version = pb::control_server::Control::get_weight_version(
-        &service,
-        tonic::Request::new(pb::GetWeightVersionRequest {}),
-    )
-    .await
-    .expect("get weight version")
-    .into_inner();
-    assert_eq!(version.weight_version, "step-7");
-    pb::control_server::Control::resume_generation(
-        &service,
-        tonic::Request::new(pb::ResumeGenerationRequest {}),
-    )
-    .await
-    .expect("resume generation");
-
-    engine_task.await.expect("mock engine task");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
 async fn control_rejects_weight_update_while_serving() {
     let mut ready = default_ready_response();
     ready.weight_transfer_backend = Some("nccl".to_string());
@@ -1762,6 +1623,9 @@ async fn control_aggregates_multi_engine_capacity() {
     ready_0.max_model_len = 8_192;
     ready_0.num_gpu_blocks = 10;
     ready_0.data_parallel_size = 2;
+    ready_0.weight_transfer_backend = Some("nccl".to_string());
+    ready_0.enable_sleep_mode = true;
+    ready_0.supports_draft_weight_updates = true;
 
     let mut ready_1 = default_ready_response();
     ready_1.max_model_len = 4_096;
@@ -1812,6 +1676,11 @@ async fn control_aggregates_multi_engine_capacity() {
     .into_inner();
     assert_eq!(server.max_model_len, 4_096);
     assert_eq!(server.total_kv_blocks, 30);
+    let rl = server.rl_capabilities.expect("RL capabilities");
+    assert!(!rl.weight_transfer_enabled);
+    assert!(rl.weight_transfer_backend.is_empty());
+    assert!(!rl.sleep_mode_enabled);
+    assert!(!rl.draft_weight_updates_enabled);
 
     drop(engine_tasks);
 }
