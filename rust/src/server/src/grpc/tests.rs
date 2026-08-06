@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::future::Future;
 use std::io;
@@ -12,6 +13,7 @@ use std::time::Duration;
 use futures::StreamExt as _;
 use hyper_util::rt::TokioIo;
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
+use rmpv::Value;
 use serial_test::serial;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
@@ -30,11 +32,14 @@ use vllm_engine_core_client::mock_engine::{
     DEFAULT_MOCK_BLOCK_SIZE, DEFAULT_MOCK_MAX_MODEL_LEN, DEFAULT_MOCK_NUM_GPU_BLOCKS,
     default_ready_response,
 };
+use vllm_engine_core_client::protocol::decode_value;
 use vllm_engine_core_client::protocol::handshake::KvEventsConfig;
 use vllm_engine_core_client::protocol::output::{
     EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
+    UtilityCallOutput,
 };
 use vllm_engine_core_client::protocol::request::EngineCoreRequest;
+use vllm_engine_core_client::protocol::utility::{UtilityOutput, UtilityResultEnvelope};
 use vllm_engine_core_client::test_utils::{
     IpcNamespace, spawn_mock_engine_task, spawn_mock_engine_task_with_ready,
 };
@@ -161,6 +166,49 @@ async fn send_outputs(push: &mut PushSocket, outputs: EngineCoreOutputs) {
 
 async fn recv_engine_message(dealer: &mut DealerSocket) -> Vec<bytes::Bytes> {
     dealer.recv().await.expect("recv engine message").into_vec()
+}
+
+async fn recv_utility_call(dealer: &mut DealerSocket) -> (u64, String, Value) {
+    let frames = recv_engine_message(dealer).await;
+    assert_eq!(frames[0].as_ref(), &[0x03]);
+    let payload = decode_value(&frames[1]).expect("decode utility payload");
+    let fields = payload.as_array().expect("utility payload array");
+    (
+        fields[1].as_u64().expect("utility call id"),
+        fields[2].as_str().expect("utility method").to_owned(),
+        fields[3].clone(),
+    )
+}
+
+async fn send_utility_result<T>(push: &mut PushSocket, call_id: u64, result: T)
+where
+    T: serde::Serialize,
+{
+    send_outputs(
+        push,
+        UtilityCallOutput {
+            output: UtilityOutput {
+                call_id: call_id.into(),
+                failure_message: None,
+                result: Some(UtilityResultEnvelope::without_type_info(
+                    rmpv::ext::to_value(result).expect("encode utility result"),
+                )),
+            },
+            ..Default::default()
+        }
+        .into(),
+    )
+    .await;
+}
+
+fn collective_args(method: &str, kwargs: BTreeMap<String, serde_json::Value>) -> Value {
+    rmpv::ext::to_value((
+        method,
+        Option::<f64>::None,
+        Vec::<serde_json::Value>::new(),
+        kwargs,
+    ))
+    .expect("encode collective arguments")
 }
 
 #[derive(Clone, Debug)]
@@ -342,6 +390,44 @@ where
             .max_decoding_message_size(crate::DEFAULT_REQUEST_BODY_LIMIT_BYTES),
         ControlServer::new(ControlServiceImpl::new(state)),
         engine_health,
+        engine_task,
+    )
+}
+
+async fn setup_control_service_with_engine_script<F>(
+    ready: vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse,
+    script: F,
+) -> (ControlServiceImpl, MockEngineTask)
+where
+    F: for<'a> FnOnce(&'a mut DealerSocket, &'a mut PushSocket) -> TestFuture<'a> + Send + 'static,
+{
+    let ipc = IpcNamespace::new().expect("create ipc namespace");
+    let handshake_address = ipc.handshake_endpoint();
+    let engine_task = MockEngineTask::new(spawn_mock_engine_task_with_ready(
+        handshake_address.clone(),
+        b"engine-grpc-rl".to_vec(),
+        ready,
+        script,
+    ));
+    let client = EngineCoreClient::connect(
+        EngineCoreClientConfig::new_single(handshake_address)
+            .with_model_name("test-model")
+            .with_local_input_output_addresses(
+                Some(ipc.input_endpoint()),
+                Some(ipc.output_endpoint()),
+            ),
+    )
+    .await
+    .expect("connect client");
+    let chat = ChatLlm::from_shared_backend(
+        Llm::new(client),
+        Arc::new(FakeTextBackend) as Arc<dyn ChatTextBackend>,
+    );
+    (
+        ControlServiceImpl::new(Arc::new(AppState::new(
+            vec!["test-model".to_string()],
+            chat,
+        ))),
         engine_task,
     )
 }
@@ -1488,6 +1574,11 @@ async fn control_reports_server_and_model_info() {
     assert_eq!(parallelism.data_parallel_size, 1);
     assert_eq!(parallelism.data_parallel_rank, 0);
     assert_eq!(parallelism.decode_context_parallel_size, 1);
+    let rl = server.rl_capabilities.expect("RL capabilities");
+    assert!(!rl.weight_transfer_enabled);
+    assert!(rl.weight_transfer_backend.is_empty());
+    assert!(!rl.sleep_mode_enabled);
+    assert!(!rl.draft_weight_updates_enabled);
 
     let model = client
         .get_model_info(pb::GetModelInfoRequest {})
@@ -1504,6 +1595,162 @@ async fn control_reports_server_and_model_info() {
     assert!(model.tool_call_parser.is_empty());
 
     server_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn control_executes_safe_weight_update_lifecycle() {
+    let mut ready = default_ready_response();
+    ready.weight_transfer_backend = Some("nccl".to_string());
+    let (service, engine_task) = setup_control_service_with_engine_script(ready, |dealer, push| {
+        boxed_test_future(async move {
+            let (call_id, method, args) = recv_utility_call(dealer).await;
+            assert_eq!(method, "collective_rpc");
+            assert_eq!(
+                args,
+                collective_args(
+                    "init_weight_transfer_engine",
+                    BTreeMap::from([(
+                        "init_info".to_string(),
+                        serde_json::json!({"master_address": "127.0.0.1"}),
+                    )]),
+                )
+            );
+            send_utility_result(push, call_id, vec![()]).await;
+
+            let (call_id, method, args) = recv_utility_call(dealer).await;
+            assert_eq!(method, "pause_scheduler");
+            assert_eq!(
+                args,
+                Value::Array(vec![Value::from("keep"), Value::from(true)])
+            );
+            send_utility_result(push, call_id, ()).await;
+
+            for expected_method in [
+                "start_weight_update",
+                "update_weights",
+                "finish_weight_update",
+            ] {
+                let (call_id, method, args) = recv_utility_call(dealer).await;
+                assert_eq!(method, "is_scheduler_paused");
+                assert_eq!(args, Value::Array(Vec::new()));
+                send_utility_result(push, call_id, true).await;
+
+                let (call_id, method, args) = recv_utility_call(dealer).await;
+                assert_eq!(method, "collective_rpc");
+                let kwargs = if expected_method == "update_weights" {
+                    BTreeMap::from([(
+                        "update_info".to_string(),
+                        serde_json::json!({"names": ["model.weight"]}),
+                    )])
+                } else {
+                    BTreeMap::new()
+                };
+                assert_eq!(args, collective_args(expected_method, kwargs));
+                send_utility_result(push, call_id, vec![()]).await;
+            }
+
+            let (call_id, method, args) = recv_utility_call(dealer).await;
+            assert_eq!(method, "set_weight_version");
+            assert_eq!(args, Value::Array(vec![Value::from("step-7")]));
+            send_utility_result(push, call_id, ()).await;
+
+            let (call_id, method, args) = recv_utility_call(dealer).await;
+            assert_eq!(method, "get_weight_version");
+            assert_eq!(args, Value::Array(Vec::new()));
+            send_utility_result(push, call_id, "step-7").await;
+
+            let (call_id, method, args) = recv_utility_call(dealer).await;
+            assert_eq!(method, "resume_scheduler");
+            assert_eq!(args, Value::Array(Vec::new()));
+            send_utility_result(push, call_id, ()).await;
+        })
+    })
+    .await;
+
+    pb::control_server::Control::init_weight_transfer_engine(
+        &service,
+        tonic::Request::new(pb::InitWeightTransferEngineRequest {
+            init_info_json: br#"{"master_address":"127.0.0.1"}"#.to_vec(),
+        }),
+    )
+    .await
+    .expect("initialize weight transfer");
+    pb::control_server::Control::pause_generation(
+        &service,
+        tonic::Request::new(pb::PauseGenerationRequest {
+            mode: pb::PauseMode::Keep as i32,
+            clear_cache: None,
+        }),
+    )
+    .await
+    .expect("pause generation");
+    pb::control_server::Control::start_weight_update(
+        &service,
+        tonic::Request::new(pb::StartWeightUpdateRequest {}),
+    )
+    .await
+    .expect("start weight update");
+    pb::control_server::Control::update_weights(
+        &service,
+        tonic::Request::new(pb::UpdateWeightsRequest {
+            update_info_json: br#"{"names":["model.weight"]}"#.to_vec(),
+        }),
+    )
+    .await
+    .expect("update weights");
+    pb::control_server::Control::finish_weight_update(
+        &service,
+        tonic::Request::new(pb::FinishWeightUpdateRequest {
+            weight_version: Some("step-7".to_string()),
+        }),
+    )
+    .await
+    .expect("finish weight update");
+    let version = pb::control_server::Control::get_weight_version(
+        &service,
+        tonic::Request::new(pb::GetWeightVersionRequest {}),
+    )
+    .await
+    .expect("get weight version")
+    .into_inner();
+    assert_eq!(version.weight_version, "step-7");
+    pb::control_server::Control::resume_generation(
+        &service,
+        tonic::Request::new(pb::ResumeGenerationRequest {}),
+    )
+    .await
+    .expect("resume generation");
+
+    engine_task.await.expect("mock engine task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn control_rejects_weight_update_while_serving() {
+    let mut ready = default_ready_response();
+    ready.weight_transfer_backend = Some("nccl".to_string());
+    let (service, engine_task) = setup_control_service_with_engine_script(ready, |dealer, push| {
+        boxed_test_future(async move {
+            let (call_id, method, args) = recv_utility_call(dealer).await;
+            assert_eq!(method, "is_scheduler_paused");
+            assert_eq!(args, Value::Array(Vec::new()));
+            send_utility_result(push, call_id, false).await;
+        })
+    })
+    .await;
+
+    let error = pb::control_server::Control::update_weights(
+        &service,
+        tonic::Request::new(pb::UpdateWeightsRequest {
+            update_info_json: br#"{"names":["model.weight"]}"#.to_vec(),
+        }),
+    )
+    .await
+    .expect_err("unpaused weight update should fail");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
+    engine_task.await.expect("mock engine task");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
