@@ -1472,6 +1472,54 @@ async fn call_utility_failure_message_surfaces_as_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_utility_call_unregisters_waiter() {
+    init_tracing();
+    let ipc = IpcNamespace::new().unwrap();
+    let handshake_address = ipc.handshake_endpoint();
+    let (received_tx, received_rx) = oneshot::channel();
+    let (_shutdown, engine_task) = spawn_mock_engine_task(
+        handshake_address.clone(),
+        vec![0x00, 0x00],
+        |dealer, _push| {
+            Box::pin(async move {
+                let _utility = recv_engine_message(dealer).await;
+                let _ = received_tx.send(());
+                std::future::pending::<()>().await;
+            })
+        },
+    );
+    let client = std::sync::Arc::new(
+        connect_client_with_ipc(
+            handshake_test_config(
+                handshake_address,
+                1,
+                "test-model",
+                Duration::from_secs(2),
+                0,
+                None,
+            ),
+            &ipc,
+        )
+        .await,
+    );
+    let call_client = client.clone();
+    let call = tokio::spawn(async move {
+        call_client.call_utility_per_engine::<bool, _>("add_lora", ()).await
+    });
+
+    received_rx.await.unwrap();
+    assert_eq!(client.pending_utility_call_count(), 1);
+    call.abort();
+    assert!(call.await.unwrap_err().is_cancelled());
+    assert_eq!(client.pending_utility_call_count(), 0);
+
+    engine_task.abort();
+    let client = std::sync::Arc::try_unwrap(client)
+        .unwrap_or_else(|_| panic!("utility task retained client after cancellation"));
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dispatcher_failure_propagates_to_waiting_utility_calls() {
     init_tracing();
     let ipc = IpcNamespace::new().unwrap();
@@ -2681,6 +2729,8 @@ fn python_msgpack_fixtures_match_rust_encoding() {
 
     let ready_response: EngineCoreReadyResponse =
         rmp_serde::from_slice(&hex::decode(ready_response_hex).unwrap()).unwrap();
+    assert!(ready_response.supports_lora);
+    assert_eq!(ready_response.max_loras, 8);
     let kv_events_config = ready_response.kv_events_config.expect("KV events config should decode");
     assert!(kv_events_config.enable_kv_cache_events);
     assert_eq!(kv_events_config.publisher, "zmq");

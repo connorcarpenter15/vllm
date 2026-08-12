@@ -7,6 +7,7 @@ mod control;
 mod convert;
 mod health;
 mod inference;
+mod lora_rpc;
 
 /// Generated protobuf/gRPC types for the `vllm` package.
 pub mod pb {
@@ -15,7 +16,7 @@ pub mod pb {
 
 pub(crate) use control::ControlGrpcService;
 pub use control::ControlServiceImpl;
-pub(crate) use health::monitor_health;
+pub(crate) use health::{monitor_health, monitor_lora_health};
 pub(crate) use inference::InferenceGrpcService;
 pub use inference::InferenceServiceImpl;
 pub use pb::control_server::ControlServer;

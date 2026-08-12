@@ -66,7 +66,13 @@ pub async fn completions(
 ) -> Response {
     let stream = body.stream;
     let request_context = resolve_request_context(&headers, body.request_id.as_deref());
-    let lora_resolution = state.resolve_model_with_loras(Some(&body.model)).await;
+    let mut lora_resolution = state.resolve_model_with_loras(Some(&body.model)).await;
+    if lora_resolution.lora_request.is_some() && !state.lora_state_is_consistent() {
+        return ApiError::server_error(
+            "LoRA state differs across engine ranks; restart the engine".to_string(),
+        )
+        .into_response();
+    }
 
     let tokenizer = state.chat.text().tokenizer();
     let prepared = match prepare_completion_request(
@@ -98,6 +104,7 @@ pub async fn completions(
             return text_submit_error("failed to submit completion request", error).into_response();
         }
     };
+    let text_stream = crate::lora::hold_lora_lease(text_stream, lora_resolution.lease.take());
 
     if stream {
         let chunk_stream = completion_chunk_stream(

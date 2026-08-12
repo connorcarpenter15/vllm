@@ -65,6 +65,7 @@ fn model_resolution(state: &RenderState) -> LoraModelResolution {
     LoraModelResolution {
         model_names: state.served_model_names.clone(),
         lora_request: None,
+        lease: None,
     }
 }
 
