@@ -235,6 +235,7 @@ where
             grpc_tls,
             health_reporter,
             engine_health,
+            state.clone(),
         ))
     } else {
         None
@@ -324,7 +325,7 @@ where
         let server_shutdown = server_shutdown.clone();
         let force_shutdown = force_shutdown.clone();
         async move {
-            let Some((addr, grpc_listener, svc, grpc_tls, health_reporter, engine_health)) =
+            let Some((addr, grpc_listener, svc, grpc_tls, health_reporter, engine_health, state)) =
                 grpc_setup
             else {
                 // No gRPC configured: just wait for shutdown so we do not race the
@@ -339,6 +340,8 @@ where
             };
             let server =
                 svc.serve_with_incoming_shutdown(incoming, shutdown.clone().cancelled_owned());
+            let lora_health_monitor =
+                grpc::monitor_lora_health(state, health_reporter.clone(), shutdown.child_token());
             let health_monitor = grpc::monitor_health(health_reporter, engine_health, shutdown);
 
             info!(%addr, tls, model, "gRPC server is ready to accept requests");
@@ -358,7 +361,7 @@ where
                 result
             };
 
-            let (result, ()) = tokio::join!(server, health_monitor);
+            let (result, (), ()) = tokio::join!(server, health_monitor, lora_health_monitor);
             result
         }
     };

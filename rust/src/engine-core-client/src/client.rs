@@ -216,6 +216,31 @@ pub struct EngineCoreClient {
     coordinator_task: Option<AbortOnDropHandle<()>>,
 }
 
+/// Removes utility waiters if a call future is cancelled before completion.
+struct UtilityCallGuard {
+    inner: Arc<ClientInner>,
+    call_ids: Vec<u64>,
+}
+
+impl UtilityCallGuard {
+    fn new(inner: Arc<ClientInner>) -> Self {
+        Self {
+            inner,
+            call_ids: Vec::new(),
+        }
+    }
+
+    fn track(&mut self, call_id: u64) {
+        self.call_ids.push(call_id);
+    }
+}
+
+impl Drop for UtilityCallGuard {
+    fn drop(&mut self) {
+        self.inner.unregister_utility_calls(self.call_ids.drain(..));
+    }
+}
+
 impl EngineCoreClient {
     /// Connect to Python `EngineCoreProc`s using the configured
     /// transport/coordinator modes.
@@ -284,6 +309,7 @@ impl EngineCoreClient {
         config: EngineCoreClientConfig,
         connected: transport::ConnectedTransport,
     ) -> Result<Self> {
+        validate_lora_capabilities(&connected.engines)?;
         let (output_tx, output_rx) = mpsc::channel(64);
         let (abort_tx, abort_rx) = mpsc::unbounded_channel();
         let engines = connected.engines;
@@ -373,6 +399,11 @@ impl EngineCoreClient {
     /// Return the number of engines connected to this client.
     pub fn engine_count(&self) -> usize {
         self.engines.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_utility_call_count(&self) -> usize {
+        self.inner.pending_utility_call_count()
     }
 
     /// Return the engine-side indices connected to this client.
@@ -474,6 +505,32 @@ impl EngineCoreClient {
     }
 }
 
+fn validate_lora_capabilities(engines: &[ConnectedEngine]) -> Result<()> {
+    let first = engines.first().expect("engine core client requires at least one engine");
+    for engine in engines {
+        let ready = &engine.ready_response;
+        if ready.supports_lora != (ready.max_loras > 0) {
+            return Err(Error::UnexpectedHandshakeMessage {
+                message: format!(
+                    "engine {:?} reported inconsistent LoRA capability (supports_lora={}, max_loras={})",
+                    engine.engine_id, ready.supports_lora, ready.max_loras
+                ),
+            });
+        }
+        if ready.supports_lora != first.ready_response.supports_lora
+            || ready.max_loras != first.ready_response.max_loras
+        {
+            return Err(Error::UnexpectedHandshakeMessage {
+                message: format!(
+                    "engine {:?} reported LoRA capability inconsistent with engine {:?}",
+                    engine.engine_id, first.engine_id
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 // Client API implementation.
 impl EngineCoreClient {
     /// Add a new request to the engine and return a per-request raw output
@@ -549,6 +606,65 @@ impl EngineCoreClient {
         Ok(())
     }
 
+    /// Call a typed utility method on all connected engines, preserving one
+    /// result per engine. The outer error is reserved for failures before any
+    /// request can be dispatched.
+    pub async fn call_utility_per_engine<T, A>(
+        &self,
+        method: &str,
+        args: A,
+    ) -> Result<Vec<Result<T>>>
+    where
+        T: serde::de::DeserializeOwned,
+        A: serde::Serialize + std::fmt::Debug,
+    {
+        trace!(
+            method,
+            client_index = self.config.client_index,
+            engine_count = self.engines.len(),
+            "sending utility request"
+        );
+
+        let mut call_guard = UtilityCallGuard::new(self.inner.clone());
+        let mut pending_calls = Vec::with_capacity(self.engines.len());
+        let mut prepared_sends = Vec::with_capacity(self.engines.len());
+        for engine in &self.engines {
+            let (call_id, rx) = match self.inner.allocate_and_register_utility_call() {
+                Ok(pair) => pair,
+                Err(err) => return Err(err),
+            };
+            call_guard.track(call_id);
+            let request = match EngineCoreUtilityRequest::new(
+                self.config.client_index,
+                call_id,
+                method,
+                &args,
+            ) {
+                Ok(request) => request,
+                Err(err) => return Err(err),
+            };
+            pending_calls.push((call_id, rx));
+            prepared_sends.push((&engine.engine_id, request));
+        }
+
+        let send_results = join_all(prepared_sends.iter().map(|(engine_id, request)| {
+            self.inner.send_to_engine(engine_id, EngineCoreRequestType::Utility, request)
+        }))
+        .await;
+        let calls = pending_calls.into_iter().zip(send_results).map(
+            |((call_id, rx), send_result)| async move {
+                send_result?;
+                rx.await
+                    .map_err(|_| Error::UtilityCallClosed {
+                        method: method.to_string(),
+                        call_id,
+                    })??
+                    .into_typed_result(method)
+            },
+        );
+        Ok(join_all(calls).await)
+    }
+
     /// Call a typed utility method on all connected engines, returning one
     /// decoded result per connected engine if all calls succeed or an error
     /// if any call fails.
@@ -568,54 +684,24 @@ impl EngineCoreClient {
             "sending utility request"
         );
 
-        // Phase 1: allocate one call id per engine and build the per-engine
-        // request payloads up-front. Any failure here (registry closed, encode
-        // error) must roll back the call ids already allocated so they do not
-        // leak in the utility registry until shutdown.
+        let mut call_guard = UtilityCallGuard::new(self.inner.clone());
         let mut pending_calls = Vec::with_capacity(self.engines.len());
         let mut prepared_sends = Vec::with_capacity(self.engines.len());
         for engine in &self.engines {
-            let (call_id, rx) = match self.inner.allocate_and_register_utility_call() {
-                Ok(pair) => pair,
-                Err(err) => {
-                    self.inner.unregister_utility_calls(pending_calls.iter().map(|(id, _)| *id));
-                    return Err(err);
-                }
-            };
-            let request = match EngineCoreUtilityRequest::new(
-                self.config.client_index,
-                call_id,
-                method,
-                &args,
-            ) {
-                Ok(request) => request,
-                Err(err) => {
-                    self.inner.unregister_utility_calls(
-                        pending_calls.iter().map(|(id, _)| *id).chain(std::iter::once(call_id)),
-                    );
-                    return Err(err);
-                }
-            };
+            let (call_id, rx) = self.inner.allocate_and_register_utility_call()?;
+            call_guard.track(call_id);
+            let request =
+                EngineCoreUtilityRequest::new(self.config.client_index, call_id, method, &args)?;
             pending_calls.push((call_id, rx));
             prepared_sends.push((&engine.engine_id, request));
         }
 
-        // Phase 2: dispatch every utility request concurrently. `try_join_all`
-        // fails fast on the first transport error and drops the remaining send
-        // futures; any engines that already received the request will reply,
-        // but those replies are simply dropped because we roll back the call
-        // ids below.
-        let send_futures = prepared_sends.iter().map(|(engine_id, request)| {
+        let sends = prepared_sends.iter().map(|(engine_id, request)| {
             self.inner.send_to_engine(engine_id, EngineCoreRequestType::Utility, request)
         });
-        if let Err(err) = try_join_all(send_futures).await {
-            self.inner.unregister_utility_calls(pending_calls.iter().map(|(id, _)| *id));
-            return Err(err);
-        }
+        try_join_all(sends).await?;
 
-        // Phase 3: wait for all engines to respond and preserve the per-engine
-        // result list.
-        let futures = pending_calls.into_iter().map(|(call_id, rx)| async move {
+        let calls = pending_calls.into_iter().map(|(call_id, rx)| async move {
             rx.await
                 .map_err(|_| Error::UtilityCallClosed {
                     method: method.to_string(),
@@ -623,7 +709,7 @@ impl EngineCoreClient {
                 })??
                 .into_typed_result(method)
         });
-        try_join_all(futures).await
+        try_join_all(calls).await
     }
 
     /// Call a utility method on all connected engines and return the shared

@@ -57,6 +57,7 @@ impl pb::control_server::Control for ControlServiceImpl {
             total_kv_blocks: self.state.engine_core_client().total_num_gpu_blocks(),
             max_running_requests: ready.max_num_seqs,
             max_batched_tokens: ready.max_num_batched_tokens,
+            max_loras: ready.max_loras,
         }))
     }
 
@@ -72,6 +73,7 @@ impl pb::control_server::Control for ControlServiceImpl {
             // GenerateRequest accepts both prompt representations.
             supports_text_input: true,
             supports_token_ids_input: true,
+            supports_lora: self.ready().supports_lora,
             supports_multimodal: self.state.chat.supports_multimodal(),
             reasoning_parser: self
                 .state
@@ -102,6 +104,27 @@ impl pb::control_server::Control for ControlServiceImpl {
             .await
             .map_err(|error| Status::internal(error.to_report_string()))?;
         Ok(Response::new(pb::AbortResponse {}))
+    }
+
+    async fn load_lora(
+        &self,
+        request: Request<pb::LoadLoraRequest>,
+    ) -> Result<Response<pb::LoadLoraResponse>, Status> {
+        super::lora_rpc::load_lora(&self.state, request).await
+    }
+
+    async fn unload_lora(
+        &self,
+        request: Request<pb::UnloadLoraRequest>,
+    ) -> Result<Response<pb::UnloadLoraResponse>, Status> {
+        super::lora_rpc::unload_lora(&self.state, request).await
+    }
+
+    async fn list_loras(
+        &self,
+        request: Request<pb::ListLorasRequest>,
+    ) -> Result<Response<pb::ListLorasResponse>, Status> {
+        super::lora_rpc::list_loras(&self.state, request).await
     }
 
     async fn get_kv_event_sources(

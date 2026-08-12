@@ -31,6 +31,7 @@ pub struct InferenceServiceImpl {
 
 struct PreparedGrpcRequest {
     text_request: TextRequest,
+    lora_lease: crate::lora::LoraLease,
     request_span: Span,
     started_at: Instant,
 }
@@ -58,12 +59,14 @@ impl InferenceServiceImpl {
         } else {
             proto_request.model.clone()
         };
+        let lora_name = proto_request.lora_name.clone();
         let media_count = proto_request.media.len();
         let request_span = info_span!(
             "grpc_inference",
             %request_id,
             rpc,
             %model,
+            %lora_name,
             media_count,
             ?data_parallel_rank,
         );
@@ -75,6 +78,25 @@ impl InferenceServiceImpl {
                 convert::to_text_request(proto_request, stream, self.state.served_model_names())?;
             text_request.arrival_time = Some(arrival_time);
             text_request.data_parallel_rank = data_parallel_rank;
+
+            let mut lora_lease = None;
+            if !lora_name.is_empty() {
+                if !self.state.engine_core_client().ready_response().supports_lora {
+                    return Err(Status::failed_precondition(
+                        "engine was not started with LoRA enabled",
+                    ));
+                }
+                let mut resolution = self.state.resolve_model_with_loras(Some(&lora_name)).await;
+                lora_lease = resolution.lease.take();
+                if !self.state.lora_state_is_consistent() {
+                    return Err(Status::failed_precondition(
+                        "LoRA state differs across engine ranks; restart the engine",
+                    ));
+                }
+                text_request.lora_request = Some(resolution.lora_request.ok_or_else(|| {
+                    Status::not_found(format!("LoRA adapter `{lora_name}` is not loaded"))
+                })?);
+            }
 
             let media = convert::media_parts_from_request(media)?;
             if !media.is_empty() {
@@ -93,13 +115,13 @@ impl InferenceServiceImpl {
                 text_request.mm_features = mm_features;
             }
 
-            Ok(text_request)
+            Ok((text_request, lora_lease))
         }
         .instrument(request_span.clone())
         .await;
 
-        let text_request = match result {
-            Ok(text_request) => text_request,
+        let (text_request, lora_lease) = match result {
+            Ok(prepared) => prepared,
             Err(status) => {
                 warn!(
                     parent: &request_span,
@@ -114,6 +136,7 @@ impl InferenceServiceImpl {
 
         Ok(PreparedGrpcRequest {
             text_request,
+            lora_lease,
             request_span,
             started_at,
         })
@@ -149,6 +172,7 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
         let response_opts = ResponseOpts::from_proto(proto_req.response.as_ref());
         let PreparedGrpcRequest {
             text_request,
+            lora_lease,
             request_span,
             started_at,
         } = self.prepare_request(proto_req, data_parallel_rank, false, "Generate").await?;
@@ -161,6 +185,7 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
             .instrument(request_span.clone())
             .await
             .map_err(|error| log_text_error(&request_span, started_at, "submission", error))?;
+        let stream = crate::lora::hold_lora_lease(stream, lora_lease);
 
         let collected = stream
             .collect_output()
@@ -211,6 +236,7 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
         let response_opts = ResponseOpts::from_proto(proto_req.response.as_ref());
         let PreparedGrpcRequest {
             text_request,
+            lora_lease,
             request_span,
             started_at,
         } = self
@@ -225,6 +251,7 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
             .instrument(request_span.clone())
             .await
             .map_err(|error| log_text_error(&request_span, started_at, "submission", error))?;
+        let stream = crate::lora::hold_lora_lease(stream, lora_lease);
 
         let (tx, rx) = mpsc::channel(32);
 
@@ -232,7 +259,9 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
         tokio::spawn(
             async move {
                 futures::pin_mut!(stream);
-                while let Some(event) = stream.next().await {
+                while let Some(event) =
+                    next_stream_event_or_receiver_closed(stream.as_mut(), &tx).await
+                {
                     let response = match event {
                         Err(error) => Err(log_text_error(&task_span, started_at, "stream", error)),
                         Ok(DecodedTextEvent::Start {
@@ -284,6 +313,20 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
     }
 }
 
+async fn next_stream_event_or_receiver_closed<S, T>(
+    mut stream: Pin<&mut S>,
+    tx: &mpsc::Sender<T>,
+) -> Option<S::Item>
+where
+    S: Stream + ?Sized,
+{
+    tokio::select! {
+        biased;
+        _ = tx.closed() => None,
+        event = stream.next() => event,
+    }
+}
+
 fn text_error_to_status(error: vllm_text::Error) -> Status {
     let message = error.to_report_string();
     if error.is_request_validation_error() {
@@ -309,4 +352,33 @@ fn log_text_error(
         "gRPC inference request failed"
     );
     status
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn receiver_drop_releases_lora_lease_while_engine_stream_is_stalled() {
+        let lock = Arc::new(tokio::sync::RwLock::new(()));
+        let lease = lock.clone().read_owned().await;
+        let stream = crate::lora::hold_lora_lease(futures::stream::pending::<()>(), Some(lease));
+        let (tx, rx) = mpsc::channel::<()>(1);
+
+        let forwarder = tokio::spawn(async move {
+            futures::pin_mut!(stream);
+            assert!(next_stream_event_or_receiver_closed(stream.as_mut(), &tx).await.is_none());
+        });
+        drop(rx);
+
+        tokio::time::timeout(Duration::from_secs(1), forwarder)
+            .await
+            .expect("forwarder should notice receiver cancellation")
+            .expect("forwarder task should succeed");
+        tokio::time::timeout(Duration::from_secs(1), lock.write_owned())
+            .await
+            .expect("cancellation should release the LoRA lease");
+    }
 }

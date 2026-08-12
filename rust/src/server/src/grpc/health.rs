@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tonic::server::NamedService;
@@ -9,6 +12,9 @@ use tonic_health::server::HealthReporter;
 use tracing::{info, warn};
 
 use super::{ControlGrpcService, InferenceGrpcService};
+use crate::state::AppState;
+
+const LORA_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(crate) async fn monitor_health(
     mut health_reporter: HealthReporter,
@@ -62,4 +68,33 @@ pub(crate) async fn monitor_health(
     health_reporter.clear_service_status(inference_service).await;
     health_reporter.clear_service_status(control_service).await;
     health_reporter.clear_service_status("").await;
+}
+
+pub(crate) async fn monitor_lora_health(
+    state: Arc<AppState>,
+    health_reporter: HealthReporter,
+    shutdown: CancellationToken,
+) {
+    let mut interval = tokio::time::interval(LORA_HEALTH_POLL_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = interval.tick() => {
+                if !state.lora_state_is_consistent() {
+                    warn!(
+                        status = ?ServingStatus::NotServing,
+                        reason = "lora_state_inconsistent",
+                        "marking gRPC health services as not serving"
+                    );
+                    health_reporter.set_not_serving::<InferenceGrpcService>().await;
+                    health_reporter.set_not_serving::<ControlGrpcService>().await;
+                    health_reporter
+                        .set_service_status("", ServingStatus::NotServing)
+                        .await;
+                    return;
+                }
+            }
+        }
+    }
 }
