@@ -1462,6 +1462,124 @@ async fn call_utility_failure_message_surfaces_as_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_utility_per_engine_preserves_partial_failure() {
+    init_tracing();
+    let ipc = IpcNamespace::new().unwrap();
+    let handshake_address = ipc.handshake_endpoint();
+    let spawn_engine = |engine_index: u16, response: std::result::Result<bool, &'static str>| {
+        spawn_mock_engine_task(
+            handshake_address.clone(),
+            EngineId::from_engine_index(engine_index).into_frame().to_vec(),
+            move |dealer, push| {
+                Box::pin(async move {
+                    let utility = recv_engine_message(dealer).await;
+                    let payload = decode_value(&utility[1]);
+                    let call_id =
+                        payload.as_array().and_then(|array| array[1].as_u64()).expect("call_id");
+                    let (failure_message, result) = match response {
+                        Ok(value) => (None, Some(utility_result_value(value))),
+                        Err(message) => (Some(message.to_string()), None),
+                    };
+                    send_outputs(
+                        push,
+                        UtilityCallOutput {
+                            engine_index: engine_index.into(),
+                            timestamp: 0.0,
+                            output: UtilityOutput {
+                                call_id: call_id.into(),
+                                failure_message,
+                                result,
+                            },
+                        }
+                        .into(),
+                    )
+                    .await;
+                })
+            },
+        )
+    };
+    let (shutdown_tx_0, engine_task_0) = spawn_engine(0, Ok(true));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (shutdown_tx_1, engine_task_1) = spawn_engine(1, Err("boom"));
+
+    let client = connect_client_with_ipc(
+        handshake_test_config(
+            handshake_address,
+            2,
+            "test-model",
+            Duration::from_secs(2),
+            0,
+            None,
+        ),
+        &ipc,
+    )
+    .await;
+
+    let results = client.call_utility_per_engine::<bool, _>("add_lora", ()).await.unwrap();
+    assert!(
+        matches!(results.as_slice(), [Ok(true), Err(Error::UtilityCallFailed {
+        method,
+        message,
+        ..
+    })] if method == "add_lora" && message == "boom")
+    );
+
+    let _ = shutdown_tx_0.send(());
+    let _ = shutdown_tx_1.send(());
+    engine_task_0.await.unwrap();
+    engine_task_1.await.unwrap();
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_utility_call_unregisters_waiter() {
+    init_tracing();
+    let ipc = IpcNamespace::new().unwrap();
+    let handshake_address = ipc.handshake_endpoint();
+    let (received_tx, received_rx) = oneshot::channel();
+    let (_shutdown, engine_task) = spawn_mock_engine_task(
+        handshake_address.clone(),
+        vec![0x00, 0x00],
+        |dealer, _push| {
+            Box::pin(async move {
+                let _utility = recv_engine_message(dealer).await;
+                let _ = received_tx.send(());
+                std::future::pending::<()>().await;
+            })
+        },
+    );
+    let client = std::sync::Arc::new(
+        connect_client_with_ipc(
+            handshake_test_config(
+                handshake_address,
+                1,
+                "test-model",
+                Duration::from_secs(2),
+                0,
+                None,
+            ),
+            &ipc,
+        )
+        .await,
+    );
+    let call_client = client.clone();
+    let call = tokio::spawn(async move {
+        call_client.call_utility_per_engine::<bool, _>("add_lora", ()).await
+    });
+
+    received_rx.await.unwrap();
+    assert_eq!(client.pending_utility_call_count(), 1);
+    call.abort();
+    assert!(call.await.unwrap_err().is_cancelled());
+    assert_eq!(client.pending_utility_call_count(), 0);
+
+    engine_task.abort();
+    let client = std::sync::Arc::try_unwrap(client)
+        .unwrap_or_else(|_| panic!("utility task retained client after cancellation"));
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dispatcher_failure_propagates_to_waiting_utility_calls() {
     init_tracing();
     let ipc = IpcNamespace::new().unwrap();

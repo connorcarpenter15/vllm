@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use thiserror_ext::AsReport as _;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, watch};
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, info, trace, warn};
 use vllm_metrics::METRICS;
 use zeromq::RouterSendHalf;
@@ -116,6 +117,11 @@ impl ClientInner {
     /// the full set without first filtering successful sends.
     pub fn unregister_utility_calls(&self, call_ids: impl IntoIterator<Item = u64>) {
         self.utility_reg.lock().unregister_many(call_ids);
+    }
+
+    #[cfg(test)]
+    pub fn pending_utility_call_count(&self) -> usize {
+        self.utility_reg.lock().len()
     }
 
     /// Undo a request registration when `add_request()` fails.
@@ -270,18 +276,17 @@ impl ClientInner {
         let mut input_send = self.input_send.clone();
         let engine_id = engine_id.clone();
 
-        self.handle
-            .spawn(async move {
-                transport::send_message(
-                    &mut input_send,
-                    &engine_id,
-                    request_type.to_frame(),
-                    payload,
-                    aux_frames,
-                )
-                .await
-            })
-            .await?
+        AbortOnDropHandle::new(self.handle.spawn(async move {
+            transport::send_message(
+                &mut input_send,
+                &engine_id,
+                request_type.to_frame(),
+                payload,
+                aux_frames,
+            )
+            .await
+        }))
+        .await?
     }
 
     /// Handle an abort request by sending the abort message to the engine.
