@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::future::{join_all, try_join_all};
+use futures::future::join_all;
 use itertools::Itertools;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -608,68 +608,10 @@ impl EngineCoreClient {
         Ok(())
     }
 
-    /// Call a typed utility method on all connected engines, preserving one
-    /// result per engine. The outer error is reserved for failures before any
-    /// request can be dispatched.
-    pub async fn call_utility_per_engine<T, A>(
-        &self,
-        method: &str,
-        args: A,
-    ) -> Result<Vec<Result<T>>>
-    where
-        T: serde::de::DeserializeOwned,
-        A: serde::Serialize + std::fmt::Debug,
-    {
-        trace!(
-            method,
-            client_index = self.config.client_index,
-            engine_count = self.engines.len(),
-            "sending utility request"
-        );
-
-        let mut call_guard = UtilityCallGuard::new(self.inner.clone());
-        let mut pending_calls = Vec::with_capacity(self.engines.len());
-        let mut prepared_sends = Vec::with_capacity(self.engines.len());
-        for engine in &self.engines {
-            let (call_id, rx) = match self.inner.allocate_and_register_utility_call() {
-                Ok(pair) => pair,
-                Err(err) => return Err(err),
-            };
-            call_guard.track(call_id);
-            let request = match EngineCoreUtilityRequest::new(
-                self.config.client_index,
-                call_id,
-                method,
-                &args,
-            ) {
-                Ok(request) => request,
-                Err(err) => return Err(err),
-            };
-            pending_calls.push((call_id, rx));
-            prepared_sends.push((&engine.engine_id, request));
-        }
-
-        let send_results = join_all(prepared_sends.iter().map(|(engine_id, request)| {
-            self.inner.send_to_engine(engine_id, EngineCoreRequestType::Utility, request)
-        }))
-        .await;
-        let calls = pending_calls.into_iter().zip(send_results).map(
-            |((call_id, rx), send_result)| async move {
-                send_result?;
-                rx.await
-                    .map_err(|_| Error::UtilityCallClosed {
-                        method: method.to_string(),
-                        call_id,
-                    })??
-                    .into_typed_result(method)
-            },
-        );
-        Ok(join_all(calls).await)
-    }
-
     /// Call a typed utility method on all connected engines, returning one
-    /// decoded result per connected engine if all calls succeed or an error
-    /// if any call fails.
+    /// decoded result per connected engine if all calls succeed. The client
+    /// waits for every engine outcome before returning an error so callers can
+    /// safely compensate partially applied mutations.
     ///
     /// Callers should pass utility arguments using Rust tuple semantics so the
     /// encoded payload matches Python's `(client_index, call_id,
@@ -698,20 +640,27 @@ impl EngineCoreClient {
             prepared_sends.push((&engine.engine_id, request));
         }
 
-        let sends = prepared_sends.iter().map(|(engine_id, request)| {
-            self.inner.send_to_engine(engine_id, EngineCoreRequestType::Utility, request)
-        });
-        try_join_all(sends).await?;
-
-        let calls = pending_calls.into_iter().map(|(call_id, rx)| async move {
-            rx.await
-                .map_err(|_| Error::UtilityCallClosed {
-                    method: method.to_string(),
-                    call_id,
-                })??
-                .into_typed_result(method)
-        });
-        try_join_all(calls).await
+        let send_results = join_all(prepared_sends.iter().map(|(engine_id, request)| {
+            self.inner.send_to_engine_abort_on_drop(
+                engine_id,
+                EngineCoreRequestType::Utility,
+                request,
+            )
+        }))
+        .await;
+        let outcomes = join_all(pending_calls.into_iter().zip(send_results).map(
+            |((call_id, rx), send_result)| async move {
+                send_result?;
+                rx.await
+                    .map_err(|_| Error::UtilityCallClosed {
+                        method: method.to_string(),
+                        call_id,
+                    })??
+                    .into_typed_result(method)
+            },
+        ))
+        .await;
+        outcomes.into_iter().collect()
     }
 
     /// Call a utility method on all connected engines and return the shared

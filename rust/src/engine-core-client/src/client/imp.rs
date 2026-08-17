@@ -254,6 +254,27 @@ impl ClientInner {
         self.send_encoded_to_engine(engine_id, request_type, payload, Vec::new()).await
     }
 
+    /// Send a message and abort the spawned transport task if this future is
+    /// dropped.
+    pub async fn send_to_engine_abort_on_drop<T>(
+        &self,
+        engine_id: &EngineId,
+        request_type: EngineCoreRequestType,
+        payload: &T,
+    ) -> Result<()>
+    where
+        T: serde::Serialize + std::fmt::Debug,
+    {
+        let payload = Bytes::from(encode_msgpack(payload)?);
+        AbortOnDropHandle::new(self.spawn_encoded_send(
+            engine_id,
+            request_type,
+            payload,
+            Vec::new(),
+        ))
+        .await?
+    }
+
     /// Send an add request, moving large tensor buffers into auxiliary frames.
     pub async fn send_request_to_engine(
         &self,
@@ -273,10 +294,20 @@ impl ClientInner {
         payload: Bytes,
         aux_frames: Vec<Bytes>,
     ) -> Result<()> {
+        self.spawn_encoded_send(engine_id, request_type, payload, aux_frames).await?
+    }
+
+    fn spawn_encoded_send(
+        &self,
+        engine_id: &EngineId,
+        request_type: EngineCoreRequestType,
+        payload: Bytes,
+        aux_frames: Vec<Bytes>,
+    ) -> tokio::task::JoinHandle<Result<()>> {
         let mut input_send = self.input_send.clone();
         let engine_id = engine_id.clone();
 
-        AbortOnDropHandle::new(self.handle.spawn(async move {
+        self.handle.spawn(async move {
             transport::send_message(
                 &mut input_send,
                 &engine_id,
@@ -285,8 +316,7 @@ impl ClientInner {
                 aux_frames,
             )
             .await
-        }))
-        .await?
+        })
     }
 
     /// Handle an abort request by sending the abort message to the engine.
