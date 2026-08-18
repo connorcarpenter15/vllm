@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
@@ -14,10 +15,6 @@ use vllm_engine_core_client::protocol::utility::PauseMode as EnginePauseMode;
 
 use super::{ControlServer, pb};
 use crate::lora::{LoadExactLoraError, UnloadLoraError};
-use crate::lora_path::{
-    LoraPathError, LoraPathMode, RUNTIME_LORA_ALLOWED_PATH_PREFIXES_ENV,
-    runtime_lora_allowed_path_prefixes, validate_lora_path_access,
-};
 use crate::state::AppState;
 
 pub(crate) type ControlGrpcService = ControlServer<ControlServiceImpl>;
@@ -103,6 +100,7 @@ impl ControlServiceImpl {
 }
 
 const GRPC_API_VERSION: &str = "vllm";
+const RUNTIME_LORA_ALLOWED_PATH_PREFIXES_ENV: &str = "VLLM_RUNTIME_LORA_ALLOWED_PATH_PREFIXES";
 
 fn utility_status(method: &'static str, error: vllm_engine_core_client::Error) -> Status {
     Status::internal(format!("{method} failed: {}", error.to_report_string()))
@@ -155,45 +153,58 @@ async fn normalize_lora_adapter(adapter: pb::LoraAdapter) -> Result<LoraRequest,
     if adapter.lora_name.trim().is_empty() {
         return Err(Status::invalid_argument("lora_name is required"));
     }
-    let allowed_prefixes = runtime_lora_allowed_path_prefixes();
-    let canonical = validate_lora_path_access(
-        &adapter.source_path,
-        allowed_prefixes.as_deref(),
-        LoraPathMode::LocalDirectory,
-    )
-    .await
-    .map_err(lora_path_status)?
-    .ok_or_else(|| Status::internal("local LoRA path validation returned a remote identifier"))?;
+    let path = Path::new(&adapter.source_path);
+    if !path.is_absolute() {
+        return Err(Status::invalid_argument("source_path must be absolute"));
+    }
+    let canonical = tokio::fs::canonicalize(path).await.map_err(|error| {
+        Status::invalid_argument(format!("invalid source_path: {}", error.to_report_string()))
+    })?;
+    let metadata = tokio::fs::metadata(&canonical).await.map_err(|error| {
+        Status::invalid_argument(format!("invalid source_path: {}", error.to_report_string()))
+    })?;
+    if !metadata.is_dir() {
+        return Err(Status::invalid_argument("source_path must be a directory"));
+    }
+    validate_lora_allowed_prefix(&canonical).await?;
 
     Ok(LoraRequest::new(
         adapter.lora_name,
         u64::try_from(adapter.lora_id)
             .map_err(|_| Status::invalid_argument("lora_id must be positive"))?,
-        canonical,
+        canonical.to_string_lossy().into_owned(),
         false,
         false,
     ))
 }
 
-fn lora_path_status(error: LoraPathError) -> Status {
-    match error {
-        LoraPathError::MissingAllowedPrefixes => Status::failed_precondition(format!(
-            "local LoRA paths require {RUNTIME_LORA_ALLOWED_PATH_PREFIXES_ENV}"
-        )),
-        LoraPathError::MustBeAbsolute => Status::invalid_argument("source_path must be absolute"),
-        LoraPathError::InvalidPath { source } => Status::invalid_argument(format!(
-            "invalid source_path: {}",
-            source.to_report_string()
-        )),
-        LoraPathError::InvalidPrefix { source } => Status::internal(format!(
-            "configured {RUNTIME_LORA_ALLOWED_PATH_PREFIXES_ENV} prefix is invalid: {}",
-            source.to_report_string()
-        )),
-        LoraPathError::NotDirectory => Status::invalid_argument("source_path must be a directory"),
-        LoraPathError::OutsideAllowedPrefixes => {
-            Status::permission_denied("source_path is outside the configured LoRA path prefixes")
+async fn validate_lora_allowed_prefix(path: &Path) -> Result<(), Status> {
+    let prefixes = std::env::var_os(RUNTIME_LORA_ALLOWED_PATH_PREFIXES_ENV)
+        .map(|value| {
+            std::env::split_paths(&value)
+                .filter(|path| !path.as_os_str().is_empty())
+                .collect::<Vec<PathBuf>>()
+        })
+        .filter(|prefixes| !prefixes.is_empty())
+        .ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "local LoRA paths require {RUNTIME_LORA_ALLOWED_PATH_PREFIXES_ENV}"
+            ))
+        })?;
+    for prefix in prefixes {
+        let canonical = tokio::fs::canonicalize(prefix).await.map_err(|error| {
+            Status::internal(format!(
+                "configured {RUNTIME_LORA_ALLOWED_PATH_PREFIXES_ENV} prefix is invalid: {}",
+                error.to_report_string()
+            ))
+        })?;
+        if path.starts_with(canonical) {
+            return Ok(());
         }
     }
+    Err(Status::permission_denied(
+        "source_path is outside the configured LoRA path prefixes",
+    ))
 }
 
 fn lora_to_proto(adapter: &LoraRequest) -> pb::LoraAdapter {

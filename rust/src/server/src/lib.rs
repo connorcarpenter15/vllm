@@ -8,7 +8,6 @@ mod error;
 mod grpc;
 mod listener;
 mod lora;
-mod lora_path;
 mod middleware;
 mod render;
 mod routes;
