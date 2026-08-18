@@ -461,6 +461,7 @@ mod tests {
         LoraModelResolution {
             model_names: names.iter().map(|s| s.to_string()).collect(),
             lora_request: None,
+            lease: None,
         }
     }
 

@@ -48,7 +48,13 @@ pub async fn generate(
     ValidatedJson(mut body): ValidatedJson<GenerateRequest>,
 ) -> Response {
     let request_context = resolve_request_context(&headers, body.request_id.as_deref());
-    let lora_resolution = state.resolve_model_with_loras(body.model.as_deref()).await;
+    let mut lora_resolution = state.resolve_model_with_loras(body.model.as_deref()).await;
+    if lora_resolution.lora_request.is_some() && !state.lora_state_is_consistent() {
+        return ApiError::server_error(
+            "LoRA state differs across engine ranks; restart the engine".to_string(),
+        )
+        .into_response();
+    }
 
     let mm_features = if let Some(parts) = body.content_parts.take() {
         match state.chat.prepare_media(parts, &mut body.token_ids).await {
@@ -91,6 +97,7 @@ pub async fn generate(
                 .into_response();
         }
     };
+    let raw_stream = crate::lora::hold_lora_lease(raw_stream, lora_resolution.lease.take());
 
     if stream {
         let chunk_stream = generate_chunk_stream(
