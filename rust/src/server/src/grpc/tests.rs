@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-use std::ffi::OsString;
 use std::fs;
 use std::future::Future;
 use std::io;
@@ -179,32 +178,6 @@ async fn reply_utility_bool(
         .into(),
     )
     .await;
-}
-
-struct EnvVarGuard {
-    key: &'static str,
-    previous: Option<OsString>,
-}
-
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
-        let previous = std::env::var_os(key);
-        // SAFETY: the test using this guard is serialized, and no other test accesses this key.
-        unsafe { std::env::set_var(key, value) };
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        // SAFETY: the serialized test still owns access to this environment variable.
-        unsafe {
-            match &self.previous {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
 }
 
 async fn recv_engine_message(dealer: &mut DealerSocket) -> Vec<bytes::Bytes> {
@@ -1617,16 +1590,6 @@ async fn control_reports_server_and_model_info() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn control_lora_lifecycle_selects_adapter_for_generation() {
-    let temp_dir = tempfile::tempdir().expect("create LoRA test directory");
-    let adapter_path = temp_dir.path().join("adapter");
-    let conflicting_adapter_path = temp_dir.path().join("conflicting-adapter");
-    fs::create_dir(&adapter_path).expect("create adapter directory");
-    fs::create_dir(&conflicting_adapter_path).expect("create conflicting adapter directory");
-    let _allowed_path_guard = EnvVarGuard::set(
-        "VLLM_RUNTIME_LORA_ALLOWED_PATH_PREFIXES",
-        temp_dir.path().as_os_str(),
-    );
-
     let mut ready = default_ready_response();
     ready.supports_lora = true;
     ready.max_loras = 4;
@@ -1672,7 +1635,7 @@ async fn control_lora_lifecycle_selects_adapter_for_generation() {
     let adapter = pb::LoraAdapter {
         lora_id: 42,
         lora_name: "adapter".to_string(),
-        source_path: adapter_path.to_string_lossy().into_owned(),
+        source_path: "adapter".to_string(),
     };
 
     let loaded = control_client
@@ -1702,7 +1665,7 @@ async fn control_lora_lifecycle_selects_adapter_for_generation() {
             adapter: Some(pb::LoraAdapter {
                 lora_id: 42,
                 lora_name: "conflicting-adapter".to_string(),
-                source_path: conflicting_adapter_path.to_string_lossy().into_owned(),
+                source_path: "conflicting-adapter".to_string(),
             }),
         })
         .await

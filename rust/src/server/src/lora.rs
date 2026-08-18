@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use indexmap::IndexMap;
 use tokio::sync::{Mutex, RwLock};
 use vllm_engine_core_client::EngineCoreClient;
-use vllm_engine_core_client::protocol::lora::LoraRequest;
+use vllm_engine_core_client::protocol::lora::{LoraRequest, LoraRequestError};
 
 /// Snapshot of the currently served model names plus the requested LoRA, if
 /// the model name resolves to a dynamic adapter.
@@ -28,6 +28,7 @@ pub(crate) struct LoraManager {
 
 #[derive(Debug)]
 pub(crate) enum LoadLoraError {
+    InvalidRequest(LoraRequestError),
     AlreadyLoaded { lora_name: String },
     BaseModelName { lora_name: String },
     Engine(vllm_engine_core_client::Error),
@@ -122,7 +123,8 @@ impl LoraManager {
             lora_path,
             load_inplace,
             is_3d_lora_weight,
-        );
+        )
+        .map_err(LoadLoraError::InvalidRequest)?;
 
         let loaded = engine_core_client
             .add_lora(&lora_request)
