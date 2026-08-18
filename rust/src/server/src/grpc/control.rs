@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
@@ -9,9 +10,11 @@ use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use vllm_engine_core_client::EngineCoreClient;
 use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
+use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_engine_core_client::protocol::utility::PauseMode as EnginePauseMode;
 
 use super::{ControlServer, pb};
+use crate::lora::{LoadExactLoraError, UnloadLoraError};
 use crate::state::AppState;
 
 pub(crate) type ControlGrpcService = ControlServer<ControlServiceImpl>;
@@ -97,6 +100,7 @@ impl ControlServiceImpl {
 }
 
 const GRPC_API_VERSION: &str = "vllm";
+const RUNTIME_LORA_ALLOWED_PATH_PREFIXES_ENV: &str = "VLLM_RUNTIME_LORA_ALLOWED_PATH_PREFIXES";
 
 fn utility_status(method: &'static str, error: vllm_engine_core_client::Error) -> Status {
     Status::internal(format!("{method} failed: {}", error.to_report_string()))
@@ -131,6 +135,91 @@ fn weight_version(value: String) -> Result<String, Status> {
         return Err(Status::invalid_argument("weight_version must not be empty"));
     }
     Ok(value)
+}
+
+fn ensure_lora_enabled(state: &AppState) -> Result<(), Status> {
+    state
+        .engine_core_client()
+        .ready_response()
+        .supports_lora
+        .then_some(())
+        .ok_or_else(|| Status::failed_precondition("engine was not started with LoRA enabled"))
+}
+
+async fn normalize_lora_adapter(adapter: pb::LoraAdapter) -> Result<LoraRequest, Status> {
+    if adapter.lora_id <= 0 {
+        return Err(Status::invalid_argument("lora_id must be positive"));
+    }
+    if adapter.lora_name.trim().is_empty() {
+        return Err(Status::invalid_argument("lora_name is required"));
+    }
+    let path = Path::new(&adapter.source_path);
+    if !path.is_absolute() {
+        return Err(Status::invalid_argument("source_path must be absolute"));
+    }
+    let canonical = tokio::fs::canonicalize(path).await.map_err(|error| {
+        Status::invalid_argument(format!("invalid source_path: {}", error.to_report_string()))
+    })?;
+    let metadata = tokio::fs::metadata(&canonical).await.map_err(|error| {
+        Status::invalid_argument(format!("invalid source_path: {}", error.to_report_string()))
+    })?;
+    if !metadata.is_dir() {
+        return Err(Status::invalid_argument("source_path must be a directory"));
+    }
+    validate_lora_allowed_prefix(&canonical).await?;
+
+    Ok(LoraRequest::new(
+        adapter.lora_name,
+        u64::try_from(adapter.lora_id)
+            .map_err(|_| Status::invalid_argument("lora_id must be positive"))?,
+        canonical.to_string_lossy().into_owned(),
+        false,
+        false,
+    ))
+}
+
+async fn validate_lora_allowed_prefix(path: &Path) -> Result<(), Status> {
+    let prefixes = std::env::var_os(RUNTIME_LORA_ALLOWED_PATH_PREFIXES_ENV)
+        .map(|value| {
+            std::env::split_paths(&value)
+                .filter(|path| !path.as_os_str().is_empty())
+                .collect::<Vec<PathBuf>>()
+        })
+        .filter(|prefixes| !prefixes.is_empty())
+        .ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "local LoRA paths require {RUNTIME_LORA_ALLOWED_PATH_PREFIXES_ENV}"
+            ))
+        })?;
+    for prefix in prefixes {
+        let canonical = tokio::fs::canonicalize(prefix).await.map_err(|error| {
+            Status::internal(format!(
+                "configured {RUNTIME_LORA_ALLOWED_PATH_PREFIXES_ENV} prefix is invalid: {}",
+                error.to_report_string()
+            ))
+        })?;
+        if path.starts_with(canonical) {
+            return Ok(());
+        }
+    }
+    Err(Status::permission_denied(
+        "source_path is outside the configured LoRA path prefixes",
+    ))
+}
+
+fn lora_to_proto(adapter: &LoraRequest) -> pb::LoraAdapter {
+    pb::LoraAdapter {
+        lora_id: adapter.lora_int_id.min(i64::MAX as u64) as i64,
+        lora_name: adapter.lora_name.clone(),
+        source_path: adapter.lora_path.clone(),
+    }
+}
+
+fn lora_conflict(existing: &LoraRequest) -> Status {
+    Status::already_exists(format!(
+        "conflicts with loaded LoRA `{}` (id {})",
+        existing.lora_name, existing.lora_int_id
+    ))
 }
 
 #[tonic::async_trait]
@@ -204,21 +293,80 @@ impl pb::control_server::Control for ControlServiceImpl {
         &self,
         request: Request<pb::LoadLoraRequest>,
     ) -> Result<Response<pb::LoadLoraResponse>, Status> {
-        super::lora_rpc::load_lora(&self.state, request).await
+        ensure_lora_enabled(&self.state)?;
+        let adapter = normalize_lora_adapter(
+            request
+                .into_inner()
+                .adapter
+                .ok_or_else(|| Status::invalid_argument("adapter is required"))?,
+        )
+        .await?;
+        let (adapter, already_loaded) =
+            self.state.load_lora_exact(adapter).await.map_err(|error| match error {
+                LoadExactLoraError::BaseModelName { lora_name } => Status::already_exists(format!(
+                    "LoRA adapter `{lora_name}` conflicts with a served base model"
+                )),
+                LoadExactLoraError::Conflict { existing } => lora_conflict(&existing),
+                LoadExactLoraError::Engine(error) => Status::internal(error.to_report_string()),
+                LoadExactLoraError::NotLoaded { lora_name } => Status::internal(format!(
+                    "one or more engine ranks rejected LoRA adapter `{lora_name}`"
+                )),
+            })?;
+        Ok(Response::new(pb::LoadLoraResponse {
+            adapter: Some(lora_to_proto(&adapter)),
+            already_loaded,
+        }))
     }
 
     async fn unload_lora(
         &self,
         request: Request<pb::UnloadLoraRequest>,
     ) -> Result<Response<pb::UnloadLoraResponse>, Status> {
-        super::lora_rpc::unload_lora(&self.state, request).await
+        ensure_lora_enabled(&self.state)?;
+        let name = request.into_inner().lora_name;
+        if name.trim().is_empty() {
+            return Err(Status::invalid_argument("lora_name is required"));
+        }
+
+        let adapter = self
+            .state
+            .served_lora_requests()
+            .await
+            .into_iter()
+            .find(|adapter| adapter.lora_name == name)
+            .ok_or_else(|| Status::not_found(format!("LoRA adapter `{name}` is not loaded")))?;
+        let adapter = self.state.unload_lora(&name, Some(adapter.lora_int_id)).await.map_err(
+            |error| match error {
+                UnloadLoraError::NotFound { lora_name } => {
+                    Status::not_found(format!("LoRA adapter `{lora_name}` is not loaded"))
+                }
+                UnloadLoraError::IntIdMismatch { .. } => {
+                    Status::internal("LoRA registry changed during unload")
+                }
+                UnloadLoraError::Engine(error) => Status::internal(error.to_report_string()),
+                UnloadLoraError::NotRemoved {
+                    lora_name,
+                    lora_int_id,
+                } => Status::internal(format!(
+                    "engine rejected removal of LoRA adapter `{lora_name}` with id {lora_int_id}"
+                )),
+            },
+        )?;
+        Ok(Response::new(pb::UnloadLoraResponse {
+            adapter: Some(lora_to_proto(&adapter)),
+        }))
     }
 
     async fn list_loras(
         &self,
-        request: Request<pb::ListLorasRequest>,
+        _request: Request<pb::ListLorasRequest>,
     ) -> Result<Response<pb::ListLorasResponse>, Status> {
-        super::lora_rpc::list_loras(&self.state, request).await
+        ensure_lora_enabled(&self.state)?;
+        let mut adapters = self.state.served_lora_requests().await;
+        adapters.sort_by(|left, right| left.lora_name.cmp(&right.lora_name));
+        Ok(Response::new(pb::ListLorasResponse {
+            adapters: adapters.iter().map(lora_to_proto).collect(),
+        }))
     }
 
     async fn get_kv_event_sources(

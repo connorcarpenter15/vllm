@@ -7,7 +7,6 @@ mod control;
 mod convert;
 mod health;
 mod inference;
-mod lora_rpc;
 
 /// Generated protobuf/gRPC types for the `vllm` package.
 pub mod pb {

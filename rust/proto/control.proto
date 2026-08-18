@@ -5,12 +5,19 @@ syntax = "proto3";
 package vllm;
 
 service Control {
+  // Server and model discovery.
   rpc GetServerInfo (GetServerInfoRequest) returns (ServerInfo) {}
   rpc GetModelInfo (GetModelInfoRequest) returns (ModelInfo) {}
+
+  // Request lifecycle.
   rpc Abort (AbortRequest) returns (AbortResponse) {}
+
+  // LoRA lifecycle.
   rpc LoadLora (LoadLoraRequest) returns (LoadLoraResponse) {}
   rpc UnloadLora (UnloadLoraRequest) returns (UnloadLoraResponse) {}
   rpc ListLoras (ListLorasRequest) returns (ListLorasResponse) {}
+
+  // KV event discovery.
   rpc GetKvEventSources (GetKvEventSourcesRequest) returns (GetKvEventSourcesResponse) {}
 
   // Reinforcement-learning lifecycle and weight updates.
