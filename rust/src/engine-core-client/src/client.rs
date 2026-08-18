@@ -641,11 +641,7 @@ impl EngineCoreClient {
         }
 
         let send_results = join_all(prepared_sends.iter().map(|(engine_id, request)| {
-            self.inner.send_to_engine_abort_on_drop(
-                engine_id,
-                EngineCoreRequestType::Utility,
-                request,
-            )
+            self.inner.send_to_engine(engine_id, EngineCoreRequestType::Utility, request)
         }))
         .await;
         let outcomes = join_all(pending_calls.into_iter().zip(send_results).map(
