@@ -13,7 +13,7 @@ use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_engine_core_client::protocol::utility::PauseMode as EnginePauseMode;
 
 use super::{ControlServer, pb};
-use crate::lora::{LoadExactLoraError, UnloadLoraError};
+use crate::lora::{LoadLoraError, UnloadLoraError};
 use crate::state::AppState;
 
 pub(crate) type ControlGrpcService = ControlServer<ControlServiceImpl>;
@@ -228,32 +228,33 @@ impl pb::control_server::Control for ControlServiceImpl {
             .into_inner()
             .adapter
             .ok_or_else(|| Status::invalid_argument("adapter is required"))?;
-        let adapter = LoraRequest::new(
-            adapter.lora_name,
-            u64::try_from(adapter.lora_id)
-                .map_err(|_| Status::invalid_argument("lora_id must be positive"))?,
-            adapter.source_path,
-            false,
-            false,
-        )
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let (adapter, already_loaded) =
-            self.state.load_lora_exact(adapter).await.map_err(|error| match error {
-                LoadExactLoraError::BaseModelName { lora_name } => Status::already_exists(format!(
+        let lora_int_id = u64::try_from(adapter.lora_id)
+            .map_err(|_| Status::invalid_argument("lora_id must be positive"))?;
+        let adapter = self
+            .state
+            .load_lora(
+                adapter.lora_name,
+                adapter.source_path,
+                Some(lora_int_id),
+                false,
+                false,
+            )
+            .await
+            .map_err(|error| match error {
+                LoadLoraError::InvalidRequest(error) => Status::invalid_argument(error.to_string()),
+                LoadLoraError::AlreadyLoaded { lora_name } => {
+                    Status::already_exists(format!("LoRA adapter `{lora_name}` is already loaded"))
+                }
+                LoadLoraError::BaseModelName { lora_name } => Status::already_exists(format!(
                     "LoRA adapter `{lora_name}` conflicts with a served base model"
                 )),
-                LoadExactLoraError::Conflict { existing } => Status::already_exists(format!(
-                    "conflicts with loaded LoRA `{}` (id {})",
-                    existing.lora_name, existing.lora_int_id
-                )),
-                LoadExactLoraError::Engine(error) => Status::internal(error.to_report_string()),
-                LoadExactLoraError::NotLoaded { lora_name } => Status::internal(format!(
+                LoadLoraError::Engine(error) => Status::internal(error.to_report_string()),
+                LoadLoraError::NotLoaded { lora_name } => Status::internal(format!(
                     "one or more engine ranks rejected LoRA adapter `{lora_name}`"
                 )),
             })?;
         Ok(Response::new(pb::LoadLoraResponse {
             adapter: Some(lora_to_proto(&adapter)),
-            already_loaded,
         }))
     }
 

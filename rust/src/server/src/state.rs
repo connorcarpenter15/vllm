@@ -15,9 +15,7 @@ use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_engine_core_client::runtime::BackgroundShutdownRuntime;
 
 use crate::config::{ApiServerOptions, CorsConfig};
-use crate::lora::{
-    LoadExactLoraError, LoadLoraError, LoraManager, LoraModelResolution, UnloadLoraError,
-};
+use crate::lora::{LoadLoraError, LoraManager, LoraModelResolution, UnloadLoraError};
 use crate::runtime::build_request_runtime;
 use crate::server_info::{ServerInfoConfigFormat, ServerInfoSnapshot};
 
@@ -173,6 +171,7 @@ impl AppState {
         &self,
         lora_name: String,
         lora_path: String,
+        lora_int_id: Option<u64>,
         load_inplace: bool,
         is_3d_lora_weight: bool,
     ) -> Result<LoraRequest, LoadLoraError> {
@@ -182,22 +181,9 @@ impl AppState {
                 &self.served_model_names,
                 lora_name,
                 lora_path,
+                lora_int_id,
                 load_inplace,
                 is_3d_lora_weight,
-            )
-            .await
-    }
-
-    /// Load one dynamic adapter with an externally assigned ID.
-    pub async fn load_lora_exact(
-        &self,
-        lora_request: LoraRequest,
-    ) -> Result<(LoraRequest, bool), LoadExactLoraError> {
-        self.lora_manager
-            .load_lora_exact(
-                self.engine_core_client(),
-                &self.served_model_names,
-                lora_request,
             )
             .await
     }

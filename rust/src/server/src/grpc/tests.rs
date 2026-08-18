@@ -1645,20 +1645,18 @@ async fn control_lora_lifecycle_selects_adapter_for_generation() {
         .await
         .expect("load LoRA")
         .into_inner();
-    assert!(!loaded.already_loaded);
     assert_eq!(
         loaded.adapter.as_ref().map(|adapter| adapter.lora_id),
         Some(42)
     );
 
-    let reloaded = control_client
+    let duplicate = control_client
         .load_lora(pb::LoadLoraRequest {
             adapter: Some(adapter),
         })
         .await
-        .expect("reload identical LoRA")
-        .into_inner();
-    assert!(reloaded.already_loaded);
+        .expect_err("duplicate LoRA name should be rejected");
+    assert_eq!(duplicate.code(), tonic::Code::AlreadyExists);
 
     let conflict = control_client
         .load_lora(pb::LoadLoraRequest {

@@ -122,6 +122,7 @@ pub async fn load_lora_adapter(
         .load_lora(
             lora_name.clone(),
             lora_path,
+            None,
             request.load_inplace,
             request.is_3d_lora_weight,
         )
