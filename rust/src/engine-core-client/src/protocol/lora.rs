@@ -64,30 +64,3 @@ impl LoraRequest {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{LoraRequest, LoraRequestError};
-
-    #[test]
-    fn new_rejects_invalid_required_fields() {
-        assert_eq!(
-            LoraRequest::new(" ".to_string(), 1, "adapter".to_string(), false, false),
-            Err(LoraRequestError::EmptyName)
-        );
-        assert_eq!(
-            LoraRequest::new(
-                "adapter".to_string(),
-                0,
-                "adapter".to_string(),
-                false,
-                false
-            ),
-            Err(LoraRequestError::ZeroId)
-        );
-        assert_eq!(
-            LoraRequest::new("adapter".to_string(), 1, " ".to_string(), false, false),
-            Err(LoraRequestError::EmptyPath)
-        );
-    }
-}

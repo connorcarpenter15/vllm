@@ -152,13 +152,6 @@ fn lora_to_proto(adapter: &LoraRequest) -> pb::LoraAdapter {
     }
 }
 
-fn lora_conflict(existing: &LoraRequest) -> Status {
-    Status::already_exists(format!(
-        "conflicts with loaded LoRA `{}` (id {})",
-        existing.lora_name, existing.lora_int_id
-    ))
-}
-
 #[tonic::async_trait]
 impl pb::control_server::Control for ControlServiceImpl {
     async fn get_server_info(
@@ -249,7 +242,10 @@ impl pb::control_server::Control for ControlServiceImpl {
                 LoadExactLoraError::BaseModelName { lora_name } => Status::already_exists(format!(
                     "LoRA adapter `{lora_name}` conflicts with a served base model"
                 )),
-                LoadExactLoraError::Conflict { existing } => lora_conflict(&existing),
+                LoadExactLoraError::Conflict { existing } => Status::already_exists(format!(
+                    "conflicts with loaded LoRA `{}` (id {})",
+                    existing.lora_name, existing.lora_int_id
+                )),
                 LoadExactLoraError::Engine(error) => Status::internal(error.to_report_string()),
                 LoadExactLoraError::NotLoaded { lora_name } => Status::internal(format!(
                     "one or more engine ranks rejected LoRA adapter `{lora_name}`"
