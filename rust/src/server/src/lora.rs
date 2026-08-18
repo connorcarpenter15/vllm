@@ -35,6 +35,14 @@ pub(crate) enum LoadLoraError {
 }
 
 #[derive(Debug)]
+pub(crate) enum LoadExactLoraError {
+    BaseModelName { lora_name: String },
+    Conflict { existing: LoraRequest },
+    Engine(vllm_engine_core_client::Error),
+    NotLoaded { lora_name: String },
+}
+
+#[derive(Debug)]
 pub(crate) enum UnloadLoraError {
     NotFound {
         lora_name: String,
@@ -127,6 +135,53 @@ impl LoraManager {
         Ok(lora_request)
     }
 
+    /// Load an adapter with a caller-supplied ID.
+    pub async fn load_lora_exact(
+        &self,
+        engine_core_client: &EngineCoreClient,
+        base_model_names: &[String],
+        lora_request: LoraRequest,
+    ) -> Result<(LoraRequest, bool), LoadExactLoraError> {
+        let _guard = self.update_lock.lock().await;
+        if base_model_names.iter().any(|name| name == &lora_request.lora_name) {
+            return Err(LoadExactLoraError::BaseModelName {
+                lora_name: lora_request.lora_name,
+            });
+        }
+
+        let requests = self.requests.read().await;
+        if let Some(existing) = requests.values().find(|existing| {
+            existing.lora_name == lora_request.lora_name
+                || existing.lora_int_id == lora_request.lora_int_id
+                || existing.lora_path == lora_request.lora_path
+        }) {
+            if same_wire_identity(existing, &lora_request) {
+                return Ok((existing.clone(), true));
+            }
+            return Err(LoadExactLoraError::Conflict {
+                existing: existing.clone(),
+            });
+        }
+        drop(requests);
+
+        let loaded = engine_core_client
+            .add_lora(&lora_request)
+            .await
+            .map_err(LoadExactLoraError::Engine)?;
+        if !loaded {
+            return Err(LoadExactLoraError::NotLoaded {
+                lora_name: lora_request.lora_name,
+            });
+        }
+
+        self.id_counter.fetch_max(lora_request.lora_int_id, Ordering::Relaxed);
+        self.requests
+            .write()
+            .await
+            .insert(lora_request.lora_name.clone(), lora_request.clone());
+        Ok((lora_request, false))
+    }
+
     /// Remove one dynamic LoRA adapter from the engine and public model
     /// registry.
     pub async fn unload_lora(
@@ -165,4 +220,10 @@ impl LoraManager {
 
         Ok(self.requests.write().await.shift_remove(lora_name).unwrap_or(lora_request))
     }
+}
+
+fn same_wire_identity(left: &LoraRequest, right: &LoraRequest) -> bool {
+    left.lora_name == right.lora_name
+        && left.lora_int_id == right.lora_int_id
+        && left.lora_path == right.lora_path
 }

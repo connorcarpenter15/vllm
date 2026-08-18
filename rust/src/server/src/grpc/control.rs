@@ -200,6 +200,27 @@ impl pb::control_server::Control for ControlServiceImpl {
         Ok(Response::new(pb::AbortResponse {}))
     }
 
+    async fn load_lora(
+        &self,
+        request: Request<pb::LoadLoraRequest>,
+    ) -> Result<Response<pb::LoadLoraResponse>, Status> {
+        super::lora_rpc::load_lora(&self.state, request).await
+    }
+
+    async fn unload_lora(
+        &self,
+        request: Request<pb::UnloadLoraRequest>,
+    ) -> Result<Response<pb::UnloadLoraResponse>, Status> {
+        super::lora_rpc::unload_lora(&self.state, request).await
+    }
+
+    async fn list_loras(
+        &self,
+        request: Request<pb::ListLorasRequest>,
+    ) -> Result<Response<pb::ListLorasResponse>, Status> {
+        super::lora_rpc::list_loras(&self.state, request).await
+    }
+
     async fn get_kv_event_sources(
         &self,
         _request: Request<pb::GetKvEventSourcesRequest>,

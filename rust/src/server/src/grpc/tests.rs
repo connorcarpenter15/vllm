@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+use std::ffi::OsString;
 use std::fs;
 use std::future::Future;
 use std::io;
@@ -149,6 +150,61 @@ async fn send_outputs(push: &mut PushSocket, outputs: EngineCoreOutputs) {
     ))
     .await
     .expect("send outputs");
+}
+
+async fn reply_utility_bool(
+    dealer: &mut DealerSocket,
+    push: &mut PushSocket,
+    expected_method: &str,
+    result: bool,
+) {
+    let frames = recv_engine_message(dealer).await;
+    assert_eq!(frames[0].as_ref(), &[0x03]);
+    let payload = decode_value(&frames[1]).expect("decode utility payload");
+    let fields = payload.as_array().expect("utility payload array");
+    let call_id = fields[1].as_u64().expect("utility call id");
+    assert_eq!(fields[2].as_str(), Some(expected_method));
+    send_outputs(
+        push,
+        UtilityCallOutput {
+            output: UtilityOutput {
+                call_id: call_id.into(),
+                failure_message: None,
+                result: Some(UtilityResultEnvelope::without_type_info(Value::Boolean(
+                    result,
+                ))),
+            },
+            ..Default::default()
+        }
+        .into(),
+    )
+    .await;
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: the test using this guard is serialized, and no other test accesses this key.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: the serialized test still owns access to this environment variable.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 }
 
 async fn recv_engine_message(dealer: &mut DealerSocket) -> Vec<bytes::Bytes> {
@@ -1555,6 +1611,149 @@ async fn control_reports_server_and_model_info() {
     assert!(model.reasoning_parser.is_empty());
     assert!(model.tool_call_parser.is_empty());
 
+    server_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn control_lora_lifecycle_selects_adapter_for_generation() {
+    let temp_dir = tempfile::tempdir().expect("create LoRA test directory");
+    let adapter_path = temp_dir.path().join("adapter");
+    let conflicting_adapter_path = temp_dir.path().join("conflicting-adapter");
+    fs::create_dir(&adapter_path).expect("create adapter directory");
+    fs::create_dir(&conflicting_adapter_path).expect("create conflicting adapter directory");
+    let _allowed_path_guard = EnvVarGuard::set(
+        "VLLM_RUNTIME_LORA_ALLOWED_PATH_PREFIXES",
+        temp_dir.path().as_os_str(),
+    );
+
+    let mut ready = default_ready_response();
+    ready.supports_lora = true;
+    ready.max_loras = 4;
+    let (inference_service, control_service, engine_health, engine_task) =
+        setup_grpc_service_with_engine_script(
+            b"engine-grpc-lora".to_vec(),
+            ready,
+            Arc::new(FakeTextBackend),
+            |dealer, push| {
+                boxed_test_future(async move {
+                    reply_utility_bool(dealer, push, "add_lora", true).await;
+
+                    let frames = recv_engine_message(dealer).await;
+                    assert_eq!(frames[0].as_ref(), &[0x00]);
+                    let request: EngineCoreRequest =
+                        rmp_serde::from_slice(&frames[1]).expect("decode generation request");
+                    let lora = request.lora_request.expect("generation LoRA request");
+                    assert_eq!(lora.lora_name, "adapter");
+                    assert_eq!(lora.lora_int_id, 42);
+                    send_outputs(
+                        push,
+                        engine_outputs_for_request(
+                            &request.request_id,
+                            vec![(vec![b'!' as u32], Some(EngineCoreFinishReason::Stop))],
+                        ),
+                    )
+                    .await;
+
+                    reply_utility_bool(dealer, push, "remove_lora", true).await;
+                })
+            },
+        )
+        .await;
+    let (channel, server_task) = start_grpc_test_server(
+        inference_service,
+        control_service,
+        engine_health,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    let mut control_client = ControlClient::new(channel.clone());
+    let mut inference_client = InferenceClient::new(channel);
+    let adapter = pb::LoraAdapter {
+        lora_id: 42,
+        lora_name: "adapter".to_string(),
+        source_path: adapter_path.to_string_lossy().into_owned(),
+    };
+
+    let loaded = control_client
+        .load_lora(pb::LoadLoraRequest {
+            adapter: Some(adapter.clone()),
+        })
+        .await
+        .expect("load LoRA")
+        .into_inner();
+    assert!(!loaded.already_loaded);
+    assert_eq!(
+        loaded.adapter.as_ref().map(|adapter| adapter.lora_id),
+        Some(42)
+    );
+
+    let reloaded = control_client
+        .load_lora(pb::LoadLoraRequest {
+            adapter: Some(adapter),
+        })
+        .await
+        .expect("reload identical LoRA")
+        .into_inner();
+    assert!(reloaded.already_loaded);
+
+    let conflict = control_client
+        .load_lora(pb::LoadLoraRequest {
+            adapter: Some(pb::LoraAdapter {
+                lora_id: 42,
+                lora_name: "conflicting-adapter".to_string(),
+                source_path: conflicting_adapter_path.to_string_lossy().into_owned(),
+            }),
+        })
+        .await
+        .expect_err("reused LoRA ID should conflict");
+    assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+
+    let listed = control_client
+        .list_loras(pb::ListLorasRequest {})
+        .await
+        .expect("list LoRAs")
+        .into_inner();
+    assert_eq!(listed.adapters.len(), 1);
+    assert_eq!(listed.adapters[0].lora_name, "adapter");
+
+    inference_client
+        .generate(pb::GenerateRequest {
+            request_id: "grpc-lora-request".to_string(),
+            model: "test-model".to_string(),
+            prompt: Some(pb::generate_request::Prompt::Text("hello".to_string())),
+            stopping: Some(pb::StoppingCriteria {
+                max_new_tokens: 1,
+                ..Default::default()
+            }),
+            lora_name: "adapter".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("generate with LoRA");
+
+    let unloaded = control_client
+        .unload_lora(pb::UnloadLoraRequest {
+            lora_name: "adapter".to_string(),
+        })
+        .await
+        .expect("unload LoRA")
+        .into_inner();
+    assert_eq!(
+        unloaded.adapter.as_ref().map(|adapter| adapter.lora_id),
+        Some(42)
+    );
+    assert!(
+        control_client
+            .list_loras(pb::ListLorasRequest {})
+            .await
+            .expect("list LoRAs after unload")
+            .into_inner()
+            .adapters
+            .is_empty()
+    );
+
+    engine_task.await.expect("mock engine task");
     server_task.abort();
 }
 
