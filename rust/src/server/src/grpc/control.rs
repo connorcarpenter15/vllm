@@ -166,19 +166,7 @@ async fn normalize_lora_adapter(adapter: pb::LoraAdapter) -> Result<LoraRequest,
     if !metadata.is_dir() {
         return Err(Status::invalid_argument("source_path must be a directory"));
     }
-    validate_lora_allowed_prefix(&canonical).await?;
 
-    Ok(LoraRequest::new(
-        adapter.lora_name,
-        u64::try_from(adapter.lora_id)
-            .map_err(|_| Status::invalid_argument("lora_id must be positive"))?,
-        canonical.to_string_lossy().into_owned(),
-        false,
-        false,
-    ))
-}
-
-async fn validate_lora_allowed_prefix(path: &Path) -> Result<(), Status> {
     let prefixes = std::env::var_os(RUNTIME_LORA_ALLOWED_PATH_PREFIXES_ENV)
         .map(|value| {
             std::env::split_paths(&value)
@@ -191,19 +179,32 @@ async fn validate_lora_allowed_prefix(path: &Path) -> Result<(), Status> {
                 "local LoRA paths require {RUNTIME_LORA_ALLOWED_PATH_PREFIXES_ENV}"
             ))
         })?;
+    let mut path_is_allowed = false;
     for prefix in prefixes {
-        let canonical = tokio::fs::canonicalize(prefix).await.map_err(|error| {
+        let canonical_prefix = tokio::fs::canonicalize(prefix).await.map_err(|error| {
             Status::internal(format!(
                 "configured {RUNTIME_LORA_ALLOWED_PATH_PREFIXES_ENV} prefix is invalid: {}",
                 error.to_report_string()
             ))
         })?;
-        if path.starts_with(canonical) {
-            return Ok(());
+        if canonical.starts_with(canonical_prefix) {
+            path_is_allowed = true;
+            break;
         }
     }
-    Err(Status::permission_denied(
-        "source_path is outside the configured LoRA path prefixes",
+    if !path_is_allowed {
+        return Err(Status::permission_denied(
+            "source_path is outside the configured LoRA path prefixes",
+        ));
+    }
+
+    Ok(LoraRequest::new(
+        adapter.lora_name,
+        u64::try_from(adapter.lora_id)
+            .map_err(|_| Status::invalid_argument("lora_id must be positive"))?,
+        canonical.to_string_lossy().into_owned(),
+        false,
+        false,
     ))
 }
 
