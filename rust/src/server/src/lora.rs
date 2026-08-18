@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
+use futures::Stream;
 use indexmap::IndexMap;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock};
 use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_engine_core_client::{EngineCoreClient, Error as EngineCoreError};
 
@@ -40,18 +44,27 @@ impl Drop for MutationGuard<'_> {
     }
 }
 
+pub(crate) type LoraLease = Option<OwnedRwLockReadGuard<()>>;
+
 /// Snapshot of the currently served model names plus the requested LoRA, if
 /// the model name resolves to a dynamic adapter.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct LoraModelResolution {
     pub model_names: Vec<String>,
     pub lora_request: Option<LoraRequest>,
+    pub lease: LoraLease,
+}
+
+#[derive(Clone)]
+struct LoadedLora {
+    request: LoraRequest,
+    lease: Arc<RwLock<()>>,
 }
 
 /// Runtime registry for dynamically loaded LoRA adapters.
 pub(crate) struct LoraManager {
-    /// Dynamically loaded LoRA adapters keyed by public model name, in load order.
-    requests: RwLock<IndexMap<String, LoraRequest>>,
+    /// Loaded adapters and their generation leases, keyed by public model name.
+    registry: RwLock<IndexMap<String, LoadedLora>>,
     /// Monotonic adapter id allocator. LoRA ids are one-indexed.
     id_counter: AtomicU64,
     /// Serialize dynamic LoRA registry updates around engine utility calls.
@@ -91,7 +104,7 @@ enum ApplyLoadError {
 impl LoraManager {
     pub fn new() -> Self {
         Self {
-            requests: RwLock::new(IndexMap::new()),
+            registry: RwLock::new(IndexMap::new()),
             id_counter: AtomicU64::new(0),
             update_lock: Mutex::new(()),
             consistent: AtomicBool::new(true),
@@ -104,24 +117,48 @@ impl LoraManager {
 
     /// Snapshot loaded LoRA adapters in load order.
     pub async fn served_lora_requests(&self) -> Vec<LoraRequest> {
-        self.requests.read().await.values().cloned().collect()
+        self.registry
+            .read()
+            .await
+            .values()
+            .map(|loaded| loaded.request.clone())
+            .collect()
     }
 
-    /// Resolve the requested model against one consistent LoRA registry
-    /// snapshot.
+    /// Resolve the requested model and take a generation lease atomically with
+    /// respect to replacement and unload operations.
     pub async fn resolve_model(
         &self,
         base_model_names: &[String],
         model_name: Option<&str>,
     ) -> LoraModelResolution {
-        let requests = self.requests.read().await;
-        let mut model_names = base_model_names.to_vec();
-        model_names.extend(requests.keys().cloned());
-        let lora_request = model_name.and_then(|name| requests.get(name).cloned());
+        loop {
+            let candidate = match model_name {
+                Some(name) => {
+                    self.registry.read().await.get(name).map(|loaded| loaded.lease.clone())
+                }
+                None => None,
+            };
+            let lease = match &candidate {
+                Some(lease) => Some(lease.clone().read_owned().await),
+                None => None,
+            };
+            let registry = self.registry.read().await;
+            let current = model_name.and_then(|name| registry.get(name));
+            if !same_lease(current, candidate.as_ref()) {
+                drop(registry);
+                drop(lease);
+                tokio::task::yield_now().await;
+                continue;
+            }
 
-        LoraModelResolution {
-            model_names,
-            lora_request,
+            let mut model_names = base_model_names.to_vec();
+            model_names.extend(registry.keys().cloned());
+            return LoraModelResolution {
+                model_names,
+                lora_request: current.map(|loaded| loaded.request.clone()),
+                lease,
+            };
         }
     }
 
@@ -142,14 +179,23 @@ impl LoraManager {
         if base_model_names.iter().any(|name| name == &lora_name) {
             return Err(LoadLoraError::BaseModelName { lora_name });
         }
-        let previous = self.requests.read().await.get(&lora_name).cloned();
+        let previous = self
+            .registry
+            .read()
+            .await
+            .get(&lora_name)
+            .map(|loaded| (loaded.request.clone(), loaded.lease.clone()));
         if previous.is_some() && !load_inplace {
             return Err(LoadLoraError::AlreadyLoaded { lora_name });
         }
+        let _generation_guard = match previous.as_ref().map(|(_, lease)| lease.clone()) {
+            Some(lease) => Some(lease.write_owned().await),
+            None => None,
+        };
 
         let lora_int_id = previous
             .as_ref()
-            .map(|request| request.lora_int_id)
+            .map(|(request, _)| request.lora_int_id)
             .unwrap_or_else(|| self.id_counter.fetch_add(1, Ordering::Relaxed) + 1);
         let lora_request = LoraRequest::new(
             lora_name.clone(),
@@ -160,7 +206,11 @@ impl LoraManager {
         );
 
         let mut mutation = self
-            .apply_load(engine_core_client, &lora_request, previous.as_ref())
+            .apply_load(
+                engine_core_client,
+                &lora_request,
+                previous.as_ref().map(|(request, _)| request),
+            )
             .await
             .map_err(|error| match error {
                 ApplyLoadError::Engine(error) => LoadLoraError::Engine(error),
@@ -168,7 +218,14 @@ impl LoraManager {
                     lora_name: lora_name.clone(),
                 },
             })?;
-        self.requests.write().await.insert(lora_name, lora_request.clone());
+        let lease = previous.map(|(_, lease)| lease).unwrap_or_else(|| Arc::new(RwLock::new(())));
+        self.registry.write().await.insert(
+            lora_name,
+            LoadedLora {
+                request: lora_request.clone(),
+                lease,
+            },
+        );
         mutation.prove_final_state();
         Ok(lora_request)
     }
@@ -211,11 +268,15 @@ impl LoraManager {
         if !self.is_consistent() {
             return Err(UnloadLoraError::Inconsistent);
         }
-        let lora_request = self.requests.read().await.get(lora_name).cloned().ok_or_else(|| {
-            UnloadLoraError::NotFound {
+        let (lora_request, lease) = self
+            .registry
+            .read()
+            .await
+            .get(lora_name)
+            .map(|loaded| (loaded.request.clone(), loaded.lease.clone()))
+            .ok_or_else(|| UnloadLoraError::NotFound {
                 lora_name: lora_name.to_string(),
-            }
-        })?;
+            })?;
 
         if let Some(actual) = requested_lora_int_id
             && actual != lora_request.lora_int_id
@@ -226,6 +287,7 @@ impl LoraManager {
                 actual,
             });
         }
+        let _generation_guard = lease.write_owned().await;
 
         let mut mutation = MutationGuard::new(&self.consistent);
         match call_all_bounded::<bool, _>(
@@ -236,8 +298,13 @@ impl LoraManager {
         .await
         {
             Ok(_) => {
-                let removed =
-                    self.requests.write().await.shift_remove(lora_name).unwrap_or(lora_request);
+                let removed = self
+                    .registry
+                    .write()
+                    .await
+                    .shift_remove(lora_name)
+                    .map(|loaded| loaded.request)
+                    .unwrap_or(lora_request);
                 mutation.prove_final_state();
                 Ok(removed)
             }
@@ -250,6 +317,41 @@ impl LoraManager {
                 Err(UnloadLoraError::Engine(error))
             }
         }
+    }
+}
+
+fn same_lease(current: Option<&LoadedLora>, candidate: Option<&Arc<RwLock<()>>>) -> bool {
+    match (current, candidate) {
+        (Some(current), Some(candidate)) => Arc::ptr_eq(&current.lease, candidate),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Hold an adapter's shared generation lease until the wrapped stream ends or
+/// is dropped.
+pub(crate) struct LoraLeaseStream<S> {
+    stream: Pin<Box<S>>,
+    _lease: LoraLease,
+}
+
+impl<S> Unpin for LoraLeaseStream<S> {}
+
+impl<S: Stream> Stream for LoraLeaseStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.stream.as_mut().poll_next(cx)
+    }
+}
+
+pub(crate) fn hold_lora_lease<S>(stream: S, lease: LoraLease) -> LoraLeaseStream<S>
+where
+    S: Stream,
+{
+    LoraLeaseStream {
+        stream: Box::pin(stream),
+        _lease: lease,
     }
 }
 
@@ -418,6 +520,69 @@ mod tests {
         let _ = shutdown_one.send(());
         task_zero.await.unwrap();
         task_one.await.unwrap();
+        client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unload_waits_for_active_generation_lease() {
+        let ipc = IpcNamespace::new().unwrap();
+        let handshake = ipc.handshake_endpoint();
+        let mut ready = vllm_engine_core_client::mock_engine::default_ready_response();
+        ready.supports_lora = true;
+        ready.max_loras = 8;
+        let (shutdown, engine_task) = spawn_mock_engine_task_with_ready(
+            handshake.clone(),
+            vec![0x00, 0x00],
+            ready,
+            |dealer, push| {
+                Box::pin(async move {
+                    let load = recv_utility_call_id(dealer, "add_lora").await;
+                    reply_utility(push, load, true).await;
+                    let unload = recv_utility_call_id(dealer, "remove_lora").await;
+                    reply_utility(push, unload, true).await;
+                })
+            },
+        );
+        let client = EngineCoreClient::connect(
+            EngineCoreClientConfig::new_single(handshake)
+                .with_model_name("test-model")
+                .with_local_input_output_addresses(
+                    Some(ipc.input_endpoint()),
+                    Some(ipc.output_endpoint()),
+                ),
+        )
+        .await
+        .unwrap();
+        let manager = LoraManager::new();
+        manager
+            .load_lora(
+                &client,
+                &["test-model".to_string()],
+                "adapter-active".to_string(),
+                "/adapters/active".to_string(),
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        let resolution =
+            manager.resolve_model(&["test-model".to_string()], Some("adapter-active")).await;
+        assert!(resolution.lease.is_some());
+
+        let removed = {
+            let unload = manager.unload_lora(&client, "adapter-active", None);
+            tokio::pin!(unload);
+            assert!(tokio::time::timeout(Duration::from_millis(50), &mut unload).await.is_err());
+            drop(resolution);
+            tokio::time::timeout(Duration::from_secs(1), unload)
+                .await
+                .expect("unload should continue after the generation releases its lease")
+                .unwrap()
+        };
+        assert_eq!(removed.lora_name, "adapter-active");
+
+        let _ = shutdown.send(());
+        engine_task.await.unwrap();
         client.shutdown().await.unwrap();
     }
 
