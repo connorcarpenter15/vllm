@@ -95,11 +95,6 @@ pub enum Error {
     },
     #[error("utility call `{method}` closed unexpectedly (call_id={call_id})")]
     UtilityCallClosed { method: String, call_id: u64 },
-    #[error("utility call `{method}` arguments must encode as a tuple or sequence, got {actual}")]
-    InvalidUtilityArguments {
-        method: String,
-        actual: &'static str,
-    },
     #[error("utility call `{method}` returned inconsistent results across engines: {values}")]
     InconsistentUtilityResults { method: String, values: String },
 

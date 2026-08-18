@@ -174,7 +174,6 @@ impl EngineCoreUtilityRequest {
     where
         T: Serialize + std::fmt::Debug,
     {
-        let method_name = method_name.into();
         let args = rmpv::ext::to_value(&args).map_err(|error| Error::Encode {
             target_type: type_name::<T>(),
             message: format!(
@@ -184,29 +183,13 @@ impl EngineCoreUtilityRequest {
         })?;
         let args = match args {
             Value::Nil => Value::Array(Vec::new()),
-            args @ Value::Array(_) => args,
-            other => {
-                let actual = match other {
-                    Value::Boolean(_) => "boolean",
-                    Value::Integer(_) => "integer",
-                    Value::F32(_) | Value::F64(_) => "float",
-                    Value::String(_) => "string",
-                    Value::Binary(_) => "binary",
-                    Value::Map(_) => "map",
-                    Value::Ext(_, _) => "extension",
-                    Value::Nil | Value::Array(_) => unreachable!(),
-                };
-                return Err(Error::InvalidUtilityArguments {
-                    method: method_name,
-                    actual,
-                });
-            }
+            other => other,
         };
 
         Ok(Self {
             client_index,
             call_id: UtilityCallId::from(call_id),
-            method_name,
+            method_name: method_name.into(),
             args,
         })
     }
@@ -308,16 +291,6 @@ mod tests {
         assert_eq!(array[1], Value::from(42));
         assert_eq!(array[2], Value::from("is_sleeping"));
         assert_eq!(array[3], Value::Array(Vec::new()));
-    }
-
-    #[test]
-    fn utility_request_rejects_scalar_arguments() {
-        let error = EngineCoreUtilityRequest::new(7, 42, "set_flag", true).unwrap_err();
-
-        assert!(matches!(
-            error,
-            Error::InvalidUtilityArguments { method, .. } if method == "set_flag"
-        ));
     }
 
     #[test]
