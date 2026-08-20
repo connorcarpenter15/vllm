@@ -7,7 +7,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt as _;
 use hyper_util::rt::TokioIo;
@@ -1632,6 +1632,23 @@ async fn control_lora_lifecycle_selects_adapter_for_generation() {
     .await;
     let mut control_client = ControlClient::new(channel.clone());
     let mut inference_client = InferenceClient::new(channel);
+    let missing_path = std::env::temp_dir().join(format!(
+        "vllm-grpc-lora-missing-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos()
+    ));
+    let rejected = control_client
+        .load_lora(pb::LoadLoraRequest {
+            lora_name: "disallowed-adapter".to_string(),
+            source_path: missing_path.to_string_lossy().into_owned(),
+        })
+        .await
+        .expect_err("local paths must pass the runtime LoRA allowlist");
+    assert_eq!(rejected.code(), tonic::Code::InvalidArgument);
+
     let loaded = control_client
         .load_lora(pb::LoadLoraRequest {
             lora_name: "adapter".to_string(),
