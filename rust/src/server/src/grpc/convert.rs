@@ -20,72 +20,51 @@ use super::pb;
 pub fn media_parts_from_request(
     media: Vec<pb::MediaItem>,
 ) -> Result<Vec<MediaContentPart>, Status> {
-    enum ValidatedMediaSource {
-        Uri(String),
-        RawBytes(Vec<u8>),
-    }
-
     let mut parts = Vec::with_capacity(media.len());
     for (index, item) in media.into_iter().enumerate() {
-        let modality = item.modality();
-        if modality == pb::Modality::Unspecified {
-            return Err(Status::invalid_argument(format!(
-                "media[{index}].modality is required"
-            )));
+        match item.modality() {
+            pb::Modality::Image => {}
+            pb::Modality::Unspecified => {
+                return Err(Status::invalid_argument(format!(
+                    "media[{index}].modality is required"
+                )));
+            }
+            other => {
+                return Err(Status::unimplemented(format!(
+                    "media[{index}].modality {other:?} is not supported by the gRPC service"
+                )));
+            }
         }
         let uuid = (!item.uuid.is_empty()).then_some(item.uuid);
         let mime_type = (!item.mime_type.is_empty()).then_some(item.mime_type);
-        let source = match item.source {
+        let part = match item.source {
             Some(pb::media_item::Source::Url(url)) => {
                 validate_media_uri(index, "url", &url, &["http", "https"])?;
-                ValidatedMediaSource::Uri(url)
+                MediaContentPart::ImageUrl {
+                    url,
+                    detail: None,
+                    uuid,
+                }
             }
             Some(pb::media_item::Source::DataUri(uri)) => {
                 validate_media_uri(index, "data_uri", &uri, &["data"])?;
-                ValidatedMediaSource::Uri(uri)
+                MediaContentPart::ImageUrl {
+                    url: uri,
+                    detail: None,
+                    uuid,
+                }
             }
-            Some(pb::media_item::Source::RawBytes(bytes)) => ValidatedMediaSource::RawBytes(bytes),
+            Some(pb::media_item::Source::RawBytes(bytes)) => MediaContentPart::ImageData {
+                data: bytes,
+                mime_type,
+                uuid,
+                detail: None,
+            },
             None => {
                 return Err(Status::invalid_argument(format!(
                     "media[{index}].source is required"
                 )));
             }
-        };
-        let part = match (modality, source) {
-            (pb::Modality::Image, ValidatedMediaSource::Uri(url)) => MediaContentPart::ImageUrl {
-                url,
-                detail: None,
-                uuid,
-            },
-            (pb::Modality::Image, ValidatedMediaSource::RawBytes(data)) => {
-                MediaContentPart::ImageData {
-                    data,
-                    mime_type,
-                    uuid,
-                    detail: None,
-                }
-            }
-            (pb::Modality::Video, ValidatedMediaSource::Uri(url)) => {
-                MediaContentPart::VideoUrl { url, uuid }
-            }
-            (pb::Modality::Video, ValidatedMediaSource::RawBytes(data)) => {
-                MediaContentPart::VideoData {
-                    data,
-                    mime_type,
-                    uuid,
-                }
-            }
-            (pb::Modality::Audio, ValidatedMediaSource::Uri(url)) => {
-                MediaContentPart::AudioUrl { url, uuid }
-            }
-            (pb::Modality::Audio, ValidatedMediaSource::RawBytes(data)) => {
-                MediaContentPart::AudioData {
-                    data,
-                    mime_type,
-                    uuid,
-                }
-            }
-            (pb::Modality::Unspecified, _) => unreachable!("modality validated above"),
         };
         parts.push(part);
     }
@@ -598,15 +577,11 @@ impl ResponseOpts {
 
 #[cfg(test)]
 mod tests {
-    use expect_test::expect;
     use vllm_engine_core_client::protocol::output::StopReason;
     use vllm_text::{FinishReason, Finished, Prompt};
 
     use super::pb::finish_info::{FinishReason as PbFinishReason, StopReason as PbStopReason};
-    use super::{
-        ResponseOpts, media_parts_from_request, pb, to_finish_info, to_sequence_output,
-        to_text_request,
-    };
+    use super::{ResponseOpts, pb, to_finish_info, to_sequence_output, to_text_request};
 
     fn base_request() -> pb::GenerateRequest {
         pb::GenerateRequest {
@@ -615,129 +590,6 @@ mod tests {
             prompt: Some(pb::generate_request::Prompt::Text("hi".to_string())),
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn media_modalities_map_every_source_to_the_matching_content_part() {
-        let media = [
-            (pb::Modality::Image, "image", "image/png"),
-            (pb::Modality::Video, "video", "video/mp4"),
-            (pb::Modality::Audio, "audio", "audio/wav"),
-        ]
-        .into_iter()
-        .flat_map(|(modality, name, mime_type)| {
-            [
-                pb::MediaItem {
-                    modality: modality as i32,
-                    source: Some(pb::media_item::Source::Url(format!(
-                        "https://example.com/{name}"
-                    ))),
-                    uuid: format!("{name}-url"),
-                    ..Default::default()
-                },
-                pb::MediaItem {
-                    modality: modality as i32,
-                    source: Some(pb::media_item::Source::DataUri(format!(
-                        "data:{mime_type};base64,AA=="
-                    ))),
-                    uuid: format!("{name}-data-uri"),
-                    ..Default::default()
-                },
-                pb::MediaItem {
-                    modality: modality as i32,
-                    source: Some(pb::media_item::Source::RawBytes(vec![1, 2, 3])),
-                    mime_type: mime_type.to_string(),
-                    uuid: format!("{name}-raw"),
-                },
-            ]
-        })
-        .collect();
-
-        let parts = media_parts_from_request(media).expect("convert media");
-
-        expect![[r#"
-            [
-                ImageUrl {
-                    url: "https://example.com/image",
-                    detail: None,
-                    uuid: Some(
-                        "image-url",
-                    ),
-                },
-                ImageUrl {
-                    url: "data:image/png;base64,AA==",
-                    detail: None,
-                    uuid: Some(
-                        "image-data-uri",
-                    ),
-                },
-                ImageData {
-                    data: [
-                        1,
-                        2,
-                        3,
-                    ],
-                    mime_type: Some(
-                        "image/png",
-                    ),
-                    uuid: Some(
-                        "image-raw",
-                    ),
-                    detail: None,
-                },
-                VideoUrl {
-                    url: "https://example.com/video",
-                    uuid: Some(
-                        "video-url",
-                    ),
-                },
-                VideoUrl {
-                    url: "data:video/mp4;base64,AA==",
-                    uuid: Some(
-                        "video-data-uri",
-                    ),
-                },
-                VideoData {
-                    data: [
-                        1,
-                        2,
-                        3,
-                    ],
-                    mime_type: Some(
-                        "video/mp4",
-                    ),
-                    uuid: Some(
-                        "video-raw",
-                    ),
-                },
-                AudioUrl {
-                    url: "https://example.com/audio",
-                    uuid: Some(
-                        "audio-url",
-                    ),
-                },
-                AudioUrl {
-                    url: "data:audio/wav;base64,AA==",
-                    uuid: Some(
-                        "audio-data-uri",
-                    ),
-                },
-                AudioData {
-                    data: [
-                        1,
-                        2,
-                        3,
-                    ],
-                    mime_type: Some(
-                        "audio/wav",
-                    ),
-                    uuid: Some(
-                        "audio-raw",
-                    ),
-                },
-            ]
-        "#]]
-        .assert_debug_eq(&parts);
     }
 
     #[test]
