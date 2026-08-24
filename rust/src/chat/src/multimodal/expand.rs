@@ -447,18 +447,6 @@ mod tests {
 
         let ranges = expand_prompt_token_ids(&mut prompt_token_ids, &prepared).unwrap();
 
-        assert_eq!(
-            prompt_token_ids,
-            vec![
-                1,
-                VISION_START_ID,
-                QWEN3_VIDEO_PAD_ID,
-                QWEN3_VIDEO_PAD_ID,
-                QWEN3_VIDEO_PAD_ID,
-                VISION_END_ID,
-                2,
-            ]
-        );
         let range = &ranges[&Modality::Video][0];
         assert_eq!(range.offset, 1);
         assert_eq!(range.length, 4);

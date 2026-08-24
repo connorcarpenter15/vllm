@@ -598,7 +598,7 @@ impl ResponseOpts {
 
 #[cfg(test)]
 mod tests {
-    use expect_test::expect;
+    use vllm_chat::MediaContentPart;
     use vllm_engine_core_client::protocol::output::StopReason;
     use vllm_text::{FinishReason, Finished, Prompt};
 
@@ -654,90 +654,93 @@ mod tests {
         .collect();
 
         let parts = media_parts_from_request(media).expect("convert media");
+        let observed = parts
+            .iter()
+            .map(|part| match part {
+                MediaContentPart::ImageUrl { url, detail, uuid } => {
+                    assert!(detail.is_none());
+                    ("image", url.as_str(), uuid.as_deref(), None)
+                }
+                MediaContentPart::ImageData {
+                    data,
+                    mime_type,
+                    uuid,
+                    detail,
+                } => {
+                    assert_eq!(data, &[1, 2, 3]);
+                    assert!(detail.is_none());
+                    ("image", "raw", uuid.as_deref(), mime_type.as_deref())
+                }
+                MediaContentPart::VideoUrl { url, uuid } => {
+                    ("video", url.as_str(), uuid.as_deref(), None)
+                }
+                MediaContentPart::VideoData {
+                    data,
+                    mime_type,
+                    uuid,
+                } => {
+                    assert_eq!(data, &[1, 2, 3]);
+                    ("video", "raw", uuid.as_deref(), mime_type.as_deref())
+                }
+                MediaContentPart::AudioUrl { url, uuid } => {
+                    ("audio", url.as_str(), uuid.as_deref(), None)
+                }
+                MediaContentPart::AudioData {
+                    data,
+                    mime_type,
+                    uuid,
+                } => {
+                    assert_eq!(data, &[1, 2, 3]);
+                    ("audio", "raw", uuid.as_deref(), mime_type.as_deref())
+                }
+                other => panic!("unexpected content part: {other:?}"),
+            })
+            .collect::<Vec<_>>();
 
-        expect![[r#"
+        assert_eq!(
+            observed,
             [
-                ImageUrl {
-                    url: "https://example.com/image",
-                    detail: None,
-                    uuid: Some(
-                        "image-url",
-                    ),
-                },
-                ImageUrl {
-                    url: "data:image/png;base64,AA==",
-                    detail: None,
-                    uuid: Some(
-                        "image-data-uri",
-                    ),
-                },
-                ImageData {
-                    data: [
-                        1,
-                        2,
-                        3,
-                    ],
-                    mime_type: Some(
-                        "image/png",
-                    ),
-                    uuid: Some(
-                        "image-raw",
-                    ),
-                    detail: None,
-                },
-                VideoUrl {
-                    url: "https://example.com/video",
-                    uuid: Some(
-                        "video-url",
-                    ),
-                },
-                VideoUrl {
-                    url: "data:video/mp4;base64,AA==",
-                    uuid: Some(
-                        "video-data-uri",
-                    ),
-                },
-                VideoData {
-                    data: [
-                        1,
-                        2,
-                        3,
-                    ],
-                    mime_type: Some(
-                        "video/mp4",
-                    ),
-                    uuid: Some(
-                        "video-raw",
-                    ),
-                },
-                AudioUrl {
-                    url: "https://example.com/audio",
-                    uuid: Some(
-                        "audio-url",
-                    ),
-                },
-                AudioUrl {
-                    url: "data:audio/wav;base64,AA==",
-                    uuid: Some(
-                        "audio-data-uri",
-                    ),
-                },
-                AudioData {
-                    data: [
-                        1,
-                        2,
-                        3,
-                    ],
-                    mime_type: Some(
-                        "audio/wav",
-                    ),
-                    uuid: Some(
-                        "audio-raw",
-                    ),
-                },
+                (
+                    "image",
+                    "https://example.com/image",
+                    Some("image-url"),
+                    None
+                ),
+                (
+                    "image",
+                    "data:image/png;base64,AA==",
+                    Some("image-data-uri"),
+                    None,
+                ),
+                ("image", "raw", Some("image-raw"), Some("image/png")),
+                (
+                    "video",
+                    "https://example.com/video",
+                    Some("video-url"),
+                    None
+                ),
+                (
+                    "video",
+                    "data:video/mp4;base64,AA==",
+                    Some("video-data-uri"),
+                    None,
+                ),
+                ("video", "raw", Some("video-raw"), Some("video/mp4")),
+                (
+                    "audio",
+                    "https://example.com/audio",
+                    Some("audio-url"),
+                    None
+                ),
+                (
+                    "audio",
+                    "data:audio/wav;base64,AA==",
+                    Some("audio-data-uri"),
+                    None,
+                ),
+                ("audio", "raw", Some("audio-raw"), Some("audio/wav")),
             ]
-        "#]]
-        .assert_debug_eq(&parts);
+        );
     }
 
     #[test]
