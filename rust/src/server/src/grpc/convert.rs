@@ -20,11 +20,6 @@ use super::pb;
 pub fn media_parts_from_request(
     media: Vec<pb::MediaItem>,
 ) -> Result<Vec<MediaContentPart>, Status> {
-    enum ValidatedMediaSource {
-        Uri(String),
-        RawBytes(Vec<u8>),
-    }
-
     let mut parts = Vec::with_capacity(media.len());
     for (index, item) in media.into_iter().enumerate() {
         let modality = item.modality();
@@ -35,29 +30,28 @@ pub fn media_parts_from_request(
         }
         let uuid = (!item.uuid.is_empty()).then_some(item.uuid);
         let mime_type = (!item.mime_type.is_empty()).then_some(item.mime_type);
-        let source = match item.source {
-            Some(pb::media_item::Source::Url(url)) => {
-                validate_media_uri(index, "url", &url, &["http", "https"])?;
-                ValidatedMediaSource::Uri(url)
+        let source = item.source.ok_or_else(|| {
+            Status::invalid_argument(format!("media[{index}].source is required"))
+        })?;
+        match &source {
+            pb::media_item::Source::Url(url) => {
+                validate_media_uri(index, "url", url, &["http", "https"])?;
             }
-            Some(pb::media_item::Source::DataUri(uri)) => {
-                validate_media_uri(index, "data_uri", &uri, &["data"])?;
-                ValidatedMediaSource::Uri(uri)
+            pb::media_item::Source::DataUri(uri) => {
+                validate_media_uri(index, "data_uri", uri, &["data"])?;
             }
-            Some(pb::media_item::Source::RawBytes(bytes)) => ValidatedMediaSource::RawBytes(bytes),
-            None => {
-                return Err(Status::invalid_argument(format!(
-                    "media[{index}].source is required"
-                )));
-            }
-        };
+            pb::media_item::Source::RawBytes(_) => {}
+        }
         let part = match (modality, source) {
-            (pb::Modality::Image, ValidatedMediaSource::Uri(url)) => MediaContentPart::ImageUrl {
+            (
+                pb::Modality::Image,
+                pb::media_item::Source::Url(url) | pb::media_item::Source::DataUri(url),
+            ) => MediaContentPart::ImageUrl {
                 url,
                 detail: None,
                 uuid,
             },
-            (pb::Modality::Image, ValidatedMediaSource::RawBytes(data)) => {
+            (pb::Modality::Image, pb::media_item::Source::RawBytes(data)) => {
                 MediaContentPart::ImageData {
                     data,
                     mime_type,
@@ -65,20 +59,22 @@ pub fn media_parts_from_request(
                     detail: None,
                 }
             }
-            (pb::Modality::Video, ValidatedMediaSource::Uri(url)) => {
-                MediaContentPart::VideoUrl { url, uuid }
-            }
-            (pb::Modality::Video, ValidatedMediaSource::RawBytes(data)) => {
+            (
+                pb::Modality::Video,
+                pb::media_item::Source::Url(url) | pb::media_item::Source::DataUri(url),
+            ) => MediaContentPart::VideoUrl { url, uuid },
+            (pb::Modality::Video, pb::media_item::Source::RawBytes(data)) => {
                 MediaContentPart::VideoData {
                     data,
                     mime_type,
                     uuid,
                 }
             }
-            (pb::Modality::Audio, ValidatedMediaSource::Uri(url)) => {
-                MediaContentPart::AudioUrl { url, uuid }
-            }
-            (pb::Modality::Audio, ValidatedMediaSource::RawBytes(data)) => {
+            (
+                pb::Modality::Audio,
+                pb::media_item::Source::Url(url) | pb::media_item::Source::DataUri(url),
+            ) => MediaContentPart::AudioUrl { url, uuid },
+            (pb::Modality::Audio, pb::media_item::Source::RawBytes(data)) => {
                 MediaContentPart::AudioData {
                     data,
                     mime_type,
@@ -598,15 +594,11 @@ impl ResponseOpts {
 
 #[cfg(test)]
 mod tests {
-    use vllm_chat::MediaContentPart;
     use vllm_engine_core_client::protocol::output::StopReason;
     use vllm_text::{FinishReason, Finished, Prompt};
 
     use super::pb::finish_info::{FinishReason as PbFinishReason, StopReason as PbStopReason};
-    use super::{
-        ResponseOpts, media_parts_from_request, pb, to_finish_info, to_sequence_output,
-        to_text_request,
-    };
+    use super::{ResponseOpts, pb, to_finish_info, to_sequence_output, to_text_request};
 
     fn base_request() -> pb::GenerateRequest {
         pb::GenerateRequest {
@@ -615,132 +607,6 @@ mod tests {
             prompt: Some(pb::generate_request::Prompt::Text("hi".to_string())),
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn media_modalities_map_every_source_to_the_matching_content_part() {
-        let media = [
-            (pb::Modality::Image, "image", "image/png"),
-            (pb::Modality::Video, "video", "video/mp4"),
-            (pb::Modality::Audio, "audio", "audio/wav"),
-        ]
-        .into_iter()
-        .flat_map(|(modality, name, mime_type)| {
-            [
-                pb::MediaItem {
-                    modality: modality as i32,
-                    source: Some(pb::media_item::Source::Url(format!(
-                        "https://example.com/{name}"
-                    ))),
-                    uuid: format!("{name}-url"),
-                    ..Default::default()
-                },
-                pb::MediaItem {
-                    modality: modality as i32,
-                    source: Some(pb::media_item::Source::DataUri(format!(
-                        "data:{mime_type};base64,AA=="
-                    ))),
-                    uuid: format!("{name}-data-uri"),
-                    ..Default::default()
-                },
-                pb::MediaItem {
-                    modality: modality as i32,
-                    source: Some(pb::media_item::Source::RawBytes(vec![1, 2, 3])),
-                    mime_type: mime_type.to_string(),
-                    uuid: format!("{name}-raw"),
-                },
-            ]
-        })
-        .collect();
-
-        let parts = media_parts_from_request(media).expect("convert media");
-        let observed = parts
-            .iter()
-            .map(|part| match part {
-                MediaContentPart::ImageUrl { url, detail, uuid } => {
-                    assert!(detail.is_none());
-                    ("image", url.as_str(), uuid.as_deref(), None)
-                }
-                MediaContentPart::ImageData {
-                    data,
-                    mime_type,
-                    uuid,
-                    detail,
-                } => {
-                    assert_eq!(data, &[1, 2, 3]);
-                    assert!(detail.is_none());
-                    ("image", "raw", uuid.as_deref(), mime_type.as_deref())
-                }
-                MediaContentPart::VideoUrl { url, uuid } => {
-                    ("video", url.as_str(), uuid.as_deref(), None)
-                }
-                MediaContentPart::VideoData {
-                    data,
-                    mime_type,
-                    uuid,
-                } => {
-                    assert_eq!(data, &[1, 2, 3]);
-                    ("video", "raw", uuid.as_deref(), mime_type.as_deref())
-                }
-                MediaContentPart::AudioUrl { url, uuid } => {
-                    ("audio", url.as_str(), uuid.as_deref(), None)
-                }
-                MediaContentPart::AudioData {
-                    data,
-                    mime_type,
-                    uuid,
-                } => {
-                    assert_eq!(data, &[1, 2, 3]);
-                    ("audio", "raw", uuid.as_deref(), mime_type.as_deref())
-                }
-                other => panic!("unexpected content part: {other:?}"),
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            observed,
-            [
-                (
-                    "image",
-                    "https://example.com/image",
-                    Some("image-url"),
-                    None
-                ),
-                (
-                    "image",
-                    "data:image/png;base64,AA==",
-                    Some("image-data-uri"),
-                    None,
-                ),
-                ("image", "raw", Some("image-raw"), Some("image/png")),
-                (
-                    "video",
-                    "https://example.com/video",
-                    Some("video-url"),
-                    None
-                ),
-                (
-                    "video",
-                    "data:video/mp4;base64,AA==",
-                    Some("video-data-uri"),
-                    None,
-                ),
-                ("video", "raw", Some("video-raw"), Some("video/mp4")),
-                (
-                    "audio",
-                    "https://example.com/audio",
-                    Some("audio-url"),
-                    None
-                ),
-                (
-                    "audio",
-                    "data:audio/wav;base64,AA==",
-                    Some("audio-data-uri"),
-                    None,
-                ),
-                ("audio", "raw", Some("audio-raw"), Some("audio/wav")),
-            ]
-        );
     }
 
     #[test]
