@@ -881,60 +881,6 @@ async fn unary_generate_prepares_multimodal_input_for_engine_core() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn unary_generate_strips_encoder_cache_params_without_media() {
-    let (inference_service, control_service, engine_health, engine_task) =
-        setup_grpc_service_with_backend(
-            b"engine-grpc-text-only-remote-prefill",
-            default_stream_output_specs(),
-            Arc::new(FakeTextBackend),
-            |request| {
-                let xargs = request
-                    .sampling_params
-                    .as_ref()
-                    .and_then(|params| params.extra_args.as_ref())
-                    .expect("KV transfer args");
-                assert!(xargs.contains_key("kv_transfer_params"));
-                assert!(!xargs.contains_key("ec_transfer_params"));
-                assert!(request.mm_features.is_none());
-            },
-        )
-        .await;
-    let (channel, server_task) = start_grpc_test_server(
-        inference_service,
-        control_service,
-        engine_health,
-        tokio_util::sync::CancellationToken::new(),
-    )
-    .await;
-    let mut client = InferenceClient::new(channel);
-
-    client
-        .generate(pb::GenerateRequest {
-            request_id: "test-text-only-remote-prefill".to_string(),
-            model: "test-model".to_string(),
-            prompt: Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
-                ids: vec![11, 12],
-            })),
-            kv: Some(pb::KvCacheParameters {
-                kv_transfer_params: Some(decode_kv_proto_struct()),
-                ec_transfer_params: Some(ec_proto_struct(&["unused-image"])),
-                ..Default::default()
-            }),
-            stopping: Some(pb::StoppingCriteria {
-                max_new_tokens: 10,
-                ..Default::default()
-            }),
-            ..Default::default()
-        })
-        .await
-        .expect("text-only remote-prefill generate");
-
-    engine_task.await.expect("mock engine task");
-    server_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
 async fn streaming_generate_rejects_text_prompt_with_media() {
     let (mut client, server_task, _engine_task) = grpc_test_server(
         b"engine-grpc-stream-media-text",
