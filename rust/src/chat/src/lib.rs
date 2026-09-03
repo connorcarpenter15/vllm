@@ -162,6 +162,7 @@ impl ChatRequestProcessor {
         &self,
         media: Vec<MediaContentPart>,
         token_ids: &mut Vec<u32>,
+        encoder_cache_items: &[multimodal::EncoderCacheItem],
     ) -> Result<Option<MmFeatures>> {
         if media.is_empty() {
             return Ok(None);
@@ -171,7 +172,14 @@ impl ChatRequestProcessor {
             .multimodal_model_info()
             .ok_or(Error::UnsupportedMultimodalRenderer)?;
         let model_dtype = self.model_dtype.ok_or(Error::UnsupportedMultimodalRenderer)?;
-        let features = info.prepare_multimodal(media, token_ids, model_dtype).await?;
+        let features = info
+            .prepare_multimodal_with_encoder_cache(
+                media,
+                token_ids,
+                model_dtype,
+                encoder_cache_items,
+            )
+            .await?;
         Ok(Some(features))
     }
 
@@ -321,7 +329,18 @@ impl ChatLlm {
         media: Vec<MediaContentPart>,
         token_ids: &mut Vec<u32>,
     ) -> Result<Option<MmFeatures>> {
-        self.processor.prepare_media(media, token_ids).await
+        self.processor.prepare_media(media, token_ids, &[]).await
+    }
+
+    /// Prepare media using producer-generated encoder-cache metadata when it
+    /// completely covers the request, with raw-media preprocessing as fallback.
+    pub async fn prepare_media_with_encoder_cache(
+        &self,
+        media: Vec<MediaContentPart>,
+        token_ids: &mut Vec<u32>,
+        encoder_cache_items: &[multimodal::EncoderCacheItem],
+    ) -> Result<Option<MmFeatures>> {
+        self.processor.prepare_media(media, token_ids, encoder_cache_items).await
     }
 
     /// Effective tool-call parser name for this model, if parsing is enabled.

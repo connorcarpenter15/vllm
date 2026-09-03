@@ -247,6 +247,38 @@ class TestStateManagement:
         assert connector._mm_datas_need_loads["img_hash_2"] == 150
         assert connector._mm_datas_need_loads["img_hash_3"] == 200
 
+    def test_request_finished_publishes_complete_frontend_metadata(
+        self, mock_vllm_config_producer, mock_request_with_3_mm
+    ):
+        connector = ECExampleConnector(
+            vllm_config=mock_vllm_config_producer,
+            role=ECConnectorRole.SCHEDULER,
+        )
+        feature = mock_request_with_3_mm.mm_features[0]
+        feature.data = Mock()
+        feature.data.get_data.return_value = {
+            "pixel_values": torch.zeros(4, 8),
+            "image_grid_thw": torch.tensor([1, 4, 4]),
+        }
+        mock_request_with_3_mm.mm_features = [feature]
+
+        with patch.object(
+            connector,
+            "_placeholder_metadata_fields",
+            return_value={"image_grid_thw"},
+        ):
+            _, params = connector.request_finished(mock_request_with_3_mm)
+
+        assert params == {
+            "ec_items": [
+                {
+                    "mm_hash": "img_hash_1",
+                    "image_grid_thw": [1, 4, 4],
+                    "num_encoder_tokens": 100,
+                }
+            ]
+        }
+
     def test_build_connector_meta_3_items(
         self, mock_vllm_config_producer, mock_request_with_3_mm
     ):
