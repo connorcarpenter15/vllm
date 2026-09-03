@@ -203,18 +203,19 @@ class ECExampleConnector(ECConnectorBase):
         self,
         request: "Request",
     ) -> tuple[bool, dict[str, Any] | None]:
-        """Report each item's cache key, placeholder metadata, and encoder-token
-        count so a consumer can skip the media transform.
+        """Report each item's cache key and grid so a consumer can skip the
+        image transform.
 
-        The embedding itself arrives through this connector. Reporting the
-        producer's processor outputs keeps the two sides in agreement without
-        the caller re-deriving them from the raw media.
+        A consumer only needs the grid to size the prompt's placeholder range;
+        the embedding itself arrives through this connector. Reporting the grid
+        the producer actually computed keeps the two sides in agreement without
+        the caller re-deriving it from the raw media.
         """
         if not self.is_producer:
             return False, None
 
         items = []
-        for index, feature in enumerate(request.mm_features):
+        for feature in request.mm_features:
             metadata = {}
             # `data` is None for items served from the processor cache, in which
             # case the metadata is unavailable here and the consumer has to fall
@@ -230,14 +231,6 @@ class ECExampleConnector(ECConnectorBase):
                         # Some metadata (e.g. Qwen3-VL video timestamps) is
                         # produced as a plain list rather than a tensor.
                         metadata[key] = value
-                # The Rust frontend cannot infer model-specific placeholder
-                # lengths from arbitrary metadata. Publish the producer's
-                # authoritative count only when all declared metadata is present;
-                # its presence marks this item safe for metadata-only preparation.
-                if wanted and wanted <= metadata.keys():
-                    metadata["num_encoder_tokens"] = request.get_num_encoder_embeds(
-                        index
-                    )
             items.append({"mm_hash": feature.identifier, **metadata})
 
         if not items:

@@ -143,7 +143,7 @@ fn default_stream_output_specs() -> Vec<(Vec<u32>, Option<EngineCoreFinishReason
     ]
 }
 
-fn ec_proto_struct(items: &[(&str, Option<usize>, [u32; 3])]) -> prost_types::Struct {
+fn ec_proto_struct() -> prost_types::Struct {
     use prost_types::value::Kind;
 
     prost_types::Struct {
@@ -151,43 +151,39 @@ fn ec_proto_struct(items: &[(&str, Option<usize>, [u32; 3])]) -> prost_types::St
             "ec_items".to_string(),
             prost_types::Value {
                 kind: Some(Kind::ListValue(prost_types::ListValue {
-                    values: items
-                        .iter()
-                        .map(|(identifier, num_encoder_tokens, grid)| {
-                            let mut fields = std::collections::BTreeMap::from([
+                    values: vec![prost_types::Value {
+                        kind: Some(Kind::StructValue(prost_types::Struct {
+                            fields: std::collections::BTreeMap::from([
                                 (
                                     "image_grid_thw".to_string(),
                                     prost_types::Value {
                                         kind: Some(Kind::ListValue(prost_types::ListValue {
-                                            values: grid
-                                                .iter()
-                                                .map(|value| prost_types::Value {
-                                                    kind: Some(Kind::NumberValue(*value as f64)),
-                                                })
-                                                .collect(),
+                                            values: vec![prost_types::Value {
+                                                kind: Some(Kind::ListValue(
+                                                    prost_types::ListValue {
+                                                        values: vec![1.0, 16.0, 16.0]
+                                                            .into_iter()
+                                                            .map(|value| prost_types::Value {
+                                                                kind: Some(Kind::NumberValue(
+                                                                    value,
+                                                                )),
+                                                            })
+                                                            .collect(),
+                                                    },
+                                                )),
+                                            }],
                                         })),
                                     },
                                 ),
                                 (
                                     "mm_hash".to_string(),
                                     prost_types::Value {
-                                        kind: Some(Kind::StringValue((*identifier).to_string())),
+                                        kind: Some(Kind::StringValue("image-1".to_string())),
                                     },
                                 ),
-                            ]);
-                            if let Some(num_encoder_tokens) = num_encoder_tokens {
-                                fields.insert(
-                                    "num_encoder_tokens".to_string(),
-                                    prost_types::Value {
-                                        kind: Some(Kind::NumberValue(*num_encoder_tokens as f64)),
-                                    },
-                                );
-                            }
-                            prost_types::Value {
-                                kind: Some(Kind::StructValue(prost_types::Struct { fields })),
-                            }
-                        })
-                        .collect(),
+                            ]),
+                        })),
+                    }],
                 })),
             },
         )]),
@@ -778,7 +774,7 @@ async fn unary_generate_with_token_ids_prompt() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn unary_generate_uses_encoder_cache_metadata_without_loading_media() {
+async fn unary_generate_prepares_multimodal_input_for_engine_core() {
     let (inference_service, control_service, engine_health, engine_task) =
         setup_grpc_service_with_backend(
             b"engine-grpc-multimodal",
@@ -787,32 +783,18 @@ async fn unary_generate_uses_encoder_cache_metadata_without_loading_media() {
             |request| {
                 let token_ids = request.prompt_token_ids.as_ref().expect("prompt token ids");
                 let features = request.mm_features.as_ref().expect("multimodal features");
-                assert_eq!(features.len(), 2);
+                assert_eq!(features.len(), 1);
 
-                let first = &features[0];
-                assert_eq!(first.modality, "image");
-                assert_eq!(first.identifier, "image-1");
-                assert_eq!(first.mm_position.offset, 1);
-                assert_eq!(first.mm_position.length, 4);
+                let feature = &features[0];
+                assert_eq!(feature.modality, "image");
+                assert_eq!(feature.identifier, "image-1");
+                assert_eq!(feature.mm_position.offset, 1);
+                assert!(feature.mm_position.length > 1);
                 assert_eq!(
-                    first
+                    feature
                         .data
                         .as_ref()
-                        .expect("first multimodal feature data")
-                        .keys()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>(),
-                    vec!["image_grid_thw"]
-                );
-                let second = &features[1];
-                assert_eq!(second.identifier, "image-2");
-                assert_eq!(second.mm_position.offset, 6);
-                assert_eq!(second.mm_position.length, 9);
-                assert_eq!(
-                    second
-                        .data
-                        .as_ref()
-                        .expect("second multimodal feature data")
+                        .expect("multimodal feature data")
                         .keys()
                         .map(String::as_str)
                         .collect::<Vec<_>>(),
@@ -831,18 +813,15 @@ async fn unary_generate_uses_encoder_cache_metadata_without_loading_media() {
                     Some(7)
                 );
                 assert!(!xargs.contains_key("ec_transfer_params"));
-                assert_eq!(token_ids.len(), 16);
+                assert_eq!(token_ids.len(), feature.mm_position.length + 2);
                 assert_eq!(token_ids[0], 11);
-                assert_eq!(token_ids[5], 12);
-                assert_eq!(token_ids.last(), Some(&13));
-                for feature in features {
-                    assert!(
-                        token_ids[feature.mm_position.offset
-                            ..feature.mm_position.offset + feature.mm_position.length]
-                            .iter()
-                            .all(|token_id| *token_id == QWEN_IMAGE_TOKEN_ID)
-                    );
-                }
+                assert_eq!(token_ids.last(), Some(&12));
+                assert!(
+                    token_ids[feature.mm_position.offset
+                        ..feature.mm_position.offset + feature.mm_position.length]
+                        .iter()
+                        .all(|token_id| *token_id == QWEN_IMAGE_TOKEN_ID)
+                );
             },
         )
         .await;
@@ -860,78 +839,6 @@ async fn unary_generate_uses_encoder_cache_metadata_without_loading_media() {
             request_id: "test-multimodal".to_string(),
             model: "test-model".to_string(),
             prompt: Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
-                ids: vec![11, QWEN_IMAGE_TOKEN_ID, 12, QWEN_IMAGE_TOKEN_ID, 13],
-            })),
-            media: vec![
-                pb::MediaItem {
-                    modality: pb::Modality::Image as i32,
-                    source: Some(pb::media_item::Source::DataUri(
-                        "data:image/png;base64,invalid-image-one".to_string(),
-                    )),
-                    mime_type: String::new(),
-                    uuid: "image-1".to_string(),
-                },
-                pb::MediaItem {
-                    modality: pb::Modality::Image as i32,
-                    source: Some(pb::media_item::Source::DataUri(
-                        "data:image/png;base64,invalid-image-two".to_string(),
-                    )),
-                    mime_type: String::new(),
-                    uuid: "image-2".to_string(),
-                },
-            ],
-            kv: Some(pb::KvCacheParameters {
-                kv_transfer_params: Some(decode_kv_proto_struct()),
-                // Reverse producer order to prove UUID lookup, not positional zip.
-                ec_transfer_params: Some(ec_proto_struct(&[
-                    ("image-2", Some(9), [1, 6, 6]),
-                    ("image-1", Some(4), [1, 4, 4]),
-                ])),
-                ..Default::default()
-            }),
-            stopping: Some(pb::StoppingCriteria {
-                max_new_tokens: 10,
-                ..Default::default()
-            }),
-            ..Default::default()
-        })
-        .await
-        .expect("multimodal generate");
-
-    engine_task.await.expect("mock engine task");
-    server_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn unary_generate_falls_back_when_encoder_cache_metadata_is_incomplete() {
-    let (inference_service, control_service, engine_health, engine_task) =
-        setup_grpc_service_with_backend(
-            b"engine-grpc-multimodal-fallback",
-            default_stream_output_specs(),
-            multimodal_backend(),
-            |request| {
-                let features = request.mm_features.as_ref().expect("multimodal features");
-                let data = features[0].data.as_ref().expect("multimodal feature data");
-                assert!(data.contains_key("pixel_values"));
-                assert!(data.contains_key("image_grid_thw"));
-            },
-        )
-        .await;
-    let (channel, server_task) = start_grpc_test_server(
-        inference_service,
-        control_service,
-        engine_health,
-        tokio_util::sync::CancellationToken::new(),
-    )
-    .await;
-    let mut client = InferenceClient::new(channel);
-
-    client
-        .generate(pb::GenerateRequest {
-            request_id: "test-multimodal-fallback".to_string(),
-            model: "test-model".to_string(),
-            prompt: Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
                 ids: vec![11, QWEN_IMAGE_TOKEN_ID, 12],
             })),
             media: vec![pb::MediaItem {
@@ -943,60 +850,8 @@ async fn unary_generate_falls_back_when_encoder_cache_metadata_is_incomplete() {
                 uuid: "image-1".to_string(),
             }],
             kv: Some(pb::KvCacheParameters {
-                ec_transfer_params: Some(ec_proto_struct(&[("image-1", None, [1, 4, 4])])),
-                ..Default::default()
-            }),
-            stopping: Some(pb::StoppingCriteria {
-                max_new_tokens: 10,
-                ..Default::default()
-            }),
-            ..Default::default()
-        })
-        .await
-        .expect("multimodal fallback generate");
-
-    engine_task.await.expect("mock engine task");
-    server_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn unary_generate_strips_encoder_cache_params_from_text_only_kv_decode() {
-    let (inference_service, control_service, engine_health, engine_task) =
-        setup_grpc_service_with_backend(
-            b"engine-grpc-text-kv-decode",
-            default_stream_output_specs(),
-            Arc::new(FakeTextBackend),
-            |request| {
-                let xargs = request
-                    .sampling_params
-                    .as_ref()
-                    .and_then(|params| params.extra_args.as_ref())
-                    .expect("KV transfer args");
-                assert!(xargs.contains_key("kv_transfer_params"));
-                assert!(!xargs.contains_key("ec_transfer_params"));
-            },
-        )
-        .await;
-    let (channel, server_task) = start_grpc_test_server(
-        inference_service,
-        control_service,
-        engine_health,
-        tokio_util::sync::CancellationToken::new(),
-    )
-    .await;
-    let mut client = InferenceClient::new(channel);
-
-    client
-        .generate(pb::GenerateRequest {
-            request_id: "test-text-kv-decode".to_string(),
-            model: "test-model".to_string(),
-            prompt: Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
-                ids: vec![1, 2, 3],
-            })),
-            kv: Some(pb::KvCacheParameters {
                 kv_transfer_params: Some(decode_kv_proto_struct()),
-                ec_transfer_params: Some(ec_proto_struct(&[("unused-image", Some(4), [1, 4, 4])])),
+                ec_transfer_params: Some(ec_proto_struct()),
                 ..Default::default()
             }),
             stopping: Some(pb::StoppingCriteria {
@@ -1006,7 +861,7 @@ async fn unary_generate_strips_encoder_cache_params_from_text_only_kv_decode() {
             ..Default::default()
         })
         .await
-        .expect("text-only KV decode");
+        .expect("multimodal generate");
 
     engine_task.await.expect("mock engine task");
     server_task.abort();

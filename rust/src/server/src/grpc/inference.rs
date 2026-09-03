@@ -13,7 +13,6 @@ use tonic::{Request, Response, Status};
 use tracing::{Span, info, info_span, warn};
 use tracing_futures::Instrument as _;
 use uuid::Uuid;
-use vllm_chat::multimodal::EncoderCacheItem;
 use vllm_llm::current_unix_timestamp_secs;
 use vllm_text::{DecodedTextEvent, Prompt, SampledDelta, TextOutputStreamExt as _, TextRequest};
 
@@ -36,9 +35,8 @@ struct PreparedGrpcRequest {
     started_at: Instant,
 }
 
-/// Read producer metadata for frontend preparation and remove it from remote-
-/// prefill decode requests before they reach EngineCore.
-fn encoder_cache_items(text_request: &mut TextRequest) -> Option<Vec<EncoderCacheItem>> {
+/// Keep producer metadata for matching EC items; leave unmatched inputs intact.
+fn apply_encoder_cache_placeholders(text_request: &mut TextRequest) {
     let is_decode_kv_consumer = text_request
         .sampling_params
         .vllm_xargs
@@ -47,32 +45,48 @@ fn encoder_cache_items(text_request: &mut TextRequest) -> Option<Vec<EncoderCach
         .and_then(|params| params.get("do_remote_prefill"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let ec_items = text_request
+    let Some(ec_items) = text_request
         .sampling_params
         .vllm_xargs
         .as_ref()
         .and_then(|args| args.get("ec_transfer_params"))
         .and_then(|params| params.get("ec_items"))
-        .cloned();
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+    else {
+        return;
+    };
+    let Some(features) = text_request.mm_features.as_mut() else {
+        return;
+    };
+
+    for (feature, item) in features.iter_mut().zip(ec_items) {
+        let Some(item) = item.as_object() else {
+            continue;
+        };
+        if item.get("mm_hash").and_then(serde_json::Value::as_str)
+            != Some(feature.identifier.as_str())
+        {
+            continue;
+        }
+        let Some(data) = feature.data.as_mut() else {
+            continue;
+        };
+        let metadata_keys: Vec<_> = data
+            .keys()
+            .filter(|key| key.as_str() != "mm_hash" && item.contains_key(key.as_str()))
+            .cloned()
+            .collect();
+        if metadata_keys.is_empty() {
+            continue;
+        }
+        data.retain(|key, _| metadata_keys.contains(key));
+    }
 
     // Decode uses EC metadata only to prepare the prompt; EngineCore consumes KV.
     if is_decode_kv_consumer {
         if let Some(args) = text_request.sampling_params.vllm_xargs.as_mut() {
             args.remove("ec_transfer_params");
-        }
-    }
-
-    let Some(ec_items) = ec_items else {
-        return None;
-    };
-    match serde_json::from_value(ec_items) {
-        Ok(items) => Some(items),
-        Err(error) => {
-            warn!(
-                %error,
-                "invalid encoder-cache metadata; falling back to raw media"
-            );
-            None
         }
     }
 }
@@ -119,7 +133,6 @@ impl InferenceServiceImpl {
                 convert::to_text_request(proto_request, stream, self.state.served_model_names())?;
             text_request.arrival_time = Some(arrival_time);
             text_request.data_parallel_rank = data_parallel_rank;
-            let encoder_cache_items = encoder_cache_items(&mut text_request);
 
             if !lora_name.is_empty() {
                 if !self.state.engine_core_client().ready_response().supports_lora {
@@ -143,15 +156,12 @@ impl InferenceServiceImpl {
                 let mm_features = self
                     .state
                     .chat
-                    .prepare_media_with_encoder_cache(
-                        media,
-                        &mut token_ids,
-                        encoder_cache_items.as_deref().unwrap_or_default(),
-                    )
+                    .prepare_media(media, &mut token_ids)
                     .await
                     .map_err(|error| Status::internal(error.to_report_string()))?;
                 text_request.prompt = Prompt::TokenIds(token_ids);
                 text_request.mm_features = mm_features;
+                apply_encoder_cache_placeholders(&mut text_request);
             }
 
             Ok(text_request)

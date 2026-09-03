@@ -37,7 +37,6 @@ use crate::renderer::RenderedPrompt;
 use crate::request::{ChatContent, ChatContentPart, ChatMessage, ChatRequest};
 
 mod audio;
-mod encoder_cache;
 mod expand;
 mod image;
 mod item;
@@ -45,8 +44,6 @@ mod tensor;
 mod video;
 
 use self::expand::expand_prompt_token_ids;
-
-pub use self::encoder_cache::EncoderCacheItem;
 
 /// Resolved multimodal support for one loaded model.
 #[derive(Clone)]
@@ -705,52 +702,11 @@ impl MultimodalModelInfo {
         prompt_token_ids: &mut Vec<u32>,
         model_dtype: ModelDtype,
     ) -> Result<MmFeatures> {
-        self.prepare_multimodal_with_encoder_cache(media_parts, prompt_token_ids, model_dtype, &[])
-            .await
-    }
-
-    /// Prepare media using producer metadata when every item has a complete
-    /// encoder-cache handoff, otherwise fall back to raw-media preprocessing.
-    pub(crate) async fn prepare_multimodal_with_encoder_cache(
-        &self,
-        media_parts: Vec<MediaContentPart>,
-        prompt_token_ids: &mut Vec<u32>,
-        model_dtype: ModelDtype,
-        encoder_cache_items: &[EncoderCacheItem],
-    ) -> Result<MmFeatures> {
         let media_parts_len = media_parts.len();
         if media_parts_len == 0 {
             return Ok(Vec::new());
         }
         self.validate_mm_limits(&media_parts)?;
-
-        if !encoder_cache_items.is_empty() {
-            match self.prepare_from_encoder_cache(&media_parts, encoder_cache_items) {
-                Ok(Some(prepared)) => {
-                    let mut cached_prompt_token_ids = prompt_token_ids.clone();
-                    match Self::finish_prepared(
-                        media_parts_len,
-                        &mut cached_prompt_token_ids,
-                        prepared,
-                    ) {
-                        Ok(features) => {
-                            *prompt_token_ids = cached_prompt_token_ids;
-                            return Ok(features);
-                        }
-                        Err(error) => warn!(
-                            error = %error.as_report(),
-                            "encoder-cache metadata could not reconstruct the multimodal prompt; falling back to raw media"
-                        ),
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => warn!(
-                    error = %error.as_report(),
-                    "encoder-cache metadata could not prepare multimodal inputs; falling back to raw media"
-                ),
-            }
-        }
-
         let fetched = self.fetch_media(media_parts).await?;
 
         let mut prepared = Vec::new();
@@ -766,14 +722,6 @@ impl MultimodalModelInfo {
             prepared.push(self.prepare_audios(fetched.audios, fetched.audio_uuids).await?);
         }
 
-        Self::finish_prepared(media_parts_len, prompt_token_ids, prepared)
-    }
-
-    fn finish_prepared(
-        media_parts_len: usize,
-        prompt_token_ids: &mut Vec<u32>,
-        prepared: Vec<PreparedMedia>,
-    ) -> Result<MmFeatures> {
         let mut ranges = expand_prompt_token_ids(prompt_token_ids, &prepared)?;
 
         let mut features = Vec::with_capacity(media_parts_len);

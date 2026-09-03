@@ -151,11 +151,6 @@ def rewrite_for_decode(req_data: dict, item_meta: dict[int, dict]) -> dict:
             meta = dict(item_meta.get(idx) or {})
             idx += 1
             item_uuid = meta.pop("mm_hash", None)
-            # This is a frontend control field for clients that cannot derive
-            # placeholder lengths from model metadata. Python derives the same
-            # value through its multimodal processor and must not forward it as
-            # a model kwarg.
-            meta.pop("num_encoder_tokens", None)
             # Whatever keys the encoder reported are the metadata its model
             # declared as needed to size the placeholder range; the proxy does
             # not need to know their names.
