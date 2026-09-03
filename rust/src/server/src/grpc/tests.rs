@@ -143,6 +143,91 @@ fn default_stream_output_specs() -> Vec<(Vec<u32>, Option<EngineCoreFinishReason
     ]
 }
 
+fn ec_proto_struct(mm_hashes: &[&str]) -> prost_types::Struct {
+    use prost_types::value::Kind;
+
+    prost_types::Struct {
+        fields: std::collections::BTreeMap::from([(
+            "ec_items".to_string(),
+            prost_types::Value {
+                kind: Some(Kind::ListValue(prost_types::ListValue {
+                    values: mm_hashes
+                        .iter()
+                        .map(|mm_hash| prost_types::Value {
+                            kind: Some(Kind::StructValue(prost_types::Struct {
+                                fields: std::collections::BTreeMap::from([
+                                    (
+                                        "image_grid_thw".to_string(),
+                                        prost_types::Value {
+                                            kind: Some(Kind::ListValue(prost_types::ListValue {
+                                                values: vec![prost_types::Value {
+                                                    kind: Some(Kind::ListValue(
+                                                        prost_types::ListValue {
+                                                            values: vec![1.0, 16.0, 16.0]
+                                                                .into_iter()
+                                                                .map(|value| prost_types::Value {
+                                                                    kind: Some(Kind::NumberValue(
+                                                                        value,
+                                                                    )),
+                                                                })
+                                                                .collect(),
+                                                        },
+                                                    )),
+                                                }],
+                                            })),
+                                        },
+                                    ),
+                                    (
+                                        "mm_hash".to_string(),
+                                        prost_types::Value {
+                                            kind: Some(Kind::StringValue((*mm_hash).to_string())),
+                                        },
+                                    ),
+                                ]),
+                            })),
+                        })
+                        .collect(),
+                })),
+            },
+        )]),
+    }
+}
+
+fn decode_kv_proto_struct() -> prost_types::Struct {
+    use prost_types::value::Kind;
+
+    prost_types::Struct {
+        fields: std::collections::BTreeMap::from([
+            (
+                "do_remote_prefill".to_string(),
+                prost_types::Value {
+                    kind: Some(Kind::BoolValue(true)),
+                },
+            ),
+            (
+                "pp_size".to_string(),
+                prost_types::Value {
+                    kind: Some(Kind::NumberValue(1.0)),
+                },
+            ),
+            (
+                "remote_block_ids".to_string(),
+                prost_types::Value {
+                    kind: Some(Kind::ListValue(prost_types::ListValue {
+                        values: vec![prost_types::Value {
+                            kind: Some(Kind::ListValue(prost_types::ListValue {
+                                values: vec![prost_types::Value {
+                                    kind: Some(Kind::NumberValue(7.0)),
+                                }],
+                            })),
+                        }],
+                    })),
+                },
+            ),
+        ]),
+    }
+}
+
 async fn send_outputs(push: &mut PushSocket, outputs: EngineCoreOutputs) {
     push.send(ZmqMessage::from(
         rmp_serde::to_vec_named(&outputs).expect("encode outputs"),
@@ -701,22 +786,51 @@ async fn unary_generate_prepares_multimodal_input_for_engine_core() {
             |request| {
                 let token_ids = request.prompt_token_ids.as_ref().expect("prompt token ids");
                 let features = request.mm_features.as_ref().expect("multimodal features");
-                assert_eq!(features.len(), 1);
+                assert_eq!(features.len(), 2);
 
-                let feature = &features[0];
-                assert_eq!(feature.modality, "image");
-                assert_eq!(feature.identifier, "image-1");
-                assert_eq!(feature.mm_position.offset, 1);
-                assert!(feature.mm_position.length > 1);
-                assert_eq!(token_ids.len(), feature.mm_position.length + 2);
-                assert_eq!(token_ids[0], 11);
-                assert_eq!(token_ids.last(), Some(&12));
-                assert!(
-                    token_ids[feature.mm_position.offset
-                        ..feature.mm_position.offset + feature.mm_position.length]
-                        .iter()
-                        .all(|token_id| *token_id == QWEN_IMAGE_TOKEN_ID)
+                for (feature, identifier) in features.iter().zip(["image-1", "image-2"]) {
+                    assert_eq!(feature.modality, "image");
+                    assert_eq!(feature.identifier, identifier);
+                    assert!(feature.mm_position.length > 1);
+                    assert_eq!(
+                        feature
+                            .data
+                            .as_ref()
+                            .expect("multimodal feature data")
+                            .keys()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>(),
+                        vec!["image_grid_thw"]
+                    );
+                }
+                assert_eq!(features[0].mm_position.offset, 1);
+                let xargs = request
+                    .sampling_params
+                    .as_ref()
+                    .and_then(|params| params.extra_args.as_ref())
+                    .expect("KV transfer args");
+                let kv_transfer_params =
+                    xargs.get("kv_transfer_params").expect("KV transfer params");
+                assert_eq!(kv_transfer_params["pp_size"].as_i64(), Some(1));
+                assert_eq!(
+                    kv_transfer_params["remote_block_ids"][0][0].as_i64(),
+                    Some(7)
                 );
+                assert!(!xargs.contains_key("ec_transfer_params"));
+                assert_eq!(
+                    token_ids.len(),
+                    features.iter().map(|feature| feature.mm_position.length).sum::<usize>() + 3
+                );
+                assert_eq!(token_ids[0], 11);
+                assert_eq!(token_ids.last(), Some(&13));
+                for feature in features {
+                    assert!(
+                        token_ids[feature.mm_position.offset
+                            ..feature.mm_position.offset + feature.mm_position.length]
+                            .iter()
+                            .all(|token_id| *token_id == QWEN_IMAGE_TOKEN_ID)
+                    );
+                }
             },
         )
         .await;
@@ -734,16 +848,24 @@ async fn unary_generate_prepares_multimodal_input_for_engine_core() {
             request_id: "test-multimodal".to_string(),
             model: "test-model".to_string(),
             prompt: Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
-                ids: vec![11, QWEN_IMAGE_TOKEN_ID, 12],
+                ids: vec![11, QWEN_IMAGE_TOKEN_ID, 12, QWEN_IMAGE_TOKEN_ID, 13],
             })),
-            media: vec![pb::MediaItem {
-                modality: pb::Modality::Image as i32,
-                source: Some(pb::media_item::Source::DataUri(
-                    TINY_PNG_DATA_URI.to_string(),
-                )),
-                mime_type: String::new(),
-                uuid: "image-1".to_string(),
-            }],
+            media: ["image-1", "image-2"]
+                .into_iter()
+                .map(|uuid| pb::MediaItem {
+                    modality: pb::Modality::Image as i32,
+                    source: Some(pb::media_item::Source::DataUri(
+                        TINY_PNG_DATA_URI.to_string(),
+                    )),
+                    mime_type: String::new(),
+                    uuid: uuid.to_string(),
+                })
+                .collect(),
+            kv: Some(pb::KvCacheParameters {
+                kv_transfer_params: Some(decode_kv_proto_struct()),
+                ec_transfer_params: Some(ec_proto_struct(&["image-2", "image-1"])),
+                ..Default::default()
+            }),
             stopping: Some(pb::StoppingCriteria {
                 max_new_tokens: 10,
                 ..Default::default()
